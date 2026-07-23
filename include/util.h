@@ -2,6 +2,7 @@
 
 #include "throw.h"
 
+#include <cstdint>
 #include <memory>
 #include <type_traits>
 
