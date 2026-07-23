@@ -130,6 +130,7 @@ test_test_SOURCES = \
 	test/test_hashset_api.cpp \
 	test/test_hashsetdata_util.cpp \
 	test/test_hex.cpp \
+	test/test_hset_batch.cpp \
 	test/test_hset_decoder.cpp \
 	test/test_hset_decoder_chunks.cpp \
 	test/test_hset_encoder.cpp \
