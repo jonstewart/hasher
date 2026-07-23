@@ -45,5 +45,16 @@
 /test/*.log
 /test/*.trs
 
+# hash-set files written by the test suite (round-trip / set-ops / api tests).
+# The committed fixtures (good.hset, test1.hset, 0123456789_*.hset) are tracked
+# and unaffected.
+/test/bogus.hset
+/test/sha1.hset
+/test/md5_sha1_a.hset
+/test/md5_sha1_b.hset
+/test/md5_sha1_aub.hset
+/test/md5_sha1_anb.hset
+/test/md5_sha1_a-b.hset
+
 # standalone benchmark binary
 bench/bench_lookup
