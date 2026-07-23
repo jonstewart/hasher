@@ -44,3 +44,6 @@
 /test-suite.log
 /test/*.log
 /test/*.trs
+
+# standalone benchmark binary
+bench/bench_lookup
