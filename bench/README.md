@@ -22,6 +22,18 @@ g++ -O3 -march=native -std=c++17 -Iinclude -Ibench \
 bench/bench_lookup 10000000     # set size (default 10,000,000)
 ```
 
+## Frozen leaderboard eval driver
+
+Runs the full candidate bar (c0-basic, c1-block256, phmap, unordered) across
+synthetic held-out, adversarial, and real NSRL datasets. Numbers from this
+driver are authoritative; see `bench/RESULTS.md` for fixed seeds and CPU info.
+
+```sh
+g++ -O3 -march=native -std=c++17 -Iinclude -Ibench -Ivendors/parallel-hashmap \
+    bench/eval.cpp src/lib/hashset/util.cpp -lrt -o bench/eval
+taskset -c 2 bench/eval 10000000
+```
+
 `-march=native` lets the compiler emit `bswap`/`prefetch`; the code is portable
 and also builds without it (a scalar fallback path).
 

@@ -114,7 +114,11 @@ src_mkhashset_mkhashset_LDADD = $(HASHER_LIB) $(PROJECT_LIBS)
 
 bin_PROGRAMS = src/fuzzy/fuzzy src/hasher/hasher src/mkhashset/mkhashset
 
-check_PROGRAMS = test/test test/bench_hex test/bench_hsd
+check_PROGRAMS = test/test test/bench_hex test/bench_hsd bench/eval
+
+bench_eval_SOURCES = bench/eval.cpp src/lib/hashset/util.cpp
+bench_eval_CPPFLAGS = -Iinclude -Ibench -Ivendors/parallel-hashmap
+bench_eval_CXXFLAGS = $(AM_CXXFLAGS) -O3 -march=native
 
 TESTS = \
 	test/test \

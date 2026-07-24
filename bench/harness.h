@@ -149,6 +149,39 @@ inline Queries make_mixed_queries(const HashSet& hs, size_t m, double hit_frac,
   return q;
 }
 
+// Templated version of make_mixed_queries: works with any SetT that has
+// hlen/count/at() (e.g. HashSet or HashSetView). Named _v to distinguish
+// from the HashSet-specific overload.
+template <class SetT>
+inline Queries make_mixed_queries_v(const SetT& hs, size_t m, double hit_frac,
+                                    uint64_t seed) {
+  Queries q;
+  q.hlen = hs.hlen;
+  q.count = m;
+  q.data.resize(m * hs.hlen);
+  std::mt19937_64 re(seed);
+  std::uniform_int_distribution<size_t> pick(0, hs.count - 1);
+  std::uniform_real_distribution<double> coin(0.0, 1.0);
+  uint64_t x = seed ^ 0xD1B54A32D192ED03ull;
+  auto next = [&x]() {
+    x += 0x9E3779B97F4A7C15ull;
+    uint64_t z = x;
+    z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ull;
+    z = (z ^ (z >> 27)) * 0x94D049BB133111EBull;
+    return z ^ (z >> 31);
+  };
+  for (size_t k = 0; k < m; ++k) {
+    uint8_t* dst = q.data.data() + k * hs.hlen;
+    if (coin(re) < hit_frac) {
+      std::memcpy(dst, hs.at(pick(re)), hs.hlen);
+    } else {
+      for (size_t j = 0; j + 8 <= hs.hlen; j += 8) { uint64_t v = next(); std::memcpy(dst + j, &v, 8); }
+      for (size_t j = (hs.hlen / 8) * 8; j < hs.hlen; ++j) dst[j] = static_cast<uint8_t>(next());
+    }
+  }
+  return q;
+}
+
 // ---------------------------------------------------------------------------
 // Ground truth
 // ---------------------------------------------------------------------------
