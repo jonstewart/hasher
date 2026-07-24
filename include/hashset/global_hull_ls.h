@@ -24,8 +24,13 @@
 // A build-time VERIFY+WIDEN guard additionally guards against float-rounding
 // artefacts: after hull construction we re-evaluate every stored point and
 // nudge hull vertices outward (by 1) until every point is strictly inside its
-// predicted window. The guard terminates because each nudge widens the window
-// by at least 1 — a strictly improving direction.
+// predicted window.  The guard terminates because each nudge moves BOTH
+// endpoints of the bracketing segment — the exact segment that eval_hull
+// interpolates between at query_x — so the interpolated value at query_x
+// changes by at least 1 in the correcting direction on every iteration.
+// (Nudging the globally-nearest vertex instead would be unsound: it might not
+// be part of the bracketing segment, leaving the interpolated value unchanged
+// and making termination non-guaranteed.)
 
 template <size_t HashLength>
 class GlobalHullLookupStrategy : public BasicLookupStrategy<HashLength> {
@@ -91,11 +96,17 @@ protected:
     // VERIFY+WIDEN guard: float interpolation can place a stored point just
     // outside [lo, hi).  Re-check every stored point using the same eval_hull
     // logic that window() uses; if any point is out-of-bounds, nudge the
-    // nearer hull vertex outward by 1 and repeat.  This is the same correctness
-    // principle as Task 9's hull_lines verify+widen.
+    // BRACKETING segment's endpoints outward by 1 and repeat.
     //
-    // To nudge: find the hull vertex whose x is closest to the point's expected
-    // index, then shift its y by ±1 in the appropriate direction.
+    // Termination guarantee: nudging both endpoints of the bracketing segment
+    // (h[lo_idx] and h[hi_idx], the pair that eval_hull interpolates between)
+    // by delta guarantees that the interpolated value at query_x shifts by at
+    // least |delta| in the desired direction, because the interpolated value is
+    // a convex combination (weight t in [0,1]) of the two endpoint y-values:
+    //   eval = h[lo_idx].y*(1-t) + h[hi_idx].y*t
+    // Shifting both by delta shifts eval by exactly delta, regardless of t.
+    // This is strictly better than nudging a single globally-nearest vertex,
+    // which may not be a bracketing endpoint and would leave eval unchanged.
     bool ok = false;
     while (!ok) {
       ok = true;
@@ -111,28 +122,40 @@ protected:
         const int64_t hi = static_cast<int64_t>(std::ceil(hi_val)) + 1;
 
         if (static_cast<int64_t>(actual) < lo) {
-          // actual is below the lower hull — nudge the nearest lower hull vertex down
-          nudge_nearest(Lower, e, -1.0);
+          // actual is below the lower hull — nudge BOTH bracketing endpoints down
+          nudge_bracketing(Lower, e, -1.0);
           ok = false;
         }
         if (static_cast<int64_t>(actual) >= hi) {
-          // actual is at or above the upper hull — nudge the nearest upper hull vertex up
-          nudge_nearest(Upper, e, +1.0);
+          // actual is at or above the upper hull — nudge BOTH bracketing endpoints up
+          nudge_bracketing(Upper, e, +1.0);
           ok = false;
         }
       }
     }
   }
 
-  // Nudge the hull vertex whose x-coordinate is closest to query_x by delta.
-  static void nudge_nearest(std::vector<Point<double>>& h, double query_x, double delta) {
-    size_t best = 0;
-    double best_dist = std::fabs(h[0].x - query_x);
-    for (size_t i = 1; i < h.size(); ++i) {
-      const double d = std::fabs(h[i].x - query_x);
-      if (d < best_dist) { best_dist = d; best = i; }
+  // Nudge BOTH endpoints of the bracketing segment in hull h at query_x by
+  // delta.  The bracketing segment is found using the same binary search as
+  // eval_hull, so the nudge always affects the exact two vertices that
+  // eval_hull interpolates between — guaranteeing the interpolated value
+  // shifts by exactly delta (termination-sound).
+  static void nudge_bracketing(std::vector<Point<double>>& h, double query_x, double delta) {
+    if (h.empty()) return;
+    if (h.size() == 1) { h[0].y += delta; return; }
+    // x <= front: only the front vertex is the interpolation endpoint
+    if (query_x <= h.front().x) { h.front().y += delta; return; }
+    // x >= back: only the back vertex is the interpolation endpoint
+    if (query_x >= h.back().x)  { h.back().y  += delta; return; }
+    // General case: binary search for lo_idx, hi_idx such that
+    //   h[lo_idx].x <= query_x < h[hi_idx].x  (hi_idx = lo_idx + 1)
+    size_t lo = 0, hi = h.size() - 1;
+    while (hi - lo > 1) {
+      size_t m = (lo + hi) / 2;
+      if (h[m].x <= query_x) lo = m; else hi = m;
     }
-    h[best].y += delta;
+    h[lo].y += delta;
+    h[hi].y += delta;
   }
 
   // Evaluate a hull (as a piecewise-linear function) at x by locating the
