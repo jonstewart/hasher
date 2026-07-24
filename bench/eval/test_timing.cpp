@@ -38,6 +38,7 @@ int main() {
   std::vector<uint8_t> scratch(q.count);
   eval::Timing tb = eval::time_batch(c, q, scratch, 5);
   assert(tb.ns_min > 0.0);
+  assert(tb.ns_median >= tb.ns_min);
   // Single and batch must agree on the checksum (same answers).
   assert(ts.checksum == tb.checksum);
   std::printf("ok single=%.1f batch=%.1f\n", ts.ns_min, tb.ns_min);

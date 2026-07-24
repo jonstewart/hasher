@@ -17,7 +17,9 @@ namespace detail {
 inline Timing summarize(std::vector<double>& samples, uint64_t checksum) {
   std::sort(samples.begin(), samples.end());
   const double mn = samples.front();
-  const double med = samples[samples.size() / 2];
+  const size_t nn = samples.size();
+  const double med = (nn % 2 == 1) ? samples[nn / 2]
+                                    : 0.5 * (samples[nn / 2 - 1] + samples[nn / 2]);
   double mean = 0; for (double s : samples) mean += s; mean /= samples.size();
   double var = 0; for (double s : samples) var += (s - mean) * (s - mean);
   var /= samples.size();
