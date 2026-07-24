@@ -1,5 +1,10 @@
 # libhasher lookup benchmarks
 
+> **HARNESS FROZEN — 2026-07-24**
+> The harness, datasets, seeds, and anti-cheat contract are fixed.
+> Subagents may only *add* candidate files (`bench/candidates/*.h` + one `registry.h` line).
+> No changes to the eval driver (`bench/eval.cpp`), datasets, seeds, or workload matrix.
+
 A small, self-contained benchmark for the hash-set lookup path. It generates
 synthetic sorted sets in memory (no external `.hset` files needed) and compares
 lookup strategies, validating each against a `std::binary_search` ground truth
@@ -24,15 +29,20 @@ bench/bench_lookup 10000000     # set size (default 10,000,000)
 
 ## Frozen leaderboard eval driver
 
-Runs the full candidate bar (c0-basic, c1-block256, phmap, unordered) across
-synthetic held-out, adversarial, and real NSRL datasets. Numbers from this
-driver are authoritative; see `bench/RESULTS.md` for fixed seeds and CPU info.
+Runs all 9 candidates (c0–c6, phmap, unordered) across synthetic held-out,
+adversarial, and real NSRL datasets. Numbers from this driver are authoritative;
+see `bench/RESULTS.md` for fixed seeds, CPU info, and the full leaderboard.
 
 ```sh
 g++ -O3 -march=native -std=c++17 -Iinclude -Ibench -Ivendors/parallel-hashmap \
     bench/eval.cpp src/lib/hashset/util.cpp -lrt -o bench/bench_eval
 taskset -c 2 bench/bench_eval 10000000
 ```
+
+Winner (2026-07-24): **c4-fine-block** — fastest single AND batch across all datasets.
+- Synthetic held-out n=10M, 1M-miss: 320 ns single / 154 ns batch (vs c1-block256: 508 / 212 ns)
+- NSRL SHA-1 1M-miss: 543 ns single / 244 ns batch (vs c1: 790 / 322 ns)
+- NSRL MD5 1M-miss: 505 ns single / 215 ns batch (vs c1: 741 / 279 ns)
 
 `-march=native` lets the compiler emit `bswap`/`prefetch`; the code is portable
 and also builds without it (a scalar fallback path).
@@ -82,7 +92,10 @@ absolute ns depend on the machine and on memory-system load.
 
 ## Results (Xeon E5645, single thread, N = 10,000,000)
 
-Authoritative before/after (old vs new compared in the same process):
+> **Superseded**: see `bench/RESULTS.md` for the full frozen leaderboard (all 9 candidates,
+> all 4 datasets). The table below is the original before/after from an earlier development phase.
+
+Historical before/after (c1-block256 vs original `std::binary_search`):
 
 | set        | old `contains` | new `contains` | speedup | new `contains_batch` (1M) | speedup | batch @ 4K |
 |------------|---------------:|---------------:|--------:|--------------------------:|--------:|-----------:|
@@ -108,7 +121,14 @@ Authoritative before/after (old vs new compared in the same process):
 
 ## Files
 
-* `harness.h`    — data generation, workloads, timing, and the validate+compare
-  suite. Every candidate is checked against ground truth before timing.
-* `reference.h`  — builds the real library strategies and the block bounds.
-* `bench_lookup.cpp` — the driver.
+* `eval.cpp`             — frozen eval driver (all 9 candidates, 4 datasets, fixed seeds)
+* `eval/suite.h`         — `run_leaderboard()` timing harness
+* `eval/datasets.h`      — NSRL SHA-1/MD5 loading (mmap + derived cache)
+* `eval/candidate.h`     — candidate interface
+* `candidates/registry.h` — candidate instantiation + EVAL_ONLY filter
+* `candidates/c0_basic.h` through `c6_hull_interp.h` — the 7 sorted-array candidates
+* `candidates/ext_phmap.h`, `ext_unordered.h` — hash-set north-star / baseline
+* `run_perf.sh`          — perf stat runner (EVAL_ONLY + taskset + hardware counters)
+* `RESULTS.md`           — frozen leaderboard, seeds, environment, winner declaration
+* `harness.h`            — (legacy) data generation for `bench_lookup.cpp`
+* `bench_lookup.cpp`     — (legacy) standalone benchmark driver
