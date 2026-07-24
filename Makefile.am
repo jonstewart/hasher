@@ -141,6 +141,7 @@ test_test_SOURCES = \
 	test/test_hset_encoder_chunks.cpp \
 	test/test_hset_ops.cpp \
 	test/test_hset_round_trip.cpp \
+	test/test_hull_lines.cpp \
 	test/test_record_iterator.cpp \
 	test/test_parser.cpp \
 	test/test_probe.cpp \
