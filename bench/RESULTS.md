@@ -13,7 +13,7 @@ These seeds are frozen. Never use the held-out seed for tuning.
 ## Benchmark environment
 
 - **CPU:** Intel Xeon E5645, SSE4.2, no AVX2
-- **Pinned core:** `taskset -c 2 bench/eval [n]`
+- **Pinned core:** `taskset -c 2 bench/bench_eval [n]`
 - **Compiler:** `g++ -O3 -march=native -std=c++17`
 - **n (default):** 10,000,000
 
@@ -38,7 +38,7 @@ The probe_touch/lookup column for c0-basic will read 0 even under
 
 Run:
 ```sh
-taskset -c 2 bench/eval 10000000
+taskset -c 2 bench/bench_eval 10000000
 ```
 
 | candidate   | single ns (min/med/sd) | batch ns (min/med/sd) | preserves_sorted | aux B/hash | build ms | probe touches/lookup | notes |
