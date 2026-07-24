@@ -8,12 +8,12 @@
 // A trivial candidate that answers via linear scan, to prove the interface
 // compiles and dispatches polymorphically.
 struct ScanCandidate : eval::Candidate {
-  const HashSet* hs = nullptr;
+  size_t hlen = 0, count = 0; const uint8_t* data = nullptr;
   std::string name() const override { return "scan"; }
-  void build(const HashSet& h) override { hs = &h; }
+  void build(const eval::SetRef& h) override { hlen = h.hlen; count = h.count; data = h.data; }
   bool contains(const uint8_t* hash) const override {
-    for (size_t i = 0; i < hs->count; ++i)
-      if (std::memcmp(hs->at(i), hash, hs->hlen) == 0) return true;
+    for (size_t i = 0; i < count; ++i)
+      if (std::memcmp(data + i * hlen, hash, hlen) == 0) return true;
     return false;
   }
   void contains_batch(const uint8_t* q, size_t n, size_t stride, bool* out) const override {

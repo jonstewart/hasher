@@ -12,7 +12,7 @@ struct BlockCand : eval::Candidate {
   std::unique_ptr<BlockLookupStrategy<20, 8>> ls;
   std::array<std::pair<int64_t,int64_t>,256> b;
   std::string name() const override { return "block256"; }
-  void build(const HashSet& hs) override {
+  void build(const eval::SetRef& hs) override {
     b.fill({INT64_MAX, INT64_MIN});
     for (size_t i = 0; i < hs.count; ++i) {
       size_t e = expected_index(hs.at(i), hs.count);
