@@ -165,6 +165,16 @@ inline bool ground_truth_contains(const HashSet& hs, const uint8_t* h) {
   return false;
 }
 
+// Template overload: works with any type that has hlen/count/at() (e.g. HashSetView).
+template <class SetT>
+inline bool ground_truth_contains_v(const SetT& hs, const uint8_t* h) {
+  size_t lo = 0, hi = hs.count;
+  while (lo < hi) { size_t mid = lo + (hi - lo) / 2;
+    int c = std::memcmp(hs.at(mid), h, hs.hlen);
+    if (c < 0) lo = mid + 1; else if (c > 0) hi = mid; else return true; }
+  return false;
+}
+
 // ---------------------------------------------------------------------------
 // Timing
 // ---------------------------------------------------------------------------

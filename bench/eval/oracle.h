@@ -1,7 +1,7 @@
 #pragma once
 
 #include "eval/candidate.h"
-#include "harness.h"           // HashSet, Queries, ground_truth_contains
+#include "harness.h"           // HashSet, Queries, ground_truth_contains, ground_truth_contains_v
 
 #include <cstring>
 #include <vector>
@@ -15,7 +15,11 @@ struct OracleResult { bool ok; size_t mismatches; size_t checked; };
 // all-0xFF leading bytes). Distinctness is enforced by construction; exact
 // duplicates across categories are astronomically unlikely for L>=16 random
 // hashes and harmless to the oracle (they only re-check an answer).
-inline Queries make_hard_queries(const HashSet& hs, size_t m, uint64_t seed) {
+//
+// Templated on SetT: any type with hlen/count/at()/beg()/end().
+// HashSet and HashSetView both satisfy this interface.
+template <class SetT>
+inline Queries make_hard_queries(const SetT& hs, size_t m, uint64_t seed) {
   Queries q; q.hlen = hs.hlen; q.count = m; q.data.assign(m * hs.hlen, 0);
   uint64_t x = seed ? seed : 0x1234567;
   auto next = [&x]() {
@@ -44,13 +48,16 @@ inline Queries make_hard_queries(const HashSet& hs, size_t m, uint64_t seed) {
   return q;
 }
 
-inline OracleResult validate(const HashSet& hs, Candidate& c, uint64_t seed = 777) {
+// Templated on SetT: any type with hlen/count/at()/beg()/end().
+// Uses ground_truth_contains_v for generic set membership; HashSet satisfies this.
+template <class SetT>
+inline OracleResult validate(const SetT& hs, Candidate& c, uint64_t seed = 777) {
   c.build(hs);
   Queries q = make_hard_queries(hs, 60000, seed);
 
   std::vector<uint8_t> truth(q.count);
   for (size_t i = 0; i < q.count; ++i)
-    truth[i] = ground_truth_contains(hs, q.at(i)) ? 1 : 0;
+    truth[i] = ground_truth_contains_v(hs, q.at(i)) ? 1 : 0;
 
   size_t mism = 0;
   for (size_t i = 0; i < q.count; ++i)
