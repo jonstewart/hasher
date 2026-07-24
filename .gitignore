@@ -56,5 +56,6 @@
 /test/md5_sha1_anb.hset
 /test/md5_sha1_a-b.hset
 
-# standalone benchmark binary
+# standalone benchmark binaries
 bench/bench_lookup
+bench/bench_eval
