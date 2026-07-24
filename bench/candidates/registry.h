@@ -7,6 +7,7 @@
 #include "candidates/c3_global_hull.h"
 #include "candidates/c4_fine_block.h"
 #include "candidates/c5_interp.h"
+#include "candidates/c6_hull_interp.h"
 #include "candidates/ext_phmap.h"
 #include "candidates/ext_unordered.h"
 #include <memory>
@@ -22,6 +23,7 @@ std::vector<std::unique_ptr<eval::Candidate>> all() {
   v.push_back(std::make_unique<C3GlobalHull<L>>());
   v.push_back(std::make_unique<C4FineBlock<L>>());
   v.push_back(std::make_unique<C5Interp<L>>());
+  v.push_back(std::make_unique<C6HullInterp<L>>());
   v.push_back(std::make_unique<ExtPhmap<L>>());
   v.push_back(std::make_unique<ExtUnordered<L>>());
 
