@@ -7,6 +7,7 @@
 #include "candidates/ext_unordered.h"
 #include <memory>
 #include <vector>
+#include <cstdlib>
 namespace candidates {
 template <size_t L>
 std::vector<std::unique_ptr<eval::Candidate>> all() {
@@ -15,6 +16,14 @@ std::vector<std::unique_ptr<eval::Candidate>> all() {
   v.push_back(std::make_unique<C1Block256<L>>());
   v.push_back(std::make_unique<ExtPhmap<L>>());
   v.push_back(std::make_unique<ExtUnordered<L>>());
+
+  // EVAL_ONLY filter: if set, keep only the candidate with matching name.
+  if (const char* only = std::getenv("EVAL_ONLY")) {
+    std::vector<std::unique_ptr<eval::Candidate>> f;
+    for (auto& c : v) if (c->name() == only) f.push_back(std::move(c));
+    return f;
+  }
+
   return v;
 }
 } // namespace candidates

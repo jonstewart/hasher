@@ -37,6 +37,35 @@ taskset -c 2 bench/bench_eval 10000000
 `-march=native` lets the compiler emit `bswap`/`prefetch`; the code is portable
 and also builds without it (a scalar fallback path).
 
+### Profiling: gprof call-graph time
+
+Build with `-pg` to collect call-graph information on a single candidate:
+
+```sh
+g++ -O3 -march=native -std=c++17 -pg -Iinclude -Ibench -Ivendors/parallel-hashmap \
+    bench/eval.cpp src/lib/hashset/util.cpp -lrt -o bench/bench_eval_pg
+EVAL_ONLY=c1-block256 taskset -c 2 bench/bench_eval_pg 10000000
+gprof bench/bench_eval_pg gmon.out | head -40
+```
+
+The `EVAL_ONLY` env var (set via `bench/run_perf.sh` or manually) filters the
+candidate set to a single entry, isolating its time.
+
+### Instrumented probe counters
+
+Build with `-DHASHER_PROBE` to measure memory-system-independent counters
+(element touches, comparisons) rather than hardware events:
+
+```sh
+g++ -O3 -march=native -std=c++17 -DHASHER_PROBE -Iinclude -Ibench -Ivendors/parallel-hashmap \
+    bench/eval.cpp src/lib/hashset/util.cpp -lrt -o bench/bench_eval_probe
+EVAL_ONLY=c1-block256 taskset -c 2 bench/bench_eval_probe 10000000
+```
+
+Probe output is printed to stdout and provides a cross-check on hardware perf
+counters. Note: `LLC-load-misses` may read `<not supported>` in VMs; probe
+counters are a machine-independent alternative.
+
 ## What it measures
 
 Three strategies, across workloads that vary batch size (4K vs 1M queries) and
