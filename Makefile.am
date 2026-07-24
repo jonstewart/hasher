@@ -139,6 +139,7 @@ test_test_SOURCES = \
 	test/test_hset_round_trip.cpp \
 	test/test_record_iterator.cpp \
 	test/test_parser.cpp \
+	test/test_probe.cpp \
 	test/test_util.cpp
 
 test_test_CFLAGS = $(AM_CFLAGS) $(CATCH2_CFLAGS)

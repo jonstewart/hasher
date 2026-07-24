@@ -2,6 +2,7 @@
 
 #include "hashset/basic_ls.h"
 #include "hashset/hash_compare.h"
+#include "hashset/probe.h"
 #include "hashset/util.h"
 
 #include <array>
@@ -89,6 +90,8 @@ protected:
     while (len > 0) {
       const size_t half = len >> 1;
       const size_t probe = pos + half;
+      HASHER_PROBE_TOUCH(b + probe * HashLength);
+      HASHER_PROBE_CMP();
       const uint64_t pk = primary_key<HashLength>(b + probe * HashLength);
       const bool lt = pk < hk;
       pos = lt ? probe + 1 : pos;
@@ -170,6 +173,8 @@ protected:
         Lane& ln = lanes[d];
         if (!ln.active) { continue; }
 
+        HASHER_PROBE_TOUCH(b + ln.mid * HashLength);
+        HASHER_PROBE_CMP();
         const int c = fast_hash_cmp<HashLength>(b + ln.mid * HashLength, ln.h);
         bool done = false;
         if (c < 0) {

@@ -26,6 +26,10 @@ public:
 
   virtual ~BasicLookupStrategy() {}
 
+  // Note: BasicLookupStrategy is intentionally left uninstrumented (no
+  // HASHER_PROBE hooks). std::binary_search does not expose its probe
+  // positions; BasicLookupStrategy is the floor baseline, not a tuned
+  // candidate. See bench/RESULTS.md for context.
   virtual bool contains(const uint8_t* hash) const {
     return std::binary_search(
       HashesBeg.get(), HashesEnd,
