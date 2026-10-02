@@ -126,3 +126,52 @@ mod tests {
         assert_eq!(expected_index(&h, 12345), 0);
     }
 }
+
+#[cfg(test)]
+mod proptests {
+    use super::*;
+    use proptest::prelude::*;
+
+    macro_rules! key_props {
+        ($($l:literal => $key64:ident, $cmp:ident;)*) => {
+            proptest! {
+                $(
+                    #[test]
+                    fn $key64(h in any::<[u8; $l]>()) {
+                        prop_assert_eq!(key64::<$l>(&h), key64_dyn(&h));
+                    }
+
+                    #[test]
+                    fn $cmp(
+                        a in any::<[u8; $l]>(),
+                        flip in prop::option::of(0usize..$l),
+                        fresh in any::<[u8; $l]>(),
+                    ) {
+                        let b = match flip {
+                            Some(j) => {
+                                let mut b = a;
+                                b[j] ^= 1;
+                                b
+                            }
+                            None => fresh,
+                        };
+                        prop_assert_eq!(cmp_hash::<$l>(&a, &b), a.cmp(&b));
+                        let t = 8.min($l);
+                        prop_assert_eq!(tail_eq::<$l>(&a, &b), a[t..] == b[t..]);
+                    }
+                )*
+            }
+        };
+    }
+
+    key_props! {
+        4 => key64_const_matches_dyn_4, cmp_hash_matches_slice_cmp_4;
+        8 => key64_const_matches_dyn_8, cmp_hash_matches_slice_cmp_8;
+        16 => key64_const_matches_dyn_16, cmp_hash_matches_slice_cmp_16;
+        20 => key64_const_matches_dyn_20, cmp_hash_matches_slice_cmp_20;
+        28 => key64_const_matches_dyn_28, cmp_hash_matches_slice_cmp_28;
+        32 => key64_const_matches_dyn_32, cmp_hash_matches_slice_cmp_32;
+        48 => key64_const_matches_dyn_48, cmp_hash_matches_slice_cmp_48;
+        64 => key64_const_matches_dyn_64, cmp_hash_matches_slice_cmp_64;
+    }
+}

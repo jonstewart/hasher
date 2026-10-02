@@ -393,3 +393,88 @@ mod tests {
         assert_eq!(s, ((0.3f64) * 4_294_967_296.0).round() as u32);
     }
 }
+
+#[cfg(test)]
+mod proptests {
+    use super::*;
+    use proptest::prelude::*;
+
+    /// Residual span `max(i - predict(x_i)) - min(i - predict(x_i))` of `e`
+    /// over the points `(xs[i], i)`, in `i64` so no slope can overflow it.
+    fn residual_span(e: &HullEntry, xs: &[u32]) -> i64 {
+        let rs = xs.iter().enumerate().map(|(i, &x)| i as i64 - e.predict(x));
+        rs.clone().max().unwrap() - rs.min().unwrap()
+    }
+
+    proptest! {
+        #[test]
+        fn fitted_bounds_cover_points(mut xs in prop::collection::vec(any::<u32>(), 1..=64)) {
+            xs.sort_unstable();
+            let e = fit_block(0..xs.len(), |i| xs[i]);
+            prop_assert!(!e.is_empty());
+            for (i, &x) in xs.iter().enumerate() {
+                let r = i as i64 - e.predict(x);
+                prop_assert!(i64::from(e.rmin) <= r && r <= i64::from(e.rmax),
+                    "point {i}: residual {r} outside [{}, {}]", e.rmin, e.rmax);
+            }
+        }
+
+        #[test]
+        fn fit_is_no_worse_than_chord_or_zero_slope(
+            mut xs in prop::collection::vec(any::<u32>(), 2..=64),
+        ) {
+            xs.sort_unstable();
+            let n = xs.len();
+            let e = fit_block(0..n, |i| xs[i]);
+            let w = residual_span(&e, &xs);
+            // Same entry type as the fit, so `predict` is the same function.
+            let flat = HullEntry { slope: 0, rmin: 0, rmax: 0 };
+            prop_assert!(w <= residual_span(&flat, &xs) + 1,
+                "fit span {w} vs zero-slope span {}", residual_span(&flat, &xs));
+            let (x0, x1) = (xs[0], xs[n - 1]);
+            if x1 > x0 {
+                let chord = (n - 1) as f64 / (f64::from(x1) - f64::from(x0));
+                let chord = HullEntry {
+                    slope: (chord * 4_294_967_296.0).round().clamp(0.0, f64::from(u32::MAX)) as u32,
+                    rmin: 0,
+                    rmax: 0,
+                };
+                let cw = residual_span(&chord, &xs);
+                // A chord whose residuals overflow `i32` is not storable, and
+                // `fit_block` then falls back to slope 0 by design (Task 6),
+                // so the chord bound only applies when its residuals fit.
+                let fits = xs.iter().enumerate().all(|(i, &x)| {
+                    i32::try_from(i as i64 - chord.predict(x)).is_ok()
+                });
+                if fits {
+                    prop_assert!(w <= cw + 1, "fit span {w} vs chord span {cw}");
+                }
+            }
+        }
+
+        #[test]
+        fn entry_bytes_roundtrip(slope in any::<u32>(), rmin in any::<i32>(), rmax in any::<i32>()) {
+            let e = HullEntry { slope, rmin, rmax };
+            prop_assert_eq!(HullEntry::from_bytes(&e.to_bytes()), e);
+        }
+
+        #[test]
+        fn table_sound_on_random_rows(
+            mut rows in prop::collection::vec(any::<[u8; 20]>(), 0..=300),
+            bits in 0u8..=10,
+        ) {
+            rows.sort_unstable();
+            rows.dedup();
+            let data = rows.concat();
+            let table = build_table::<20>(&data, bits);
+            prop_assert_eq!(table.len(), 1usize << bits);
+            let n = rows.len() as u32;
+            for (i, row) in rows.iter().enumerate() {
+                let key = key64::<20>(row);
+                let (lo, hi) = table[block_index(key, bits)].window(frac_of(key, bits), n);
+                prop_assert!(lo as usize <= i && i < hi as usize,
+                    "row {i} outside its window [{lo}, {hi})");
+            }
+        }
+    }
+}

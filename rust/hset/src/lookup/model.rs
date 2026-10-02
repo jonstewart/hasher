@@ -281,3 +281,25 @@ mod tests {
         assert_eq!(m.window(0x8000_0000_0000_0000, &h, 100), (49, 52));
     }
 }
+
+#[cfg(test)]
+mod proptests {
+    use super::*;
+    use proptest::prelude::*;
+
+    proptest! {
+        #[test]
+        fn block_index_monotone(a in any::<u64>(), b in any::<u64>(), bits in 0u8..=32) {
+            let (a, b) = (a.min(b), a.max(b));
+            prop_assert!(block_index(a, bits) <= block_index(b, bits));
+        }
+
+        #[test]
+        fn frac_monotone_within_block(a in any::<u64>(), b in any::<u64>(), bits in 0u8..=32) {
+            let (a, b) = (a.min(b), a.max(b));
+            if block_index(a, bits) == block_index(b, bits) {
+                prop_assert!(frac_of(a, bits) <= frac_of(b, bits));
+            }
+        }
+    }
+}

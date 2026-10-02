@@ -226,3 +226,44 @@ mod tests {
         assert!(HashType::Blake3.is_digest());
     }
 }
+
+#[cfg(test)]
+mod proptests {
+    use super::*;
+    use proptest::prelude::*;
+
+    /// Shrunk case of `roundtrip_over_all`: the display name `"Quick MD5"`
+    /// (the C reference's name) contains a space, which `parse` rejected.
+    #[test]
+    fn quick_md5_display_name_parses() {
+        assert_eq!(HashType::parse("Quick MD5").ok(), Some(HashType::QuickMd5));
+        assert_eq!(
+            HashType::parse(&HashType::QuickMd5.to_string()).ok(),
+            Some(HashType::QuickMd5)
+        );
+    }
+
+    proptest! {
+        #[test]
+        fn roundtrip_over_all(t in prop::sample::select(&HashType::ALL[..])) {
+            prop_assert_eq!(HashType::from_bits(t.bits()), Some(t));
+            prop_assert_eq!(HashType::from_log2(t.log2()), Some(t));
+            prop_assert_eq!(HashType::parse(t.name()).ok(), Some(t));
+            prop_assert_eq!(HashType::parse(t.field_name()).ok(), Some(t));
+            prop_assert_eq!(HashType::parse(&t.to_string()).ok(), Some(t));
+        }
+
+        #[test]
+        fn from_bits_rejects_non_members(bits in any::<u32>()) {
+            prop_assert_eq!(
+                HashType::from_bits(bits).is_some(),
+                HashType::ALL.iter().any(|t| t.bits() == bits)
+            );
+        }
+
+        #[test]
+        fn from_log2_rejects_out_of_range(v in 15u16..) {
+            prop_assert_eq!(HashType::from_log2(v), None);
+        }
+    }
+}
