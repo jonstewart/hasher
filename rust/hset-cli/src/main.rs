@@ -197,6 +197,7 @@ struct QueryArgs {
     #[arg(short = 'q', long)]
     quiet: bool,
     /// Hex hashes to look up
+    #[arg(allow_negative_numbers = true)]
     hashes: Vec<String>,
 }
 
