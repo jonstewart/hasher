@@ -9,6 +9,7 @@ license.workspace = true
 hset = { path = "../hset" }
 proptest.workspace = true
 arbitrary.workspace = true
+fearless_simd.workspace = true
 
 [lints]
 workspace = true

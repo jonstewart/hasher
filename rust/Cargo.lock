@@ -411,6 +411,7 @@ name = "hset-testkit"
 version = "0.1.0"
 dependencies = [
  "arbitrary",
+ "fearless_simd",
  "hset",
  "proptest",
 ]

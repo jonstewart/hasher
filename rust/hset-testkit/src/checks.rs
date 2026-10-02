@@ -16,6 +16,10 @@
 //! [`check_set_op`] is the set-algebra property: `ops::apply` answers like
 //! [`set_op_model`] over [`Doc::op_rows`] in the [`canonical_layout`], or
 //! fails with the documented input error.
+//!
+//! [`check_hex`] and [`check_hex_rows`] are the hex-codec properties: every
+//! [`simd_levels`] level agrees with [`hex_oracle`] and rejects a bad
+//! digit, and the row APIs agree with it over whole rows.
 
 use std::collections::BTreeSet;
 use std::panic::{AssertUnwindSafe, catch_unwind, resume_unwind};
@@ -25,8 +29,10 @@ use hset::lookup::{HintSpec, Lookup, build_hint, hint_from_parts, make_lookup_wi
 use hset::ops::{SetOp, apply};
 use hset::{Builder, Error, HashType, Hashset};
 
+use hset::hex;
+
 use crate::doc::{Doc, Opts};
-use crate::oracle::{NaiveSet, set_op_model};
+use crate::oracle::{NaiveSet, hex_oracle, set_op_model};
 use crate::strategies::{LookupCase, UNSUPPORTED_LENGTH, queries};
 
 /// Build `doc`, decode and check it against `doc.expected()`, load and
@@ -397,4 +403,172 @@ pub fn check_set_op(op: SetOp, a: &Doc, b: &Doc) {
             }
         }
     }
+}
+
+/// Every SIMD level hex checks should run at: the portable baseline the
+/// binary is compiled for (SSE2 on x86_64) and whatever runtime detection
+/// picks for this CPU (identical to the baseline when nothing better is
+/// available).
+pub fn simd_levels() -> Vec<fearless_simd::Level> {
+    vec![
+        fearless_simd::Level::baseline(),
+        fearless_simd::Level::new(),
+    ]
+}
+
+/// Bytes substituted for one hex digit to check rejection: past the digit
+/// range ('g'), the ASCII neighbours of the digit class ('/' just below
+/// '0', ':' just above '9') and a non-ASCII lead byte (0xC3, the first
+/// byte of a two-byte UTF-8 sequence).
+const BAD_HEX_DIGITS: [u8; 4] = [b'g', b'/', b':', 0xC3];
+
+/// For every [`simd_levels`] level: `encode_into_at` matches
+/// [`hex_oracle::encode`], `decode_into_at` inverts it for both the
+/// lowercase and uppercase encoding, and each of [`BAD_HEX_DIGITS`]
+/// substituted for one digit — at up to [`MAX_PROBES`] positions — is
+/// rejected by `decode_into_at` and by `hex::decode`. Also: `hex::decode`
+/// of the encoding with its last character dropped is an error (odd
+/// length), when the encoding is non-empty.
+pub fn check_hex(bytes: &[u8]) {
+    let encoded = hex_oracle::encode(bytes);
+
+    for level in simd_levels() {
+        let mut enc = vec![0u8; bytes.len() * 2];
+        hex::simd::encode_into_at(level, bytes, &mut enc);
+        assert_eq!(enc, encoded.as_bytes(), "encode_into_at at {level:?}");
+
+        let mut back = vec![0xAAu8; bytes.len()];
+        assert!(
+            hex::simd::decode_into_at(level, &enc, &mut back),
+            "decode_into_at should accept its own encoding at {level:?}"
+        );
+        assert_eq!(back, bytes, "decode_into_at roundtrip at {level:?}");
+
+        let upper = enc.to_ascii_uppercase();
+        let mut back_upper = vec![0xAAu8; bytes.len()];
+        assert!(
+            hex::simd::decode_into_at(level, &upper, &mut back_upper),
+            "decode_into_at should accept uppercase at {level:?}"
+        );
+        assert_eq!(back_upper, bytes, "uppercase roundtrip at {level:?}");
+
+        let n = enc.len().min(MAX_PROBES);
+        for pos in 0..n {
+            for &bad in &BAD_HEX_DIGITS {
+                let mut mutated = enc.clone();
+                mutated[pos] = bad;
+                let mut scratch = vec![0u8; bytes.len()];
+                assert!(
+                    !hex::simd::decode_into_at(level, &mutated, &mut scratch),
+                    "decode_into_at should reject {bad:#04x} at position {pos} ({level:?})"
+                );
+            }
+        }
+    }
+
+    // `hex::decode` (the `&str` API) rejects the same bad digits. b'g',
+    // b'/' and b':' are ASCII, so substituting one into the (all-ASCII)
+    // encoding keeps it valid UTF-8 at the same length, which exercises
+    // the bad-digit path directly. 0xC3 is the lead byte of a two-byte
+    // UTF-8 sequence and cannot stand alone in a `&str`, so it is paired
+    // with a valid continuation byte (0xA9, i.e. "é") to keep the string
+    // valid UTF-8; that widens the string by one byte, so this case is
+    // still rejected, but by the odd-length check rather than the
+    // bad-digit one. `decode_into_at` above already covers 0xC3 as a raw,
+    // length-preserving invalid digit.
+    let n = encoded.len().min(MAX_PROBES);
+    for pos in 0..n {
+        for &bad in &BAD_HEX_DIGITS {
+            let mutated = if bad == 0xC3 {
+                let mut s = encoded.clone();
+                s.replace_range(pos..pos + 1, "\u{e9}");
+                s
+            } else {
+                let mut b = encoded.clone().into_bytes();
+                b[pos] = bad;
+                String::from_utf8(b).expect("ASCII substitution stays valid UTF-8")
+            };
+            assert!(
+                hex::decode(&mutated).is_err(),
+                "hex::decode should reject {bad:#04x} at position {pos}"
+            );
+        }
+    }
+
+    if !encoded.is_empty() {
+        assert!(
+            hex::decode(&encoded[..encoded.len() - 1]).is_err(),
+            "hex::decode should reject odd length"
+        );
+    }
+}
+
+/// `encode_rows`, `encode_rows_to_writer` and `decode_rows` against
+/// [`hex_oracle`] over whole rows, plus their rejection of a malformed
+/// row. `data.len()` must be a multiple of `width` (the proptest driving
+/// this truncates `data` to a whole number of rows).
+pub fn check_hex_rows(data: &[u8], width: usize, sep: &[u8]) {
+    assert_eq!(
+        data.len() % width,
+        0,
+        "data length {} is not a multiple of the row width {width}",
+        data.len()
+    );
+    let rows: Vec<&[u8]> = data.chunks_exact(width).collect();
+
+    // The oracle: each row's hex, lowercase, followed by `sep`.
+    let mut want = Vec::new();
+    for row in &rows {
+        want.extend_from_slice(hex_oracle::encode(row).as_bytes());
+        want.extend_from_slice(sep);
+    }
+
+    let prefix = b"prefix";
+    let mut via_rows = prefix.to_vec();
+    hex::encode_rows(data, width, sep, &mut via_rows);
+    assert_eq!(&via_rows[prefix.len()..], &want[..], "encode_rows");
+
+    let mut via_writer = prefix.to_vec();
+    hex::encode_rows_to_writer(data, width, sep, &mut via_writer).expect("encode_rows_to_writer");
+    assert_eq!(
+        &via_writer[prefix.len()..],
+        &want[..],
+        "encode_rows_to_writer"
+    );
+
+    // `decode_rows` of the oracle's own strings returns the data and the
+    // row count, appending (not overwriting) `out`.
+    let strs: Vec<String> = rows.iter().map(|r| hex_oracle::encode(r)).collect();
+    let sentinel = [0xAAu8; 3];
+    let mut out = sentinel.to_vec();
+    let n = hex::decode_rows(strs.iter().map(String::as_str), width, &mut out)
+        .expect("decode_rows of the oracle's own strings");
+    assert_eq!(n, rows.len(), "decode_rows row count");
+    assert_eq!(&out[..sentinel.len()], &sentinel[..], "decode_rows prefix");
+    assert_eq!(&out[sentinel.len()..], data, "decode_rows data");
+
+    if rows.is_empty() {
+        // No row to corrupt.
+        return;
+    }
+
+    // A row of the wrong length is rejected, and `out` is left unchanged.
+    let mut wrong_len = strs.clone();
+    wrong_len[0].push('0');
+    let mut out = sentinel.to_vec();
+    assert!(
+        hex::decode_rows(wrong_len.iter().map(String::as_str), width, &mut out).is_err(),
+        "decode_rows should reject a row of the wrong length"
+    );
+    assert_eq!(out, sentinel, "out after a wrong-length row");
+
+    // A row with a bad digit is rejected, and `out` is left unchanged.
+    let mut bad_digit = strs.clone();
+    bad_digit[0].replace_range(0..1, "g");
+    let mut out = sentinel.to_vec();
+    assert!(
+        hex::decode_rows(bad_digit.iter().map(String::as_str), width, &mut out).is_err(),
+        "decode_rows should reject a row with a bad digit"
+    );
+    assert_eq!(out, sentinel, "out after a bad-digit row");
 }
