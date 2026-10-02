@@ -440,9 +440,18 @@ mod proptests {
                     rmax: 0,
                 };
                 let cw = residual_span(&chord, &xs);
-                // A chord whose residuals overflow `i32` is not storable, and
-                // `fit_block` then falls back to slope 0 by design (Task 6),
-                // so the chord bound only applies when its residuals fit.
+                // `fit_block` falls back to slope 0 by design (Task 6) when
+                // the residuals of the slope it CHOSE overflow `i32`; that is
+                // the fallback this guard exempts. The guard tests the chord's
+                // residuals as a proxy: when they overflow, the chord is not
+                // storable and a chosen slope near it overflows too, so the
+                // bound is only asserted when the chord's residuals fit.
+                //
+                // Known gap: choose_slope skips slopes above 1 instead of
+                // capping them, so clustered inputs such as xs[i] = i/2 fall
+                // back to slope 0 and give a wider window than a capped chord
+                // (63 vs 33 for n = 64); any::<u32>() never generates such
+                // clusters, so this property does not cover them.
                 let fits = xs.iter().enumerate().all(|(i, &x)| {
                     i32::try_from(i as i64 - chord.predict(x)).is_ok()
                 });

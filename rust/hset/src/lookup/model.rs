@@ -295,10 +295,19 @@ mod proptests {
         }
 
         #[test]
-        fn frac_monotone_within_block(a in any::<u64>(), b in any::<u64>(), bits in 0u8..=32) {
-            let (a, b) = (a.min(b), a.max(b));
-            if block_index(a, bits) == block_index(b, bits) {
-                prop_assert!(frac_of(a, bits) <= frac_of(b, bits));
+        fn frac_monotone_within_block(
+            a in any::<u64>(),
+            b in any::<u64>(),
+            delta in 0u64..=1 << 20,
+            bits in 0u8..=32,
+        ) {
+            // Two independent keys share a block with probability ~2^-bits,
+            // so also check a nearby key, which usually shares a's block.
+            for b in [b, a.saturating_add(delta)] {
+                let (a, b) = (a.min(b), a.max(b));
+                if block_index(a, bits) == block_index(b, bits) {
+                    prop_assert!(frac_of(a, bits) <= frac_of(b, bits));
+                }
             }
         }
     }
