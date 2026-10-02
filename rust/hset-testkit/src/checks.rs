@@ -314,9 +314,10 @@ pub fn apply_rows(op: SetOp, a: &Doc, b: &Doc) -> Option<BTreeSet<Vec<u8>>> {
 }
 
 /// [`apply_rows`] keeping `apply`'s error. The result is built with
-/// [`Opts::default_for_tests`] (records on), decoded, checked to carry the
-/// canonical layout of `a`, and read back as record rows; a result without
-/// records (a single hash section) reads as `[1] ++ hash` rows, the form
+/// [`Opts::default_for_tests`] (records on, so it always has records),
+/// decoded, checked to carry the canonical layout of `a`, and read back as
+/// record rows. A hashes-only operand still compares like for like: `apply`
+/// wraps its hashes as `[1] ++ hash` one-field records, the form
 /// [`Doc::op_rows`] gives a hashes-only document.
 fn apply_result(op: SetOp, a: &Doc, b: &Doc) -> hset::Result<BTreeSet<Vec<u8>>> {
     let (ab, bb) = (a.build().expect("build a"), b.build().expect("build b"));
@@ -331,28 +332,18 @@ fn apply_result(op: SetOp, a: &Doc, b: &Doc) -> hset::Result<BTreeSet<Vec<u8>>> 
         fs.iter().map(|f| (f.htype, f.length)).collect()
     };
     let layout = canonical_layout(a);
-    if let Some(rhdr) = &file.rhdr {
-        assert_eq!(
-            shape(&rhdr.fields),
-            shape(&layout),
-            "result fields are not the canonical layout"
-        );
-        Ok((0..file.record_count())
-            .map(|i| file.record(i).expect("result record").to_vec())
-            .collect())
-    } else {
-        let [s] = file.sections.as_slice() else {
-            panic!("a records-less result has {} sections", file.sections.len());
-        };
-        assert_eq!(
-            vec![(s.header.htype, s.header.hash_length)],
-            shape(&layout),
-            "result section is not the canonical layout"
-        );
-        Ok((0..s.len())
-            .map(|i| [&[1u8][..], s.hash(i)].concat())
-            .collect())
-    }
+    let rhdr = file
+        .rhdr
+        .as_ref()
+        .expect("a result built with records has records");
+    assert_eq!(
+        shape(&rhdr.fields),
+        shape(&layout),
+        "result fields are not the canonical layout"
+    );
+    Ok((0..file.record_count())
+        .map(|i| file.record(i).expect("result record").to_vec())
+        .collect())
 }
 
 /// Whether `ops::apply` can take `doc` as an operand: it has records, or
