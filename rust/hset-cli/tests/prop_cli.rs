@@ -302,3 +302,35 @@ fn make_accepts_a_name_starting_with_a_hyphen() {
     assert!(s.contains("name:        -A"), "{s}");
     assert!(s.contains("description: -B"), "{s}");
 }
+
+/// Regression: a negative decimal entropy value, passed positionally to
+/// `hset query`, is parsed by clap as an unrecognized flag (e.g. `-1`
+/// out of `-1.5`) rather than accepted as a hash to look up, because
+/// `QueryArgs::hashes` lacks a way to recognize negative numbers as
+/// values. The fix must not require `--` before a negative query value,
+/// and must not reopen `query_flag_after_positional_hash_still_parses`
+/// in `cli.rs` (a flag after a positional hash must still parse as a
+/// flag, not get swallowed as another hash).
+#[test]
+fn query_accepts_negative_entropy_values() {
+    let d = Doc {
+        fields: vec![Field::canonical(HashType::Entropy)],
+        records: vec![vec![Some((-1.5f64).to_le_bytes().to_vec())]],
+        opts: Opts::default_for_tests(),
+    };
+    let out = TempOut::new();
+    let o = run_with_stdin(
+        &[
+            "make",
+            "-t",
+            &d.type_list(),
+            "-o",
+            out.path().to_str().unwrap(),
+        ],
+        &d.to_text(),
+    );
+    assert!(o.status.success(), "make failed: {}", stderr(&o));
+    let o = run(&["query", p(out.path()), "-t", "entropy", "-1.5"]);
+    assert!(o.status.success(), "query failed: {}", stderr(&o));
+    assert_eq!(stdout(&o), "-1.5\tfound\n");
+}

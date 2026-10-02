@@ -156,6 +156,34 @@ fn query_from_stdin_and_found_only() {
     );
 }
 
+/// A flag given after a positional hash must still parse as a flag: the
+/// fix for negative query values (`--bits`-like decimal entropy values
+/// parsing as hashes, not flags) must not make every later hyphen token
+/// get swallowed as another hash to look up instead.
+#[test]
+fn query_flag_after_positional_hash_still_parses() {
+    let o = run(&[
+        "query",
+        p(&fixture("good.hset")),
+        "0053e9b602c2fa8473262b590f6d24a406ae1cc3",
+        "-q",
+    ]);
+    assert!(o.status.success(), "{}", stderr(&o));
+    assert!(stdout(&o).is_empty());
+
+    let o = run(&[
+        "query",
+        p(&fixture("good.hset")),
+        "0053e9b602c2fa8473262b590f6d24a406ae1cc3",
+        "--found-only",
+    ]);
+    assert!(o.status.success(), "{}", stderr(&o));
+    assert_eq!(
+        stdout(&o).trim(),
+        "0053e9b602c2fa8473262b590f6d24a406ae1cc3\tfound"
+    );
+}
+
 #[test]
 fn set_operations_and_reindex() {
     let dir = tmpdir("setops");
