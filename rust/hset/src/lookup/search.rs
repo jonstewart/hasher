@@ -311,7 +311,9 @@ impl<'a, const L: usize, M: Model> Strategy<'a, L, M> {
 
     #[inline(always)]
     fn lower_bound_kary(&self, hk: u64, mut lo: usize, mut hi: usize) -> usize {
-        while (hi - lo) * L > self.cfg.window_prefetch_bytes {
+        // `kary_step` only shrinks windows of more than 8 hashes; a prefetch
+        // budget below that must not keep stepping smaller windows.
+        while hi - lo > 8 && (hi - lo) * L > self.cfg.window_prefetch_bytes {
             (lo, hi) = self.kary_step(hk, lo, hi);
         }
         // The remainder spans few lines: fetch them all at once and scan.
