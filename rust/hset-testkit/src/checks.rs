@@ -147,11 +147,22 @@ pub fn exercise_loaded(bytes: &[u8]) -> bool {
     true
 }
 
+/// Longest hash [`exercise_section`] builds queries for. A query must be
+/// a whole hash, and the format bounds `hash_length` only through the
+/// section's data (`hash_count * hash_length` bytes), so an empty section
+/// can claim any length (a corrupt one claimed 601295421460). Every
+/// non-empty section of a fuzz input is far below this bound.
+const MAX_QUERY_HASH_LENGTH: usize = 1 << 20;
+
 /// Probe section `idx`: the original smoke-test queries, the boundary
 /// hashes around its stored data, and a sample of its own stored hashes.
+/// Skipped when the hash length exceeds [`MAX_QUERY_HASH_LENGTH`].
 fn exercise_section(hs: &Hashset<'_>, idx: usize) {
     let s = hs.section(idx);
     let hl = s.hash_length();
+    if hl > MAX_QUERY_HASH_LENGTH {
+        return;
+    }
 
     // The probes `robustness.rs::exercise` ran before this module existed.
     let probe = vec![0x5au8; hl];
