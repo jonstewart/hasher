@@ -3,3 +3,4 @@
 //! only from `tests/` directories and the fuzz crate.
 
 pub mod doc;
+pub mod oracle;
