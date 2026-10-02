@@ -1,0 +1,49 @@
+# hset task runner. `just --list` for the menu.
+#
+# Recipes run through sh. Tiers: `check` is the commit gate; `check-slow`
+# is nightly. Every deeper tier compares against Rust-internal oracles.
+
+set shell := ["sh", "-euc"]
+
+# Seconds each fuzz target runs under `just fuzz-ci`.
+fuzz_seconds := env_var_or_default("FUZZ_SECONDS", "60")
+# Sanitizer for fuzz builds. The crate has one `unsafe` (a prefetch hint);
+# sanitizer-free builds are portable to the Mac.
+fuzz_sanitizer := env_var_or_default("FUZZ_SANITIZER", "none")
+# Parallel cargo-mutants jobs.
+mutants_jobs := env_var_or_default("MUTANTS_JOBS", "2")
+# Memory cap for the cargo-mutants scope (Linux only).
+mutants_memory := env_var_or_default("MUTANTS_MEMORY", "3G")
+# Proptest cases for `just prop`.
+proptest_cases := env_var_or_default("PROPTEST_CASES", "20000")
+
+# List the available recipes.
+default:
+    @just --list
+
+# Format every crate in place.
+fmt:
+    cargo fmt --all
+
+# Fail if anything is unformatted.
+fmt-check:
+    cargo fmt --all -- --check
+
+# Clippy over the workspace with warnings fatal.
+lint:
+    cargo clippy --workspace --all-targets -- -D warnings
+
+# Commit gate: unit, interop, CLI and property tests at default case counts.
+# nextest does not run doctests, so they run separately to keep this the
+# same test set as `cargo test --workspace`.
+test:
+    cargo nextest run --workspace
+    cargo test --workspace --doc
+
+# Property tests at a high case count (the whole suite; example tests
+# cost seconds and the in-crate proptests live in the unit-test binaries).
+prop:
+    PROPTEST_CASES={{ proptest_cases }} cargo nextest run --workspace
+
+# Fast gate, run on every change.
+check: fmt-check lint test

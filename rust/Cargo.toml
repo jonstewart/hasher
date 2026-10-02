@@ -1,6 +1,7 @@
 [workspace]
 resolver = "2"
-members = ["hset", "hset-cli"]
+members = ["hset", "hset-cli", "hset-testkit"]
+exclude = ["fuzz"]
 
 [workspace.package]
 version = "0.1.0"
@@ -15,6 +16,14 @@ memmap2 = "0.9"
 fearless_simd = { version = "1.0", default-features = false, features = ["std"] }
 clap = { version = "4", features = ["derive"] }
 criterion = { version = "0.8", default-features = false, features = ["cargo_bench_support"] }
+proptest = "1.11"
+arbitrary = { version = "1.4", features = ["derive"] }
+hset-testkit = { path = "hset-testkit" }
+
+# hset carries #[cfg(kani)] mod proofs and #[cfg(kani_slow)] harnesses for
+# later tasks; declare the cfgs here so clippy/rustc don't warn on them.
+[workspace.lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(kani)', 'cfg(kani_slow)'] }
 
 [profile.release]
 debug = 1
