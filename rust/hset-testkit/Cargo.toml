@@ -6,6 +6,9 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+hset = { path = "../hset" }
+proptest.workspace = true
+arbitrary.workspace = true
 
 [lints]
 workspace = true
