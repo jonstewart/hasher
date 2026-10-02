@@ -65,3 +65,45 @@ fn flat_block_hint_with_extreme_bounds_does_not_panic() {
     }
     exercise_loaded(&bytes);
 }
+
+/// Fuzz finding (`corrupt_doc`, crash-398d5600…): an empty SHA-1 hash set
+/// with four byte overwrites in its header aborted with "memory allocation
+/// of 601295421460 bytes failed" instead of being rejected or loaded.
+#[test]
+fn corrupt_empty_sha1_section_does_not_over_allocate() {
+    use hset::{BitsPolicy, HashType, HintSpec};
+    use hset_testkit::corrupt::Corruption;
+    use hset_testkit::doc::{Doc, Field, Opts};
+
+    let doc = Doc {
+        fields: vec![Field {
+            htype: HashType::Sha1,
+            name: "sha1".to_string(),
+        }],
+        records: vec![],
+        opts: Opts {
+            name: String::new(),
+            desc: String::new(),
+            timestamp: "2024-01-01T00:00:00Z".to_string(),
+            with_records: false,
+            with_hashsets: true,
+            hint: HintSpec::None,
+            bits_policy: BitsPolicy {
+                budget: 0.0,
+                min_bits: 0,
+                max_bits: 10,
+            },
+        },
+    };
+    let c = Corruption {
+        truncate_to: None,
+        overwrites: vec![
+            (35980, 0),
+            (10127624197330698240, 140),
+            (10123402072680074380, 140),
+            (10127624197330734220, 125),
+        ],
+        chunk_edits: vec![],
+    };
+    check_corruption(&doc, &c);
+}
