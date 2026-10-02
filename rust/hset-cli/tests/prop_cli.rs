@@ -273,3 +273,32 @@ fn single_field_blank_line_is_skipped_not_stored() {
         "a blank single-field line must be skipped, not stored as a record"
     );
 }
+
+/// Regression: a name or description starting with `-` is ordinary data
+/// (`Opts::name` and `Opts::desc` are arbitrary printable ASCII), but
+/// clap parses it as an unrecognized flag following `-n`/`-d`, because
+/// `OutputArgs::name` and `OutputArgs::desc` lack `allow_hyphen_values`.
+#[test]
+fn make_accepts_a_name_starting_with_a_hyphen() {
+    let out = TempOut::new();
+    let o = run_with_stdin(
+        &[
+            "make",
+            "-t",
+            "sha2_224",
+            "-n",
+            "-A",
+            "-d",
+            "-B",
+            "-o",
+            out.path().to_str().unwrap(),
+        ],
+        "",
+    );
+    assert!(o.status.success(), "make failed: {}", stderr(&o));
+    let o = run(&["info", p(out.path())]);
+    assert!(o.status.success(), "info failed: {}", stderr(&o));
+    let s = stdout(&o);
+    assert!(s.contains("name:        -A"), "{s}");
+    assert!(s.contains("description: -B"), "{s}");
+}
