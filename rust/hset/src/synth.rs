@@ -157,3 +157,17 @@ mod tests {
         assert!(nm.chunks_exact(hl).all(|h| rows.binary_search(&h).is_err()));
     }
 }
+
+#[cfg(test)]
+mod proptests {
+    use super::*;
+    use proptest::prelude::*;
+
+    proptest! {
+        // The Kani version (a symbolic 128-bit product) did not converge in 15 minutes.
+        #[test]
+        fn below_is_below(seed in any::<u64>(), b in 1u64..) {
+            prop_assert!(SplitMix64::new(seed).below(b) < b);
+        }
+    }
+}

@@ -403,6 +403,12 @@ mod proptests {
             prop_assert!(c.is_empty());
         }
 
+        // Kani harnesses for `Cursor` were attempted and dropped: the
+        // `format!` on the symbolic error path does not converge
+        // (`cursor_new_rejects_past_end` alone ran past 28 minutes; Ok-only
+        // and Err-only halves each exceeded five). The coverage is this
+        // proptest, `failed_pstring_leaves_position_unchanged` and the fuzz
+        // `decode_bytes` target.
         #[test]
         fn cursor_never_panics(
             buf in vec(any::<u8>(), 0..=64),
