@@ -2,7 +2,8 @@
 //! `Doc` format oracle, plus the boundary and error examples.
 
 use hset::format::{FieldDescriptor, decode};
-use hset::{BuildOptions, Builder, Error, HashType};
+use hset::lookup::BitsPolicy;
+use hset::{BuildOptions, Builder, Error, HashType, HintSpec};
 use hset_testkit::doc::{Doc, Field, Opts};
 use hset_testkit::{checks::check_doc_roundtrip, strategies::doc};
 use proptest::prelude::*;
@@ -74,4 +75,34 @@ fn both_outputs_disabled_is_an_error() {
     };
     let r = doc.build();
     assert!(matches!(r, Err(Error::Input(_))), "{r:?}");
+}
+
+/// Shrunk proptest case: two SHA-512 hashes in one hull block at 10 bits
+/// (`80 ff ff ff ff 80 ..` and `80 ff ff ff ff ff ..`). `verify` reported
+/// "hint window excludes a stored hash" on hset's own output.
+#[test]
+fn hull_two_hashes_in_one_block_verify() {
+    let hash = |b5: u8| {
+        let mut h = vec![0u8; 64];
+        h[..6].copy_from_slice(&[0x80, 0xff, 0xff, 0xff, 0xff, b5]);
+        Some(h)
+    };
+    let mut opts = Opts::default_for_tests();
+    opts.name = String::new();
+    opts.desc = String::new();
+    opts.hint = HintSpec::Hull { bits: 10 };
+    opts.bits_policy = BitsPolicy {
+        budget: 0.0,
+        min_bits: 0,
+        max_bits: 0,
+    };
+    let doc = Doc {
+        fields: vec![Field {
+            htype: HashType::Sha2_512,
+            name: "Y 2 v7-_Qpy l__N _X".to_string(),
+        }],
+        records: vec![vec![hash(0xff)], vec![hash(0x80)]],
+        opts,
+    };
+    check_doc_roundtrip(&doc);
 }
