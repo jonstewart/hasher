@@ -175,3 +175,51 @@ mod proptests {
         64 => key64_const_matches_dyn_64, cmp_hash_matches_slice_cmp_64;
     }
 }
+
+#[cfg(kani)]
+mod proofs {
+    use super::*;
+
+    macro_rules! key_proofs {
+        ($($l:literal, $unwind:literal => $key64:ident, $cmp:ident;)*) => {
+            $(
+                #[kani::proof]
+                #[kani::unwind($unwind)]
+                fn $key64() {
+                    let h: [u8; $l] = kani::any();
+                    assert!(key64::<$l>(&h) == key64_dyn(&h));
+                }
+
+                #[kani::proof]
+                #[kani::unwind($unwind)]
+                fn $cmp() {
+                    let a: [u8; $l] = kani::any();
+                    let b: [u8; $l] = kani::any();
+                    assert!(cmp_hash::<$l>(&a, &b) == a.cmp(&b));
+                }
+            )*
+        };
+    }
+
+    // Unwind bound L + 1 for each length L.
+    key_proofs! {
+        4, 5 => key64_matches_dyn_4, cmp_hash_matches_slice_cmp_4;
+        8, 9 => key64_matches_dyn_8, cmp_hash_matches_slice_cmp_8;
+        16, 17 => key64_matches_dyn_16, cmp_hash_matches_slice_cmp_16;
+        20, 21 => key64_matches_dyn_20, cmp_hash_matches_slice_cmp_20;
+        28, 29 => key64_matches_dyn_28, cmp_hash_matches_slice_cmp_28;
+        32, 33 => key64_matches_dyn_32, cmp_hash_matches_slice_cmp_32;
+        48, 49 => key64_matches_dyn_48, cmp_hash_matches_slice_cmp_48;
+        64, 65 => key64_matches_dyn_64, cmp_hash_matches_slice_cmp_64;
+    }
+
+    /// Over one minute: about 96 s of verification under Kani 0.68.
+    #[kani::proof]
+    #[kani::unwind(1)]
+    fn expected_index_below_n() {
+        let h: [u8; 4] = kani::any();
+        let n: u32 = kani::any();
+        kani::assume(n > 0);
+        assert!(expected_index(&h, n) < n);
+    }
+}

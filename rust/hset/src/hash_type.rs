@@ -268,3 +268,34 @@ mod proptests {
         }
     }
 }
+
+#[cfg(kani)]
+mod proofs {
+    use super::*;
+
+    /// Over one minute: about 63 s of verification under Kani 0.68.
+    #[kani::proof]
+    #[kani::unwind(16)]
+    fn from_log2_and_from_bits_invert_accessors() {
+        for t in HashType::ALL {
+            assert!(HashType::from_log2(t.log2()) == Some(t));
+            assert!(HashType::from_bits(t.bits()) == Some(t));
+        }
+    }
+
+    #[kani::proof]
+    #[kani::unwind(16)]
+    fn from_log2_none_out_of_range() {
+        let v: u16 = kani::any();
+        kani::assume(v >= 15);
+        assert!(HashType::from_log2(v).is_none());
+    }
+
+    #[kani::proof]
+    #[kani::unwind(16)]
+    fn from_bits_none_for_non_members() {
+        let bits: u32 = kani::any();
+        kani::assume(bits.count_ones() != 1 || bits >= 1 << 15);
+        assert!(HashType::from_bits(bits).is_none());
+    }
+}

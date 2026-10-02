@@ -487,3 +487,41 @@ mod proptests {
         }
     }
 }
+
+#[cfg(kani)]
+mod proofs {
+    use super::*;
+
+    fn any_entry() -> HullEntry {
+        HullEntry {
+            slope: kani::any(),
+            rmin: kani::any(),
+            rmax: kani::any(),
+        }
+    }
+
+    /// Every entry, even a corrupt one, gives a window inside `[0, n]`.
+    #[kani::proof]
+    #[kani::unwind(1)]
+    fn window_within_bounds() {
+        let e = any_entry();
+        let frac: u32 = kani::any();
+        let n: u32 = kani::any();
+        let (lo, hi) = e.window(frac, n);
+        assert!(lo <= hi && hi <= n);
+    }
+
+    #[kani::proof]
+    #[kani::unwind(16)]
+    fn entry_bytes_roundtrip() {
+        let e = any_entry();
+        assert!(HullEntry::from_bytes(&e.to_bytes()) == e);
+    }
+
+    #[kani::proof]
+    #[kani::unwind(1)]
+    fn is_empty_iff_rmin_gt_rmax() {
+        let e = any_entry();
+        assert!(e.is_empty() == (e.rmin > e.rmax));
+    }
+}

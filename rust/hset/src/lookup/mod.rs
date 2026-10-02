@@ -562,3 +562,25 @@ mod tests {
         assert!(build_hint(20, &[0u8; 20], HintSpec::Block { bits: 0 }).is_err());
     }
 }
+
+#[cfg(kani)]
+mod proofs {
+    use super::*;
+
+    #[kani::proof]
+    #[kani::unwind(26)]
+    fn bits_policy_choose_within_bounds() {
+        let p = BitsPolicy {
+            budget: kani::any(),
+            min_bits: kani::any(),
+            max_bits: kani::any(),
+        };
+        kani::assume(p.min_bits <= p.max_bits && p.max_bits <= 24);
+        kani::assume(p.budget.is_finite() && p.budget >= 0.0);
+        let n: usize = kani::any();
+        let hash_length: usize = kani::any();
+        let entry_len: usize = kani::any();
+        let bits = p.choose(n, hash_length, entry_len);
+        assert!((p.min_bits..=p.max_bits).contains(&bits));
+    }
+}

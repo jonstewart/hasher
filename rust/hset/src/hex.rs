@@ -865,3 +865,27 @@ mod tests {
         assert!(simd::decode_into(&[], &mut out));
     }
 }
+
+#[cfg(kani)]
+mod proofs {
+    use super::*;
+
+    #[kani::proof]
+    #[kani::unwind(2)]
+    fn decode_pair_iff_hex_digits() {
+        let src: [u8; 2] = kani::any();
+        let ok = scalar::decode_into(&src, &mut [0u8; 1]);
+        assert!(ok == (src[0].is_ascii_hexdigit() && src[1].is_ascii_hexdigit()));
+    }
+
+    #[kani::proof]
+    #[kani::unwind(3)]
+    fn decode_inverts_encode_byte() {
+        let b: u8 = kani::any();
+        let mut hex = [0u8; 2];
+        scalar::encode_into(&[b], &mut hex);
+        let mut back = [0u8; 1];
+        assert!(scalar::decode_into(&hex, &mut back));
+        assert!(back[0] == b);
+    }
+}

@@ -326,3 +326,58 @@ mod proptests {
         }
     }
 }
+
+#[cfg(kani)]
+mod proofs {
+    use super::*;
+
+    /// Every flat block entry, even a corrupt one, gives a window inside `[0, n]`.
+    #[kani::proof]
+    #[kani::unwind(2)]
+    fn flat_window_within_bounds() {
+        let m = FlatBlocks {
+            bits: 0,
+            table: vec![(kani::any(), kani::any())],
+        };
+        let key: u64 = kani::any();
+        let hash: [u8; 4] = kani::any();
+        let n: u32 = kani::any();
+        let (lo, hi) = m.window(key, &hash, n);
+        assert!(lo <= hi && hi <= n);
+    }
+
+    /// The vectorisable batch path computes exactly `HullEntry::window`.
+    /// Over one minute: about 69 s of verification under Kani 0.68.
+    #[kani::proof]
+    #[kani::unwind(2)]
+    fn hull_batch_of_one_matches_window() {
+        let e = HullEntry {
+            slope: kani::any(),
+            rmin: kani::any(),
+            rmax: kani::any(),
+        };
+        let m = HullBlocks {
+            bits: 0,
+            table: vec![e],
+        };
+        let k: u64 = kani::any();
+        let n: u32 = kani::any();
+        let mut lo = [0u32; 1];
+        let mut hi = [0u32; 1];
+        m.window_batch(&[k], &[], 0, n, &mut lo, &mut hi);
+        assert!((lo[0], hi[0]) == e.window(frac_of(k, 0), n));
+    }
+
+    /// The block index and the within-block fraction are the top `bits`
+    /// and the next 32 bits of the key.
+    #[kani::proof]
+    #[kani::unwind(1)]
+    fn block_index_and_frac_split_the_key() {
+        let key: u64 = kani::any();
+        let bits: u8 = kani::any();
+        kani::assume(bits <= 32);
+        let b = block_index(key, bits);
+        assert!(b < 1usize << bits);
+        assert!(((b as u64) << 32) | u64::from(frac_of(key, bits)) == key >> (32 - bits));
+    }
+}

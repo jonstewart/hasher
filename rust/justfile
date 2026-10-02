@@ -98,3 +98,13 @@ fuzz-seed target:
     find "target/fuzz-corpus/{{ target }}" -type f -exec cp {} "fuzz/corpus/{{ target }}/" \;
     cargo fuzz cmin -s {{ fuzz_sanitizer }} "{{ target }}" "fuzz/corpus/{{ target }}" -- \
         -set_cover_merge=1 -use_counters=0
+
+# Model-check the pure integer functions of hset with Kani, if installed.
+verify:
+    #!/bin/sh
+    set -eu
+    if ! cargo kani --version >/dev/null 2>&1; then
+        echo "SKIP: kani not installed. cargo install kani-verifier && cargo kani setup" >&2
+        exit 0
+    fi
+    cargo kani -p hset
