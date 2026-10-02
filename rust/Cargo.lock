@@ -391,6 +391,8 @@ version = "0.1.0"
 dependencies = [
  "criterion",
  "fearless_simd",
+ "hset-testkit",
+ "proptest",
  "sha2",
  "thiserror",
 ]

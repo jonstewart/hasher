@@ -3,6 +3,7 @@
 
 use hset::synth::SplitMix64;
 use hset::{BuildOptions, Builder, HashType, Hashset, HintSpec};
+use hset_testkit::checks::exercise_loaded;
 
 fn sample() -> Vec<u8> {
     let mut b = Builder::new(&[HashType::Md5, HashType::Sha1, HashType::Size]).unwrap();
@@ -21,29 +22,6 @@ fn sample() -> Vec<u8> {
         .unwrap()
 }
 
-fn exercise(bytes: &[u8]) {
-    if let Ok(hs) = Hashset::load(bytes) {
-        let _ = hs.verify();
-        for i in 0..hs.section_count() {
-            let s = hs.section(i);
-            let hl = s.hash_length();
-            let probe = vec![0x5au8; hl];
-            let _ = hs.contains(i, &probe);
-            let _ = hs.find(i, &probe);
-            let _ = hs.records_for(i, &probe);
-            if !s.is_empty() {
-                let h = s.hash(s.len() / 2).to_vec();
-                let _ = hs.records_for(i, &h);
-            }
-            let mut out = vec![false; 5];
-            hs.contains_batch(i, &vec![0xa5u8; hl * 5], &mut out);
-        }
-        for r in hs.records().take(10) {
-            let _ = hs.record_fields(r);
-        }
-    }
-}
-
 #[test]
 fn truncations_never_panic() {
     let bytes = sample();
@@ -53,10 +31,9 @@ fn truncations_never_panic() {
         .chain([bytes.len() - 1, bytes.len()])
     {
         let b = &bytes[..cut];
-        if Hashset::load(b).is_ok() {
+        if exercise_loaded(b) {
             ok += 1;
         }
-        exercise(b);
     }
     assert_eq!(ok, 1, "only the untruncated file should load");
 }
@@ -75,7 +52,7 @@ fn random_corruption_never_panics() {
             let pos = if rng.below(2) == 0 { pos % 600 } else { pos };
             b[pos] = val;
         }
-        exercise(&b);
+        exercise_loaded(&b);
     }
 }
 

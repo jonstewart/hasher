@@ -3,6 +3,7 @@
 //! only from `tests/` directories and the fuzz crate.
 
 pub mod arb;
+pub mod checks;
 pub mod doc;
 pub mod oracle;
 pub mod strategies;
