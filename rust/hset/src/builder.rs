@@ -542,3 +542,66 @@ mod tests {
         assert_eq!(w, b"1024");
     }
 }
+
+#[cfg(test)]
+mod proptests {
+    use super::*;
+    use proptest::collection::vec;
+    use proptest::prelude::*;
+
+    /// Every type a hash set can store: all of them but `Fuzzy`.
+    fn storable() -> Vec<HashType> {
+        HashType::ALL
+            .iter()
+            .copied()
+            .filter(|&t| t != HashType::Fuzzy)
+            .collect()
+    }
+
+    proptest! {
+        #[test]
+        fn sorted_rows_matches_sort_dedup(
+            width in 1usize..=8,
+            rows in vec(any::<u8>(), 0..=256),
+            dedup in any::<bool>(),
+        ) {
+            let data = &rows[..rows.len() / width * width];
+            let mut expected: Vec<&[u8]> = data.chunks_exact(width).collect();
+            expected.sort();
+            if dedup {
+                expected.dedup();
+            }
+            prop_assert_eq!(sorted_rows(data, width, dedup), expected.concat());
+        }
+
+        #[test]
+        fn parse_format_roundtrip(
+            t in prop::sample::select(storable()),
+            raw in vec(any::<u8>(), 0..=64),
+            f in any::<f64>().prop_filter("finite", |f| f.is_finite()),
+        ) {
+            let fd = FieldDescriptor::for_type(t).unwrap();
+            let value = if t == HashType::Entropy {
+                f.to_le_bytes().to_vec()
+            } else {
+                let mut v = raw;
+                v.resize(t.length().unwrap(), 0);
+                v
+            };
+            let text = format_value(&fd, &value);
+            prop_assert_eq!(parse_value(&fd, &text).ok(), Some(value), "{} {:?}", t, text);
+        }
+
+        #[test]
+        fn add_text_line_rejects_wrong_column_count(cols in 0usize..=5) {
+            let mut b = Builder::new(&[HashType::Md5, HashType::Size]).unwrap();
+            let line = " ".repeat(cols.saturating_sub(1));
+            let r = b.add_text_line(&line);
+            if cols <= 2 {
+                prop_assert!(r.is_ok(), "{:?}: {:?}", line, r);
+            } else {
+                prop_assert!(matches!(r, Err(Error::Input(_))), "{:?}: {:?}", line, r);
+            }
+        }
+    }
+}

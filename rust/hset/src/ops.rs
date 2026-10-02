@@ -267,3 +267,41 @@ mod tests {
         assert!(apply(SetOp::Union, &fa, &fb).is_err());
     }
 }
+
+#[cfg(test)]
+mod proptests {
+    use super::*;
+    use proptest::collection::{btree_set, vec};
+    use proptest::prelude::*;
+
+    /// A row width and two sets of rows of exactly that width.
+    fn width_and_sets() -> impl Strategy<Value = (usize, BTreeSet<Vec<u8>>, BTreeSet<Vec<u8>>)> {
+        (1usize..=8).prop_flat_map(|width| {
+            (
+                Just(width),
+                btree_set(vec(any::<u8>(), width), 0..=40),
+                btree_set(vec(any::<u8>(), width), 0..=40),
+            )
+        })
+    }
+
+    fn concat<'a>(rows: impl Iterator<Item = &'a Vec<u8>>) -> Vec<u8> {
+        rows.flat_map(|r| r.iter().copied()).collect()
+    }
+
+    proptest! {
+        #[test]
+        fn merge_matches_btreeset((width, a, b) in width_and_sets()) {
+            let a_bytes = concat(a.iter());
+            let b_bytes = concat(b.iter());
+            for op in [SetOp::Union, SetOp::Intersect, SetOp::Subtract] {
+                let expected = match op {
+                    SetOp::Union => concat(a.union(&b)),
+                    SetOp::Intersect => concat(a.intersection(&b)),
+                    SetOp::Subtract => concat(a.difference(&b)),
+                };
+                prop_assert_eq!(merge(op, &a_bytes, &b_bytes, width), expected, "{:?}", op);
+            }
+        }
+    }
+}

@@ -273,3 +273,176 @@ mod tests {
         assert_eq!(o.len(), 16);
     }
 }
+
+#[cfg(test)]
+mod proptests {
+    use super::*;
+    use proptest::collection::vec;
+    use proptest::prelude::*;
+
+    #[derive(Debug, Clone)]
+    enum Prim {
+        U8(u8),
+        LeU16(u16),
+        LeU32(u32),
+        LeU64(u64),
+        BeU16(u16),
+        BeU32(u32),
+        Bytes(Vec<u8>),
+        PString(String),
+        Zeros(usize),
+    }
+
+    fn prim() -> impl Strategy<Value = Prim> {
+        prop_oneof![
+            any::<u8>().prop_map(Prim::U8),
+            any::<u16>().prop_map(Prim::LeU16),
+            any::<u32>().prop_map(Prim::LeU32),
+            any::<u64>().prop_map(Prim::LeU64),
+            any::<u16>().prop_map(Prim::BeU16),
+            any::<u32>().prop_map(Prim::BeU32),
+            vec(any::<u8>(), 0..=32).prop_map(Prim::Bytes),
+            "\\PC{0,100}".prop_map(Prim::PString),
+            (0usize..=16).prop_map(Prim::Zeros),
+        ]
+    }
+
+    fn write(o: &mut Out, p: &Prim) {
+        match p {
+            // `Out` has no single-byte writer; one byte goes through `bytes`.
+            Prim::U8(v) => o.bytes(&[*v]),
+            Prim::LeU16(v) => o.le_u16(*v),
+            Prim::LeU32(v) => o.le_u32(*v),
+            Prim::LeU64(v) => o.le_u64(*v),
+            Prim::BeU16(v) => o.be_u16(*v),
+            Prim::BeU32(v) => o.be_u32(*v),
+            Prim::Bytes(b) => o.bytes(b),
+            Prim::PString(s) => o.pstring(s),
+            Prim::Zeros(n) => o.zeros(*n),
+        }
+    }
+
+    /// A reader op on a cursor, reduced to how many bytes it consumed on
+    /// success.
+    #[derive(Debug, Clone, Copy)]
+    enum Read {
+        U8,
+        LeU16,
+        LeU32,
+        LeU64,
+        BeU16,
+        BeU32,
+        PString,
+        Bytes(usize),
+    }
+
+    fn apply(c: &mut Cursor<'_>, r: Read) -> Result<usize> {
+        Ok(match r {
+            Read::U8 => c.u8().map(|_| 1)?,
+            Read::LeU16 => c.le_u16().map(|_| 2)?,
+            Read::LeU32 => c.le_u32().map(|_| 4)?,
+            Read::LeU64 => c.le_u64().map(|_| 8)?,
+            Read::BeU16 => c.be_u16().map(|_| 2)?,
+            Read::BeU32 => c.be_u32().map(|_| 4)?,
+            Read::PString => c.pstring().map(|s| pstring_len(&s))?,
+            Read::Bytes(n) => c.bytes(n).map(<[u8]>::len)?,
+        })
+    }
+
+    /// Shrunk case of `cursor_never_panics`: `pstring` read the length
+    /// prefix (256), then failed on the body but left the cursor past the
+    /// prefix. A failed read must not move the cursor.
+    #[test]
+    fn failed_pstring_leaves_position_unchanged() {
+        let buf = [0u8, 0, 0, 1];
+        let mut c = Cursor::new(&buf, 2).unwrap();
+        assert!(c.pstring().is_err());
+        assert_eq!(c.position(), 2);
+    }
+
+    proptest! {
+        #[test]
+        fn out_primitives_read_back(prims in vec(prim(), 0..=32)) {
+            let mut o = Out::default();
+            for p in &prims {
+                write(&mut o, p);
+            }
+            let mut c = Cursor::new(&o.buf, 0).unwrap();
+            for p in &prims {
+                match p {
+                    Prim::U8(v) => prop_assert_eq!(c.u8().unwrap(), *v),
+                    Prim::LeU16(v) => prop_assert_eq!(c.le_u16().unwrap(), *v),
+                    Prim::LeU32(v) => prop_assert_eq!(c.le_u32().unwrap(), *v),
+                    Prim::LeU64(v) => prop_assert_eq!(c.le_u64().unwrap(), *v),
+                    Prim::BeU16(v) => prop_assert_eq!(c.be_u16().unwrap(), *v),
+                    Prim::BeU32(v) => prop_assert_eq!(c.be_u32().unwrap(), *v),
+                    Prim::Bytes(b) => prop_assert_eq!(c.bytes(b.len()).unwrap(), b.as_slice()),
+                    Prim::PString(s) => prop_assert_eq!(&c.pstring().unwrap(), s),
+                    Prim::Zeros(n) => prop_assert!(c.bytes(*n).unwrap().iter().all(|&b| b == 0)),
+                }
+            }
+            prop_assert!(c.is_empty());
+        }
+
+        #[test]
+        fn cursor_never_panics(
+            buf in vec(any::<u8>(), 0..=64),
+            pos in prop_oneof![0usize..=70, any::<usize>()],
+            n in 0usize..=70,
+        ) {
+            prop_assert_eq!(Cursor::new(&buf, pos).is_ok(), pos <= buf.len());
+            if pos > buf.len() {
+                return Ok(());
+            }
+            let reads = [
+                Read::U8,
+                Read::LeU16,
+                Read::LeU32,
+                Read::LeU64,
+                Read::BeU16,
+                Read::BeU32,
+                Read::PString,
+                Read::Bytes(n),
+            ];
+            // Each reader from a fresh cursor at `pos` ...
+            for r in reads {
+                let mut c = Cursor::new(&buf, pos).unwrap();
+                match apply(&mut c, r) {
+                    Ok(w) => prop_assert_eq!(c.position(), pos + w, "{:?}", r),
+                    Err(_) => prop_assert_eq!(c.position(), pos, "{:?}", r),
+                }
+            }
+            // ... and all of them in sequence on one cursor.
+            let mut c = Cursor::new(&buf, pos).unwrap();
+            for r in reads {
+                let before = c.position();
+                match apply(&mut c, r) {
+                    Ok(w) => prop_assert_eq!(c.position(), before + w, "{:?}", r),
+                    Err(_) => prop_assert_eq!(c.position(), before, "{:?}", r),
+                }
+            }
+        }
+
+        #[test]
+        fn read_chunk_never_panics(
+            buf in vec(any::<u8>(), 0..=64),
+            off in prop_oneof![0usize..=70, any::<usize>()],
+        ) {
+            let expected = match off.checked_add(CHUNK_HEADER_LEN) {
+                Some(end) if end <= buf.len() => {
+                    let len = u64::from_le_bytes(buf[off + 4..end].try_into().unwrap());
+                    len <= (buf.len() - end) as u64
+                }
+                _ => false,
+            };
+            prop_assert_eq!(read_chunk(&buf, off).is_ok(), expected);
+        }
+
+        #[test]
+        fn pstring_roundtrip(s in "\\PC{0,300}") {
+            let mut o = Out::default();
+            o.pstring(&s);
+            prop_assert_eq!(Cursor::new(&o.buf, 0).unwrap().pstring().unwrap(), s);
+        }
+    }
+}
