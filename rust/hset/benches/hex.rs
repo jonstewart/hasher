@@ -5,6 +5,10 @@
 //! steady-state rate without per-call overhead. Throughput is in input bytes
 //! for encode and in output bytes for decode, so the two are comparable.
 //!
+//! The `hex/rows` group measures the batch paths that `hset dump` and
+//! `hset query -f` use, in ns per hash, against the per-call loops they
+//! replaced.
+//!
 //! Environment knobs:
 //! * `HSET_BENCH_HEX_LEVELS=1` also run the SIMD kernels pinned to the
 //!   compile-time baseline level (SSE2 on x86_64) for comparison with the
@@ -130,5 +134,96 @@ fn bench_decode(c: &mut Criterion) {
     g.finish();
 }
 
-criterion_group!(benches, bench_encode, bench_decode);
+fn bench_rows(c: &mut Criterion) {
+    use std::io::Write;
+
+    let mut g = c.benchmark_group("hex/rows");
+    let rows = 4096usize;
+    for &(name, width) in &WIDTHS[..4] {
+        let data = sample_bytes(rows * width);
+        let lines: Vec<String> = data.chunks(width).map(hex::encode).collect();
+        g.throughput(Throughput::Elements(rows as u64));
+
+        // Encode: per-row `encode` + writeln (the old dump), per-row writer,
+        // batch into a Vec, batch streamed to a writer.
+        g.bench_with_input(
+            BenchmarkId::new("encode-string-loop", name),
+            &data,
+            |b, d| {
+                let mut sink = Vec::with_capacity(rows * (2 * width + 1));
+                b.iter(|| {
+                    sink.clear();
+                    for row in d.chunks(width) {
+                        writeln!(sink, "{}", hex::encode(black_box(row))).unwrap();
+                    }
+                    black_box(&sink);
+                })
+            },
+        );
+        g.bench_with_input(
+            BenchmarkId::new("encode-writer-loop", name),
+            &data,
+            |b, d| {
+                let mut sink = Vec::with_capacity(rows * (2 * width + 1));
+                b.iter(|| {
+                    sink.clear();
+                    for row in d.chunks(width) {
+                        hex::encode_to_writer(black_box(row), &mut sink).unwrap();
+                        sink.push(b'\n');
+                    }
+                    black_box(&sink);
+                })
+            },
+        );
+        g.bench_with_input(BenchmarkId::new("encode-rows", name), &data, |b, d| {
+            let mut sink = Vec::with_capacity(rows * (2 * width + 1));
+            b.iter(|| {
+                sink.clear();
+                hex::encode_rows(black_box(d), width, b"\n", &mut sink);
+                black_box(&sink);
+            })
+        });
+        g.bench_with_input(
+            BenchmarkId::new("encode-rows-writer", name),
+            &data,
+            |b, d| {
+                let mut sink = Vec::with_capacity(rows * (2 * width + 1));
+                b.iter(|| {
+                    sink.clear();
+                    hex::encode_rows_to_writer(black_box(d), width, b"\n", &mut sink).unwrap();
+                    black_box(&sink);
+                })
+            },
+        );
+
+        // Decode: per-row `decode_into` (the old query) versus `decode_rows`.
+        g.bench_with_input(
+            BenchmarkId::new("decode-into-loop", name),
+            &lines,
+            |b, l| {
+                let mut out = Vec::with_capacity(rows * width);
+                b.iter(|| {
+                    out.clear();
+                    for s in l {
+                        let start = out.len();
+                        out.resize(start + width, 0);
+                        hex::decode_into(black_box(s), &mut out[start..]).unwrap();
+                    }
+                    black_box(&out);
+                })
+            },
+        );
+        g.bench_with_input(BenchmarkId::new("decode-rows", name), &lines, |b, l| {
+            let mut out = Vec::with_capacity(rows * width);
+            b.iter(|| {
+                out.clear();
+                hex::decode_rows(black_box(l).iter().map(String::as_str), width, &mut out).unwrap();
+                black_box(&out);
+            })
+        });
+    }
+    g.finish();
+}
+
+criterion_group!(benches, bench_encode, bench_decode, bench_rows);
 criterion_main!(benches);

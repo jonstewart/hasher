@@ -42,3 +42,44 @@ public entry points including allocation (encode) or validation and `Result`
 * `encode-string` is dominated by the allocation and UTF-8 check of the
   returned `String`, not by the kernel. Callers on a hot path should use
   `hex::simd::encode_into` with a reused buffer.
+
+## Row batches (`hex/rows` group, ns per hash, 4096 rows)
+
+The batch functions take the contiguous fixed-width layout of a section
+(`encode_rows*`) or a list of strings (`decode_rows`) and run the kernel
+densely across row boundaries, so SHA-1 rows no longer pay for the
+half-block overlap. `encode-string-loop` is the old `hset dump` inner loop
+(`hex::encode` + `writeln!` per hash); `decode-into-loop` is the old
+`hset query -f` inner loop.
+
+| width | encode-string-loop | encode-writer-loop | encode-rows | encode-rows-writer | decode-into-loop | decode-rows |
+|---|---:|---:|---:|---:|---:|---:|
+| md5 | 109.4 | 31.6 | 15.0 | 11.8 | 37.0 | 15.9 |
+| sha1 | 117.5 | 38.8 | 17.9 | 15.1 | 47.5 | 20.4 |
+| sha256 | 112.3 | 39.1 | 23.0 | 20.0 | 49.4 | 27.0 |
+| sha512 | 131.1 | 50.9 | 35.0 | 37.6 | 68.0 | 49.6 |
+
+## End to end, 1 M SHA-1 synthetic set (`synth_hset 1000000 20 ... hull`)
+
+Wall-clock seconds, best of three, output to `/dev/null` (writing the 41 MB
+text file to the shared `/work` mount costs about 1.2 s on its own and
+hides everything else).
+
+| command | before (69fb167) | after |
+|---|---:|---:|
+| `hset dump` | 0.129 | 0.031 |
+| `hset query -f all.txt -q` | 0.454 | 0.407 |
+
+Dump output is byte-identical. In the new `query -f` profile hex decoding is
+no longer visible; the remaining time is reading lines into one `String`
+each (`read_until`, malloc) and the lookups themselves.
+
+## Pitfalls met along the way
+
+* `encode_to_string` / `encode_to_writer` first zeroed an 8 KiB stack
+  scratch buffer per call, which cost about 250 ns and made the per-hash
+  writer loop slower than the allocating one. Inputs up to 64 bytes now use
+  a 128-byte buffer.
+* `cargo build --examples` builds only the examples, so the first
+  end-to-end comparison ran a stale `hset` binary from before the SIMD work.
+  Check binary timestamps before timing.

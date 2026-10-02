@@ -1,9 +1,30 @@
 //! Hexadecimal encoding and decoding.
 //!
-//! The public functions run SIMD kernels (see [`simd`]) chosen at runtime by
-//! `fearless_simd`; [`scalar`] is the portable reference used for tests.
+//! Three tiers, all backed by the same SIMD kernels (see [`simd`]), which
+//! `fearless_simd` dispatches at runtime; [`scalar`] is the portable
+//! reference used by the tests.
+//!
+//! * Convenience: [`encode`] and [`decode`] allocate and return a `String`
+//!   or `Vec<u8>`.
+//! * Buffer and sink: [`encode_into`] fills a byte slice, [`encode_to_string`]
+//!   appends to a `String` (Rust's growable string buffer) and
+//!   [`encode_to_writer`] streams into any [`io::Write`]; [`decode_into`]
+//!   fills a byte slice. None of these allocate.
+//! * Rows: [`encode_rows`], [`encode_rows_to_writer`] and [`decode_rows`]
+//!   handle many fixed-width values at once, the shape of a hash-set
+//!   section, running the kernel densely across row boundaries.
+
+use std::io;
 
 use crate::error::{Error, Result};
+
+/// Size of the stack buffers the streaming functions work through.
+const SCRATCH: usize = 8192;
+
+/// Inputs up to this many bytes (every digest, SHA-512 included) use a
+/// small stack buffer; zeroing the full `SCRATCH` per call would cost more
+/// than the encode itself.
+const SMALL: usize = 64;
 
 /// Portable scalar reference implementation.
 pub mod scalar {
@@ -201,12 +222,53 @@ pub mod simd {
     }
 }
 
-/// Encode bytes as lowercase hex.
+pub use simd::encode_into;
+
+/// Encode bytes as a new lowercase hex `String`.
 pub fn encode(bytes: &[u8]) -> String {
+    // Encode straight into the allocation the String will own; the UTF-8
+    // check on all-ASCII output is cheap and keeps this module `unsafe`-free.
     let mut v = vec![0u8; bytes.len() * 2];
     simd::encode_into(bytes, &mut v);
-    // Every byte written is an ASCII hex digit.
     String::from_utf8(v).expect("hex digits are ASCII")
+}
+
+/// Append the lowercase hex of `bytes` to `out`. Allocates only if `out`
+/// lacks capacity for `2 * bytes.len()` more bytes.
+pub fn encode_to_string(bytes: &[u8], out: &mut String) {
+    out.reserve(bytes.len() * 2);
+    // Every byte produced is an ASCII hex digit; the UTF-8 check is cheap
+    // and keeps this module free of `unsafe`.
+    if bytes.len() <= SMALL {
+        let mut buf = [0u8; 2 * SMALL];
+        let hex = &mut buf[..bytes.len() * 2];
+        simd::encode_into(bytes, hex);
+        out.push_str(str::from_utf8(hex).expect("hex digits are ASCII"));
+        return;
+    }
+    let mut buf = [0u8; SCRATCH];
+    for chunk in bytes.chunks(SCRATCH / 2) {
+        let hex = &mut buf[..chunk.len() * 2];
+        simd::encode_into(chunk, hex);
+        out.push_str(str::from_utf8(hex).expect("hex digits are ASCII"));
+    }
+}
+
+/// Write the lowercase hex of `bytes` to `w` without allocating.
+pub fn encode_to_writer<W: io::Write + ?Sized>(bytes: &[u8], w: &mut W) -> io::Result<()> {
+    if bytes.len() <= SMALL {
+        let mut buf = [0u8; 2 * SMALL];
+        let hex = &mut buf[..bytes.len() * 2];
+        simd::encode_into(bytes, hex);
+        return w.write_all(hex);
+    }
+    let mut buf = [0u8; SCRATCH];
+    for chunk in bytes.chunks(SCRATCH / 2) {
+        let hex = &mut buf[..chunk.len() * 2];
+        simd::encode_into(chunk, hex);
+        w.write_all(hex)?;
+    }
+    Ok(())
 }
 
 /// Decode hex into `out`. The input must be exactly `2 * out.len()` hex digits.
@@ -225,7 +287,7 @@ pub fn decode_into(src: &str, out: &mut [u8]) -> Result<()> {
     Ok(())
 }
 
-/// Decode a hex string of any even length.
+/// Decode a hex string of any even length into a new `Vec`.
 pub fn decode(src: &str) -> Result<Vec<u8>> {
     if !src.len().is_multiple_of(2) {
         return Err(Error::input(format!("odd-length hex string '{src}'")));
@@ -233,6 +295,170 @@ pub fn decode(src: &str) -> Result<Vec<u8>> {
     let mut v = vec![0u8; src.len() / 2];
     decode_into(src, &mut v)?;
     Ok(v)
+}
+
+fn check_rows(data: &[u8], width: usize) -> usize {
+    assert!(width > 0, "row width must be non-zero");
+    assert!(
+        data.len().is_multiple_of(width),
+        "data length {} is not a multiple of the row width {width}",
+        data.len()
+    );
+    data.len() / width
+}
+
+/// Append the hex of every `width`-byte row of `data`, each followed by
+/// `sep`, to `out`. `data` is the contiguous layout of a hash-set section.
+///
+/// Panics if `width` is zero or `data.len()` is not a multiple of it.
+pub fn encode_rows(data: &[u8], width: usize, sep: &[u8], out: &mut Vec<u8>) {
+    let rows = check_rows(data, width);
+    out.reserve(rows * (2 * width + sep.len()));
+    if sep.is_empty() {
+        // Rows are contiguous in the output too: one dense pass.
+        let start = out.len();
+        out.resize(start + 2 * data.len(), 0);
+        simd::encode_into(data, &mut out[start..]);
+        return;
+    }
+    if 2 * width > SCRATCH {
+        for row in data.chunks_exact(width) {
+            let start = out.len();
+            out.resize(start + 2 * width, 0);
+            simd::encode_into(row, &mut out[start..]);
+            out.extend_from_slice(sep);
+        }
+        return;
+    }
+    // Encode a run of rows densely, then scatter them with separators.
+    let per = SCRATCH / (2 * width);
+    let mut hex = [0u8; SCRATCH];
+    for block in data.chunks(per * width) {
+        let h = &mut hex[..block.len() * 2];
+        simd::encode_into(block, h);
+        for row in h.chunks_exact(2 * width) {
+            out.extend_from_slice(row);
+            out.extend_from_slice(sep);
+        }
+    }
+}
+
+/// Stream the hex of every `width`-byte row of `data`, each followed by
+/// `sep`, to `w`, using fixed stack buffers. Suited to dumping a whole
+/// section to a `BufWriter`.
+///
+/// Panics if `width` is zero or `data.len()` is not a multiple of it.
+pub fn encode_rows_to_writer<W: io::Write + ?Sized>(
+    data: &[u8],
+    width: usize,
+    sep: &[u8],
+    w: &mut W,
+) -> io::Result<()> {
+    check_rows(data, width);
+    let line = 2 * width + sep.len();
+    if line > SCRATCH {
+        for row in data.chunks_exact(width) {
+            encode_to_writer(row, w)?;
+            w.write_all(sep)?;
+        }
+        return Ok(());
+    }
+    let per = SCRATCH / line;
+    let mut hex = [0u8; SCRATCH];
+    let mut lines = [0u8; SCRATCH];
+    for block in data.chunks(per * width) {
+        let h = &mut hex[..block.len() * 2];
+        simd::encode_into(block, h);
+        let mut p = 0;
+        for row in h.chunks_exact(2 * width) {
+            lines[p..p + 2 * width].copy_from_slice(row);
+            p += 2 * width;
+            lines[p..p + sep.len()].copy_from_slice(sep);
+            p += sep.len();
+        }
+        w.write_all(&lines[..p])?;
+    }
+    Ok(())
+}
+
+/// Decode many hex strings of the same `width` (in bytes), appending the
+/// decoded rows to `out` contiguously, and return how many were decoded.
+/// Rows are gathered into a stack buffer and decoded in dense batches.
+///
+/// On error `out` is left exactly as it was and the message names the
+/// offending row by its zero-based index.
+pub fn decode_rows<'a, I>(rows: I, width: usize, out: &mut Vec<u8>) -> Result<usize>
+where
+    I: IntoIterator<Item = &'a str>,
+{
+    assert!(width > 0, "row width must be non-zero");
+    let start = out.len();
+    let hex_len = 2 * width;
+    let per = (SCRATCH / hex_len).max(1);
+    let mut scratch = [0u8; SCRATCH];
+    let mut gathered = 0usize;
+    let mut count = 0usize;
+
+    let bad_digit = |row: usize, s: &[u8]| {
+        Error::input(format!(
+            "row {row}: invalid hex digit in '{}'",
+            String::from_utf8_lossy(s)
+        ))
+    };
+    // Decode a gathered batch into the tail of `out`.
+    let flush = |scratch: &[u8], out: &mut Vec<u8>, first_row: usize| -> Result<()> {
+        let o = out.len();
+        out.resize(o + scratch.len() / 2, 0);
+        if simd::decode_into(scratch, &mut out[o..]) {
+            return Ok(());
+        }
+        // Error path only: find which row failed.
+        let mut tmp = vec![0u8; width];
+        for (i, row) in scratch.chunks_exact(hex_len).enumerate() {
+            if !scalar::decode_into(row, &mut tmp) {
+                return Err(bad_digit(first_row + i, row));
+            }
+        }
+        unreachable!("dense decode failed but every row decodes");
+    };
+
+    for (i, s) in rows.into_iter().enumerate() {
+        let b = s.as_bytes();
+        if b.len() != hex_len {
+            out.truncate(start);
+            return Err(Error::input(format!(
+                "row {i}: expected {hex_len} hex digits, found {} in '{s}'",
+                b.len()
+            )));
+        }
+        if hex_len > SCRATCH {
+            let o = out.len();
+            out.resize(o + width, 0);
+            if !simd::decode_into(b, &mut out[o..]) {
+                out.truncate(start);
+                return Err(bad_digit(i, b));
+            }
+            count += 1;
+            continue;
+        }
+        scratch[gathered * hex_len..(gathered + 1) * hex_len].copy_from_slice(b);
+        gathered += 1;
+        count += 1;
+        if gathered == per {
+            if let Err(e) = flush(&scratch[..gathered * hex_len], out, count - gathered) {
+                out.truncate(start);
+                return Err(e);
+            }
+            gathered = 0;
+        }
+    }
+    if gathered > 0
+        && let Err(e) = flush(&scratch[..gathered * hex_len], out, count - gathered)
+    {
+        out.truncate(start);
+        return Err(e);
+    }
+    Ok(count)
 }
 
 #[cfg(test)]
@@ -321,6 +547,161 @@ mod tests {
         let mut out = [0u8; 4];
         let e = decode_into("ab", &mut out).unwrap_err().to_string();
         assert!(e.contains("expected 8 hex digits, found 2"), "{e}");
+    }
+
+    // ---- buffer, writer and row APIs ----------------------------------------
+
+    #[test]
+    fn encode_to_string_appends_without_reallocating() {
+        let bytes = pseudo_random(20, 3);
+        let mut s = String::with_capacity(8 + 40);
+        s.push_str("prefix: ");
+        let cap = s.capacity();
+        encode_to_string(&bytes, &mut s);
+        assert_eq!(s, format!("prefix: {}", encode(&bytes)));
+        assert_eq!(s.capacity(), cap);
+    }
+
+    #[test]
+    fn encode_to_string_handles_long_input_across_chunks() {
+        let bytes = pseudo_random(10_000, 4);
+        let mut s = String::new();
+        encode_to_string(&bytes, &mut s);
+        assert_eq!(s, encode(&bytes));
+    }
+
+    #[test]
+    fn encode_to_writer_writes_exact_bytes() {
+        let bytes = pseudo_random(64, 5);
+        let mut w: Vec<u8> = b"x".to_vec();
+        encode_to_writer(&bytes, &mut w).unwrap();
+        assert_eq!(w, format!("x{}", encode(&bytes)).into_bytes());
+        let mut w = Vec::new();
+        encode_to_writer(&pseudo_random(10_000, 6), &mut w).unwrap();
+        assert_eq!(w, encode(&pseudo_random(10_000, 6)).into_bytes());
+    }
+
+    #[test]
+    fn encode_into_top_level_fills_buffer() {
+        let bytes = pseudo_random(20, 8);
+        let mut out = [0u8; 40];
+        encode_into(&bytes, &mut out);
+        assert_eq!(&out[..], encode(&bytes).as_bytes());
+    }
+
+    #[test]
+    #[should_panic(expected = "2x")]
+    fn encode_into_panics_on_wrong_size() {
+        let mut out = [0u8; 3];
+        encode_into(&[1, 2], &mut out);
+    }
+
+    fn rows_reference(data: &[u8], width: usize, sep: &[u8]) -> Vec<u8> {
+        let mut v = Vec::new();
+        for row in data.chunks_exact(width) {
+            v.extend_from_slice(encode(row).as_bytes());
+            v.extend_from_slice(sep);
+        }
+        v
+    }
+
+    #[test]
+    fn encode_rows_matches_per_row_encode_for_every_width_and_count() {
+        for width in [1usize, 16, 20, 32, 64] {
+            for rows in [0usize, 1, 2, 7, 63, 64, 65, 200] {
+                let data = pseudo_random(rows * width, 9 + width as u64 + rows as u64);
+                for sep in [&b""[..], b"\n", b", "] {
+                    let mut out = b"head\n".to_vec();
+                    encode_rows(&data, width, sep, &mut out);
+                    let mut want = b"head\n".to_vec();
+                    want.extend(rows_reference(&data, width, sep));
+                    assert_eq!(out, want, "width {width} rows {rows} sep {sep:?}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "multiple of")]
+    fn encode_rows_panics_on_ragged_data() {
+        let mut out = Vec::new();
+        encode_rows(&[0u8; 21], 20, b"\n", &mut out);
+    }
+
+    #[test]
+    #[should_panic(expected = "width")]
+    fn encode_rows_panics_on_zero_width() {
+        let mut out = Vec::new();
+        encode_rows(&[], 0, b"\n", &mut out);
+    }
+
+    #[test]
+    fn encode_rows_to_writer_matches_encode_rows() {
+        for width in [1usize, 20, 64, 5000] {
+            for rows in [0usize, 1, 5, 130, 1000] {
+                let data = pseudo_random(rows * width, 11 + width as u64 + rows as u64);
+                let mut want = Vec::new();
+                encode_rows(&data, width, b"\n", &mut want);
+                let mut got = Vec::new();
+                encode_rows_to_writer(&data, width, b"\n", &mut got).unwrap();
+                assert_eq!(got, want, "width {width} rows {rows}");
+            }
+        }
+    }
+
+    #[test]
+    fn decode_rows_appends_every_row_and_returns_count() {
+        for width in [1usize, 16, 20, 32, 64, 5000] {
+            for rows in [0usize, 1, 2, 63, 64, 65, 300] {
+                let data = pseudo_random(rows * width, 13 + width as u64 + rows as u64);
+                let strs: Vec<String> = data
+                    .chunks_exact(width)
+                    .enumerate()
+                    .map(|(i, r)| {
+                        let s = encode(r);
+                        if i % 2 == 0 { s } else { s.to_uppercase() }
+                    })
+                    .collect();
+                let mut out = vec![0xAAu8; 3];
+                let n = decode_rows(strs.iter().map(String::as_str), width, &mut out).unwrap();
+                assert_eq!(n, rows, "width {width}");
+                assert_eq!(&out[..3], &[0xAA; 3]);
+                assert_eq!(&out[3..], &data[..], "width {width} rows {rows}");
+            }
+        }
+    }
+
+    #[test]
+    fn decode_rows_reports_the_bad_row_and_leaves_output_untouched() {
+        let data = pseudo_random(20 * 100, 17);
+        let mut strs: Vec<String> = data.as_chunks::<20>().0.iter().map(|r| encode(r)).collect();
+        strs[77].replace_range(5..6, "g");
+        let mut out = vec![1u8, 2, 3];
+        let e = decode_rows(strs.iter().map(String::as_str), 20, &mut out).unwrap_err();
+        let msg = e.to_string();
+        assert!(msg.contains("row 77"), "{msg}");
+        assert!(msg.contains("invalid hex digit"), "{msg}");
+        assert_eq!(out, [1, 2, 3]);
+
+        let mut strs: Vec<String> = data.as_chunks::<20>().0.iter().map(|r| encode(r)).collect();
+        strs[3].pop();
+        let e = decode_rows(strs.iter().map(String::as_str), 20, &mut out).unwrap_err();
+        let msg = e.to_string();
+        assert!(msg.contains("row 3"), "{msg}");
+        assert!(msg.contains("expected 40 hex digits, found 39"), "{msg}");
+        assert_eq!(out, [1, 2, 3]);
+    }
+
+    #[test]
+    fn decode_rows_rejects_bad_row_in_a_later_chunk() {
+        // 300 SHA-512 rows span several gather chunks; corrupt one near the end.
+        let data = pseudo_random(64 * 300, 19);
+        let mut strs: Vec<String> = data.as_chunks::<64>().0.iter().map(|r| encode(r)).collect();
+        strs[290].replace_range(127..128, "Z");
+        let mut out = Vec::new();
+        let e = decode_rows(strs.iter().map(String::as_str), 64, &mut out).unwrap_err();
+        assert!(e.to_string().contains("row 290"), "{e}");
+        assert!(out.is_empty());
     }
 
     // ---- simd kernels vs scalar reference -----------------------------------

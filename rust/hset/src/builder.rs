@@ -1,5 +1,6 @@
 //! Building `.hset` files from records.
 
+use std::io;
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -332,6 +333,24 @@ pub fn parse_value(field: &FieldDescriptor, col: &str) -> Result<Vec<u8>> {
     }
 }
 
+/// Write a field value as text to `w` without allocating (see
+/// [`format_value`] for the `String`-returning form).
+pub fn write_value<W: io::Write + ?Sized>(
+    field: &FieldDescriptor,
+    value: &[u8],
+    w: &mut W,
+) -> io::Result<()> {
+    match field.htype {
+        HashType::Size if value.len() == 8 => {
+            write!(w, "{}", u64::from_le_bytes(value.try_into().unwrap()))
+        }
+        HashType::Entropy if value.len() == 8 => {
+            write!(w, "{}", f64::from_le_bytes(value.try_into().unwrap()))
+        }
+        _ => hex::encode_to_writer(value, w),
+    }
+}
+
 /// Render a field value as text (inverse of [`parse_value`]).
 pub fn format_value(field: &FieldDescriptor, value: &[u8]) -> String {
     match field.htype {
@@ -518,5 +537,8 @@ mod tests {
         // bytewise order of little-endian 7 and 1024 puts 1024 (0x00 0x04) first
         assert_eq!(f.sections[0].hash(0), &1024u64.to_le_bytes());
         assert_eq!(format_value(&b.fields()[0], f.sections[0].hash(0)), "1024");
+        let mut w = Vec::new();
+        write_value(&b.fields()[0], f.sections[0].hash(0), &mut w).unwrap();
+        assert_eq!(w, b"1024");
     }
 }

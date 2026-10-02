@@ -438,12 +438,17 @@ fn cmd_info(a: InfoArgs) -> CliResult<()> {
     Ok(())
 }
 
-fn record_line(hs: &Hashset<'_>, rec: &[u8]) -> String {
-    hs.record_fields(rec)
-        .iter()
-        .map(|(f, v)| v.map(|v| builder::format_value(f, v)).unwrap_or_default())
-        .collect::<Vec<_>>()
-        .join(" ")
+/// Write one record as space-separated columns plus a newline.
+fn write_record_line<W: Write>(hs: &Hashset<'_>, rec: &[u8], w: &mut W) -> io::Result<()> {
+    for (k, (f, v)) in hs.record_fields(rec).iter().enumerate() {
+        if k > 0 {
+            w.write_all(b" ")?;
+        }
+        if let Some(v) = v {
+            builder::write_value(f, v, w)?;
+        }
+    }
+    w.write_all(b"\n")
 }
 
 fn cmd_dump(a: DumpArgs) -> CliResult<()> {
@@ -457,7 +462,9 @@ fn cmd_dump(a: DumpArgs) -> CliResult<()> {
             return err("file has no records");
         }
         for rec in hs.records() {
-            let _ = writeln!(o, "{}", record_line(&hs, rec));
+            if write_record_line(&hs, rec, &mut o).is_err() {
+                break;
+            }
         }
         return Ok(());
     }
@@ -478,8 +485,15 @@ fn cmd_dump(a: DumpArgs) -> CliResult<()> {
         if a.r#type.is_none() && hs.section_count() > 1 {
             let _ = writeln!(o, "# {} ({} hashes)", s.header.name, s.len());
         }
-        for j in 0..s.len() {
-            let _ = writeln!(o, "{}", builder::format_value(&fd, s.hash(j)));
+        if matches!(fd.htype, HashType::Size | HashType::Entropy) {
+            for j in 0..s.len() {
+                let _ = builder::write_value(&fd, s.hash(j), &mut o);
+                let _ = o.write_all(b"\n");
+            }
+        } else {
+            // Digest sections: stream the whole sorted array as hex rows.
+            let hl = s.hash_length();
+            let _ = hex::encode_rows_to_writer(&s.data[..s.len() * hl], hl, b"\n", &mut o);
         }
     }
     Ok(())
@@ -535,9 +549,14 @@ fn cmd_query(a: QueryArgs) -> CliResult<ExitCode> {
     };
 
     let mut queries = Vec::with_capacity(lines.len() * hl);
-    for l in &lines {
-        let v = builder::parse_value(&fd, l).map_err(|e| e.to_string())?;
-        queries.extend_from_slice(&v);
+    if matches!(fd.htype, HashType::Size | HashType::Entropy) {
+        for l in &lines {
+            let v = builder::parse_value(&fd, l).map_err(|e| e.to_string())?;
+            queries.extend_from_slice(&v);
+        }
+    } else {
+        hex::decode_rows(lines.iter().map(String::as_str), hl, &mut queries)
+            .map_err(|e| e.to_string())?;
     }
     let mut found = vec![false; lines.len()];
     hs.contains_batch(idx, &queries, &mut found);
@@ -559,7 +578,7 @@ fn cmd_query(a: QueryArgs) -> CliResult<ExitCode> {
                     let _ = writeln!(o, "{l}\tfound");
                 }
                 for r in recs {
-                    let _ = writeln!(o, "{}", record_line(&hs, r));
+                    let _ = write_record_line(&hs, r, &mut o);
                 }
             } else if !a.found_only {
                 let _ = writeln!(o, "{l}\tmissing");

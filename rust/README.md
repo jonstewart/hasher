@@ -36,13 +36,27 @@ to ASCII with a compare-and-select, and interleaves; decode classifies digits
 and case-folded letters with unsigned compares, accumulates an invalid-lane
 mask that is checked once, and packs nibble pairs through 16-bit lanes. A
 trailing partial block re-runs the kernel on the last full block with
-overlapping output, so SHA-1's 20 bytes cost one and a half blocks rather
-than a scalar tail. `hex::scalar` is the portable reference and the oracle
-for the tests, which sweep every length up to 80 bytes, every byte value, and
-every invalid byte at every position. On the development machine (Westmere,
-SSE4.2) decode runs 2.4x to 7.4x faster than the scalar reference across the
-digest widths and encode 1.4x to 3.2x; see
-`experiments/results/criterion-hex-*.md`.
+overlapping output.
+
+The API comes in three tiers over the same kernels:
+
+* `encode` / `decode` allocate and return a `String` or `Vec<u8>`.
+* `encode_into`, `encode_to_string` (appends to a `String`),
+  `encode_to_writer` (any `io::Write`) and `decode_into` fill caller-owned
+  storage and never allocate.
+* `encode_rows`, `encode_rows_to_writer` and `decode_rows` handle a whole
+  array of fixed-width values at once, the layout of a section's hash data,
+  running the kernel densely across row boundaries. `hset dump` streams
+  digest sections with `encode_rows_to_writer`; `hset query -f` gathers its
+  input with `decode_rows`.
+
+`hex::scalar` is the portable reference and the oracle for the tests, which
+sweep every length up to 80 bytes, every byte value, and every invalid byte
+at every position. On the development machine (Westmere, SSE4.2) a single
+decode runs 2.4x to 7.4x faster than the scalar reference across the digest
+widths and encode 1.4x to 3.2x; the row batches reach 15 to 20 ns per
+SHA-1 hash either way, and `hset dump` of 1 M SHA-1 hashes went from 0.13 s
+to 0.03 s. See `experiments/results/criterion-hex-*.md`.
 
 The full experiment matrix behind the design decisions below is reproducible
 with `experiments/run_all.sh`; see `experiments/README.md`. Results from the
