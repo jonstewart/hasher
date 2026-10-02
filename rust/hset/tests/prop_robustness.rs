@@ -19,17 +19,12 @@ proptest! {
     }
 }
 
-/// Fuzz finding (`decode_bytes`, crash-20aa62e8…, a mutated
-/// `test/good.hset`): a flat block hint whose `(min, max)` deviation
-/// entries hold extreme `i64`s panicked with an arithmetic overflow in
-/// `FlatBlocks::mean_window` (`hi - lo + 1`) while loading. The artifact
-/// is 21 KiB of raw bytes, so this rebuilds the same shape: a valid file
-/// with a 2-bit block hint, one entry per extreme, one hash per block.
-#[test]
-fn flat_block_hint_with_extreme_bounds_does_not_panic() {
+/// A valid four-hash MD5 file with a 2-bit flat block hint whose four
+/// `(min, max)` deviation entries are overwritten with `entries`. Every
+/// entry has `min <= max`, so the loader treats every block as non-empty.
+fn file_with_block_hint_entries(entries: [(i64, i64); 4]) -> Vec<u8> {
     use hset::format::{Hint, decode};
     use hset::{BuildOptions, Builder, HashType, HintSpec};
-    use hset_testkit::checks::exercise_loaded;
 
     let mut b = Builder::new(&[HashType::Md5]).unwrap();
     for top in [0x00u8, 0x40, 0x80, 0xC0] {
@@ -52,18 +47,41 @@ fn flat_block_hint_with_extreme_bounds_does_not_panic() {
         };
         table.as_ptr() as usize - bytes.as_ptr() as usize
     };
-    let entries: [(i64, i64); 4] = [
-        (i64::MIN, 0),
-        (0, i64::MAX),
-        (i64::MAX, i64::MAX),
-        (i64::MIN, i64::MAX),
-    ];
     for (k, (lo, hi)) in entries.iter().enumerate() {
         let e = at + 16 * k;
         bytes[e..e + 8].copy_from_slice(&lo.to_le_bytes());
         bytes[e + 8..e + 16].copy_from_slice(&hi.to_le_bytes());
     }
-    exercise_loaded(&bytes);
+    bytes
+}
+
+/// Fuzz finding (`decode_bytes`, crash-20aa62e8…, a mutated
+/// `test/good.hset`): a flat block hint whose `(min, max)` deviation
+/// entries hold extreme `i64`s panicked with an arithmetic overflow in
+/// `FlatBlocks::mean_window` (`hi - lo + 1`) while loading. The artifact
+/// is 21 KiB of raw bytes, so this rebuilds the same shape: a valid file
+/// with a 2-bit block hint, one extreme entry per block. The decoder
+/// checks a hint's shape, not its values, so the file must still load; a
+/// wrong hint may only make lookups miss.
+#[test]
+fn flat_block_hint_with_extreme_bounds_does_not_panic() {
+    let bytes = file_with_block_hint_entries([
+        (i64::MIN, 0),
+        (0, i64::MAX),
+        (i64::MAX, i64::MAX),
+        (i64::MIN, i64::MAX),
+    ]);
+    assert!(hset_testkit::checks::exercise_loaded(&bytes), "should load");
+}
+
+/// The same finding, centre side: entries of `(i64::MIN, i64::MIN)` put
+/// the model's predicted centre near `i64::MIN`, and the region-radius
+/// sample taken at construction computed `index - centre`, overflowing
+/// for every stored hash at or past its expected index.
+#[test]
+fn flat_block_hint_with_minimal_centre_does_not_panic() {
+    let bytes = file_with_block_hint_entries([(i64::MIN, i64::MIN); 4]);
+    assert!(hset_testkit::checks::exercise_loaded(&bytes), "should load");
 }
 
 /// Fuzz finding (`corrupt_doc`, crash-398d5600…): an empty SHA-1 hash set
