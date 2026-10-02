@@ -1,0 +1,21 @@
+[package]
+name = "hset"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Sorted hash-set (.hset) file format: encoder, decoder, and accelerated membership lookup"
+
+[dependencies]
+sha2.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+criterion.workspace = true
+
+[[bench]]
+name = "lookup"
+harness = false
+
+[[bench]]
+name = "build"
+harness = false
