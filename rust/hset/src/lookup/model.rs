@@ -18,7 +18,9 @@ pub fn block_index(key: u64, bits: u8) -> usize {
 /// `[0, n)`, that is guaranteed to contain `hash` if the set contains it.
 pub trait Model: Send + Sync {
     fn window(&self, key: u64, hash: &[u8], n: u32) -> (u32, u32);
-    /// The model's point prediction of where `hash` would sit (unclamped).
+    /// The model's point prediction of where `hash` would sit, unclamped:
+    /// a corrupt hint can put it anywhere in `i64`, so clamp it or use
+    /// overflow-free arithmetic before using it as an index.
     fn center(&self, key: u64, hash: &[u8], n: u32) -> i64;
     /// Positions spanned by a key difference of `dkey` near `key`, i.e. the
     /// model's local density. Used to re-aim after a missed region.
@@ -123,7 +125,10 @@ impl Model for FlatBlocks {
     fn center(&self, key: u64, hash: &[u8], n: u32) -> i64 {
         let (dmin, dmax) = self.table[block_index(key, self.bits)];
         // The midpoint of two `i64`s fits an `i64`; computed wide so a
-        // corrupt table cannot overflow it.
+        // corrupt table cannot overflow it. The sum saturates, so with a
+        // corrupt table the centre can be anywhere in `i64` (including
+        // `i64::MIN`): callers must clamp it or use overflow-free
+        // arithmetic, never subtract from it directly.
         let mid = ((i128::from(dmin) + i128::from(dmax)) / 2) as i64;
         i64::from(expected_index(hash, n)).saturating_add(mid)
     }

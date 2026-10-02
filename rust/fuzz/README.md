@@ -70,7 +70,7 @@ A crash is a finding; it becomes a named test before it is fixed.
    ```rust
    use arbitrary::Arbitrary;
    let bytes = std::fs::read("fuzz/artifacts/build_doc/crash-...").unwrap();
-   let mut u = arbitrary::Unstructured::new(&bytes);
+   let u = arbitrary::Unstructured::new(&bytes);
    let doc = hset_testkit::doc::Doc::arbitrary_take_rest(u).unwrap();
    println!("{doc:#?}");
    ```

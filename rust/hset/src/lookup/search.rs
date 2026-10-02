@@ -116,8 +116,10 @@ impl<'a, const L: usize, M: Model> Strategy<'a, L, M> {
             .step_by(step)
             .map(|i| {
                 let h = &self.data[i * L..(i + 1) * L];
+                // `center` comes from a hint read from the file and can be
+                // anywhere in `i64`; `abs_diff` cannot overflow.
                 let c = self.model.center(key64::<L>(h), h, self.n);
-                (i as i64 - c).unsigned_abs()
+                (i as i64).abs_diff(c)
             })
             .collect();
         res.sort_unstable();
