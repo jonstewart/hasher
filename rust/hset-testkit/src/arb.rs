@@ -7,6 +7,7 @@ use hset::HashType;
 use hset::lookup::{BitsPolicy, HintSpec, SearchConfig};
 use hset::synth::{adversarial_hashes, sort_unique_rows};
 
+use crate::corrupt::{ChunkEdit, Corruption};
 use crate::doc::{Doc, Field, Opts, STORABLE_TYPES};
 use crate::strategies::{
     BATCH_MODES, BUDGETS, DENSE_BYTES, LookupCase, SINGLE_MODES, SUPPORTED_LENGTHS, TIMESTAMPS,
@@ -194,6 +195,48 @@ impl<'a> Arbitrary<'a> for LookupCase {
             data: with_duplicates(set, hlen, &mask),
             hint,
             cfg,
+        })
+    }
+}
+
+/// A chunk-edit value as `strategies::corruption` draws it: anything, 0,
+/// `u64::MAX`, 1, or at most 8192.
+fn edit_value(u: &mut Unstructured<'_>) -> Result<u64> {
+    Ok(match u.int_in_range(0..=4u8)? {
+        0 => u64::arbitrary(u)?,
+        1 => 0,
+        2 => u64::MAX,
+        3 => 1,
+        _ => u.int_in_range(0..=8192)?,
+    })
+}
+
+/// As `strategies::corruption`: any truncation, at most 16 overwrites and
+/// at most 4 chunk edits (a `Type` edit keeps the value's low 32 bits).
+impl<'a> Arbitrary<'a> for Corruption {
+    fn arbitrary(u: &mut Unstructured<'a>) -> Result<Self> {
+        let truncate_to = Option::<usize>::arbitrary(u)?;
+        let n = u.int_in_range(0..=16usize)?;
+        let overwrites = (0..n)
+            .map(|_| Ok((usize::arbitrary(u)?, u8::arbitrary(u)?)))
+            .collect::<Result<Vec<_>>>()?;
+        let k = u.int_in_range(0..=4usize)?;
+        let chunk_edits = (0..k)
+            .map(|_| {
+                let kind = u.int_in_range(0..=2u8)?;
+                let i = usize::arbitrary(u)?;
+                let v = edit_value(u)?;
+                Ok(match kind {
+                    0 => ChunkEdit::Offset(i, v),
+                    1 => ChunkEdit::Length(i, v),
+                    _ => ChunkEdit::Type(i, v as u32),
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Ok(Corruption {
+            truncate_to,
+            overwrites,
+            chunk_edits,
         })
     }
 }

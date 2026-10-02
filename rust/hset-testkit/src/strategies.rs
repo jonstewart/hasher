@@ -11,6 +11,7 @@ use proptest::collection::vec;
 use proptest::prelude::*;
 use proptest::sample::select;
 
+use crate::corrupt::{ChunkEdit, Corruption};
 use crate::doc::{Doc, Field, Opts, STORABLE_TYPES};
 
 /// Hash lengths the lookup engine supports.
@@ -394,6 +395,38 @@ pub fn lookup_case() -> BoxedStrategy<LookupCase> {
             data: with_duplicates(set, hlen, &mask),
             hint,
             cfg,
+        })
+        .boxed()
+}
+
+/// A chunk-edit value: anything, or one of the edge values 0, 1 and
+/// `u64::MAX`, or a small plausible offset/length.
+fn edit_value() -> BoxedStrategy<u64> {
+    prop_oneof![any::<u64>(), Just(0), Just(u64::MAX), Just(1), 0..=8192u64].boxed()
+}
+
+/// A chunk edit at any index; a `Type` edit keeps the value's low 32 bits.
+fn chunk_edit() -> BoxedStrategy<ChunkEdit> {
+    (0..3u8, any::<usize>(), edit_value())
+        .prop_map(|(kind, i, v)| match kind {
+            0 => ChunkEdit::Offset(i, v),
+            1 => ChunkEdit::Length(i, v),
+            _ => ChunkEdit::Type(i, v as u32),
+        })
+        .boxed()
+}
+
+/// Any truncation, up to 16 byte overwrites and up to 4 chunk edits.
+pub fn corruption() -> BoxedStrategy<Corruption> {
+    (
+        any::<Option<usize>>(),
+        vec((any::<usize>(), any::<u8>()), 0..=16),
+        vec(chunk_edit(), 0..=4),
+    )
+        .prop_map(|(truncate_to, overwrites, chunk_edits)| Corruption {
+            truncate_to,
+            overwrites,
+            chunk_edits,
         })
         .boxed()
 }

@@ -6,6 +6,10 @@
 //! are the failure signal — nothing there distinguishes a correctness bug
 //! from a crash beyond that.
 //!
+//! [`check_corruption`] is the robustness property: a corrupted [`Doc`]
+//! file never panics [`exercise_loaded`], and never passes the digest
+//! unless the corruption changed nothing.
+//!
 //! [`check_doc_roundtrip`] is the format property: a [`Doc`] builds,
 //! decodes to its oracle, verifies, answers lookups per the oracle, builds
 //! deterministically and rebuilds from its own decoded records.
@@ -31,6 +35,7 @@ use hset::{Builder, Error, HashType, Hashset};
 
 use hset::hex;
 
+use crate::corrupt::Corruption;
 use crate::doc::{Doc, Opts};
 use crate::oracle::{NaiveSet, hex_oracle, set_op_model};
 use crate::strategies::{LookupCase, UNSUPPORTED_LENGTH, queries};
@@ -201,6 +206,25 @@ fn exercise_records(hs: &Hashset<'_>) {
         for t in HashType::ALL {
             let _ = hs.field_value(r, t);
         }
+    }
+}
+
+/// Build `doc`, corrupt it with `c` and [`exercise_loaded`] the result. If
+/// the corrupted file still loads and its SHA-256 digest verifies, it must
+/// equal the original: the digest catches any real change.
+pub fn check_corruption(doc: &Doc, c: &Corruption) {
+    let bytes = doc.build().expect("build");
+    let m = c.apply(&bytes);
+    exercise_loaded(&m);
+    if let Ok(hs) = Hashset::load(&m)
+        && hs.verify_digest()
+    {
+        assert!(
+            m == bytes,
+            "corrupted file ({} of {} bytes) passed verify_digest",
+            m.len(),
+            bytes.len()
+        );
     }
 }
 

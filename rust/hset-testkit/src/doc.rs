@@ -353,7 +353,7 @@ impl Expected {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use hset::format::decode;
 
@@ -364,7 +364,7 @@ mod tests {
     }
 
     /// Fields md5 and sizes; r3 duplicates r0 and r4 is all absent.
-    fn two_field_doc() -> Doc {
+    pub(crate) fn two_field_doc() -> Doc {
         Doc {
             fields: vec![
                 Field::canonical(HashType::Md5),
