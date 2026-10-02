@@ -32,6 +32,7 @@ fmt-check:
 # Clippy over the workspace with warnings fatal.
 lint:
     cargo clippy --workspace --all-targets -- -D warnings
+    cargo clippy --manifest-path fuzz/Cargo.toml --all-targets -- -D warnings
 
 # Commit gate: unit, interop, CLI and property tests at default case counts.
 # nextest does not run doctests, so they run separately to keep this the
@@ -47,3 +48,53 @@ prop:
 
 # Fast gate, run on every change.
 check: fmt-check lint test
+
+# Fuzz one target without a time limit: `just fuzz lookup`. Extra arguments
+# go to libFuzzer. New inputs land in target/fuzz-corpus so the committed
+# seeds stay clean (fuzz/README.md).
+fuzz target *extra:
+    #!/bin/sh
+    set -eu
+    if ! command -v cargo-fuzz >/dev/null 2>&1; then
+        echo "SKIP: cargo-fuzz not installed; cargo install cargo-fuzz" >&2
+        exit 0
+    fi
+    case "{{ target }}" in lookup) max_len=1048576 ;; *) max_len=65536 ;; esac
+    mkdir -p "target/fuzz-corpus/{{ target }}" "fuzz/corpus/{{ target }}"
+    cargo fuzz run -s {{ fuzz_sanitizer }} "{{ target }}" \
+        "target/fuzz-corpus/{{ target }}" "fuzz/corpus/{{ target }}" -- \
+        -timeout=10 -rss_limit_mb=2048 -dict=fuzz/hset.dict -max_len=$max_len {{ extra }}
+
+# Bounded fuzzing: every target, FUZZ_SECONDS each.
+fuzz-ci:
+    #!/bin/sh
+    set -eu
+    if ! command -v cargo-fuzz >/dev/null 2>&1; then
+        echo "SKIP: cargo-fuzz not installed; cargo install cargo-fuzz" >&2
+        exit 0
+    fi
+    targets=$(cargo fuzz list)
+    if [ -z "$targets" ]; then
+        echo "no fuzz targets found under fuzz/fuzz_targets/" >&2
+        exit 1
+    fi
+    for target in $targets; do
+        echo "fuzzing $target for {{ fuzz_seconds }}s"
+        just fuzz "$target" -max_total_time={{ fuzz_seconds }}
+    done
+
+# Fold the scratch corpus of one target into the committed seeds, minimised.
+# `cargo fuzz cmin` minimises a single directory in place, so the scratch
+# inputs are copied in first. A greedy set cover over edge coverage (hit
+# counts ignored) keeps the seeds to a few dozen files per target.
+fuzz-seed target:
+    #!/bin/sh
+    set -eu
+    if ! command -v cargo-fuzz >/dev/null 2>&1; then
+        echo "SKIP: cargo-fuzz not installed; cargo install cargo-fuzz" >&2
+        exit 0
+    fi
+    mkdir -p "fuzz/corpus/{{ target }}" "target/fuzz-corpus/{{ target }}"
+    find "target/fuzz-corpus/{{ target }}" -type f -exec cp {} "fuzz/corpus/{{ target }}/" \;
+    cargo fuzz cmin -s {{ fuzz_sanitizer }} "{{ target }}" "fuzz/corpus/{{ target }}" -- \
+        -set_cover_merge=1 -use_counters=0

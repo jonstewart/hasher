@@ -24,6 +24,9 @@
 //! [`check_hex`] and [`check_hex_rows`] are the hex-codec properties: every
 //! [`simd_levels`] level agrees with [`hex_oracle`] and rejects a bad
 //! digit, and the row APIs agree with it over whole rows.
+//!
+//! [`check_text_input`] is the text-parsing property: `Builder::add_text`
+//! never panics and accepts exactly what [`text_oracle_accepts`] does.
 
 use std::collections::BTreeSet;
 use std::panic::{AssertUnwindSafe, catch_unwind, resume_unwind};
@@ -33,6 +36,7 @@ use hset::lookup::{HintSpec, Lookup, build_hint, hint_from_parts, make_lookup_wi
 use hset::ops::{SetOp, apply};
 use hset::{Builder, Error, HashType, Hashset};
 
+use hset::builder::parse_value;
 use hset::hex;
 
 use crate::corrupt::Corruption;
@@ -606,4 +610,98 @@ pub fn check_hex_rows(data: &[u8], width: usize, sep: &[u8]) {
         "decode_rows should reject a row with a bad digit"
     );
     assert_eq!(out, sentinel, "out after a bad-digit row");
+}
+
+/// The field sets [`check_text_input`] parses against: one digest, a
+/// digest with a size, the float column alone, and three columns mixed.
+const TEXT_FIELD_SETS: [&[HashType]; 4] = [
+    &[HashType::Md5],
+    &[HashType::Sha1, HashType::Size],
+    &[HashType::Entropy],
+    &[HashType::Md5, HashType::Sha1, HashType::Size],
+];
+
+/// Whether `Builder::add_text` should accept `text` for `fields`, decided
+/// line by line from `text.lines()`: strip one trailing `'\r'`; an empty
+/// line is accepted; otherwise the line needs exactly `fields.len()`
+/// columns split on `' '`, and each non-empty column must parse — a
+/// digest as exactly `2 * length` ASCII hex digits, `Size` as a `u64`,
+/// `Entropy` as an `f64`. An empty column is an absent value.
+fn text_oracle_accepts(fields: &[HashType], text: &str) -> bool {
+    text.lines().all(|line| {
+        let line = line.strip_suffix('\r').unwrap_or(line);
+        if line.is_empty() {
+            return true;
+        }
+        let cols: Vec<&str> = line.split(' ').collect();
+        cols.len() == fields.len()
+            && fields.iter().zip(&cols).all(|(t, col)| {
+                col.is_empty()
+                    || match t {
+                        HashType::Size => col.parse::<u64>().is_ok(),
+                        HashType::Entropy => col.parse::<f64>().is_ok(),
+                        t => {
+                            let len = t.length().expect("storable type has a length");
+                            col.len() == 2 * len && col.bytes().all(|b| b.is_ascii_hexdigit())
+                        }
+                    }
+            })
+    })
+}
+
+/// For every [`TEXT_FIELD_SETS`] entry: `Builder::add_text(text)` does not
+/// panic and is `Ok` exactly when [`text_oracle_accepts`]; and
+/// `parse_value` on every space-separated column of every line, for every
+/// field, does not panic.
+pub fn check_text_input(text: &str) {
+    for types in TEXT_FIELD_SETS {
+        let mut b = Builder::new(types).expect("storable, distinct types");
+        let got = b.add_text(text);
+        let want = text_oracle_accepts(types, text);
+        assert_eq!(
+            got.is_ok(),
+            want,
+            "add_text for {types:?} on {text:?}: got {got:?}, oracle says {want}"
+        );
+        for f in b.fields() {
+            for line in text.lines() {
+                for col in line.split(' ') {
+                    let _ = parse_value(f, col);
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn text_input_accepts_well_formed_lines() {
+        let md5 = "0123456789abcdef0123456789ABCDEF";
+        let sha1 = "00112233445566778899aabbccddeeff00112233";
+        assert!(text_oracle_accepts(
+            &[HashType::Md5],
+            &format!("{md5}\r\n\n{md5}")
+        ));
+        assert!(text_oracle_accepts(
+            &[HashType::Md5, HashType::Sha1, HashType::Size],
+            &format!("{md5} {sha1} 42\n {sha1} \n  ")
+        ));
+        assert!(text_oracle_accepts(&[HashType::Entropy], "7.5\ninf\n"));
+        check_text_input(&format!("{md5}\r\n{md5} {sha1} 42\n"));
+    }
+
+    #[test]
+    fn text_input_rejects_malformed_lines() {
+        assert!(!text_oracle_accepts(&[HashType::Md5], "0123"));
+        assert!(!text_oracle_accepts(
+            &[HashType::Sha1, HashType::Size],
+            " -1"
+        ));
+        assert!(!text_oracle_accepts(&[HashType::Entropy], "x"));
+        assert!(!text_oracle_accepts(&[HashType::Md5], "a b"));
+        check_text_input("0123\n a b\t\n");
+    }
 }

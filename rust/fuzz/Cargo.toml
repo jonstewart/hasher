@@ -1,0 +1,63 @@
+[package]
+name = "hset-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+arbitrary = { version = "1.4", features = ["derive"] }
+hset = { path = "../hset" }
+hset-testkit = { path = "../hset-testkit" }
+
+[[bin]]
+name = "decode_bytes"
+path = "fuzz_targets/decode_bytes.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "corrupt_doc"
+path = "fuzz_targets/corrupt_doc.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "lookup"
+path = "fuzz_targets/lookup.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "build_doc"
+path = "fuzz_targets/build_doc.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "set_ops"
+path = "fuzz_targets/set_ops.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "hex"
+path = "fuzz_targets/hex.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "text_input"
+path = "fuzz_targets/text_input.rs"
+test = false
+doc = false
+bench = false
