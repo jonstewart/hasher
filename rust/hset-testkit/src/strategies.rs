@@ -353,6 +353,14 @@ pub fn doc_pair_mismatched() -> BoxedStrategy<(Doc, Doc)> {
 
 /// A document `hset make` can express: canonical names, records and hash
 /// sets, and the default bits policy apart from the budget.
+///
+/// A single-field document's all-absent record has no text rendering:
+/// `Doc::to_text()` writes its one empty column as a blank line, and a
+/// blank line is always a skipped separator in `hset make`'s input
+/// format, never a record (there is no other way to write "this field is
+/// absent" as text when it is the only field). Such a record is not
+/// round-trippable through `hset make`, so `cli_doc()` never generates
+/// one.
 pub fn cli_doc() -> BoxedStrategy<Doc> {
     doc()
         .prop_map(|mut d| {
@@ -365,6 +373,9 @@ pub fn cli_doc() -> BoxedStrategy<Doc> {
                 budget: d.opts.bits_policy.budget,
                 ..BitsPolicy::default()
             };
+            if d.fields.len() == 1 {
+                d.records.retain(|r| r[0].is_some());
+            }
             d
         })
         .boxed()

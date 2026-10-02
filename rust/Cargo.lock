@@ -403,7 +403,9 @@ version = "0.1.0"
 dependencies = [
  "clap",
  "hset",
+ "hset-testkit",
  "memmap2",
+ "proptest",
 ]
 
 [[package]]

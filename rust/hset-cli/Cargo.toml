@@ -16,3 +16,7 @@ path = "src/main.rs"
 hset = { path = "../hset" }
 clap.workspace = true
 memmap2.workspace = true
+
+[dev-dependencies]
+hset-testkit.workspace = true
+proptest.workspace = true
