@@ -1,12 +1,104 @@
-//! Shared robustness exerciser used by `hset`'s `tests/robustness.rs` and
-//! (in later tasks) its fuzz targets: once a `Hashset` loads, hammer every
-//! query and record-access path the kit knows about. Panics are the
-//! failure signal — nothing here distinguishes a correctness bug from a
-//! crash beyond that.
+//! Shared checks used by `hset`'s tests and (in later tasks) its fuzz
+//! targets.
+//!
+//! [`exercise_loaded`] is the robustness exerciser: once a `Hashset` loads,
+//! hammer every query and record-access path the kit knows about. Panics
+//! are the failure signal — nothing there distinguishes a correctness bug
+//! from a crash beyond that.
+//!
+//! [`check_doc_roundtrip`] is the format property: a [`Doc`] builds,
+//! decodes to its oracle, verifies, answers lookups per the oracle, builds
+//! deterministically and rebuilds from its own decoded records.
 
-use hset::{HashType, Hashset};
+use std::panic::{AssertUnwindSafe, catch_unwind, resume_unwind};
 
+use hset::format::decode;
+use hset::{Builder, HashType, Hashset};
+
+use crate::doc::Doc;
 use crate::strategies::queries;
+
+/// Build `doc`, decode and check it against `doc.expected()`, load and
+/// verify it, check `records_for`/`equal_range` per section against the
+/// oracle, rebuild it for determinism and, when it has records, rebuild it
+/// from its decoded records. Any failure panics with the doc's `Debug`.
+pub fn check_doc_roundtrip(doc: &Doc) {
+    if let Err(payload) = catch_unwind(AssertUnwindSafe(|| roundtrip(doc))) {
+        let msg = payload
+            .downcast_ref::<String>()
+            .map(String::as_str)
+            .or_else(|| payload.downcast_ref::<&str>().copied());
+        match msg {
+            Some(m) => panic!("{m}\ndoc: {doc:?}"),
+            None => resume_unwind(payload),
+        }
+    }
+}
+
+fn roundtrip(doc: &Doc) {
+    // 1. Build, decode, compare with the oracle.
+    let bytes = doc.build().expect("build");
+    let file = decode(&bytes).expect("decode");
+    let expected = doc.expected();
+    expected.assert_matches(&file);
+
+    // 2. Load, digest, verify.
+    let hs = Hashset::load(&bytes).expect("load");
+    assert!(hs.verify_digest(), "verify_digest");
+    let report = hs.verify();
+    assert!(report.is_ok(), "verify: {:?}", report.problems);
+
+    // 3. Review Focus 5: records_for and equal_range per distinct stored
+    //    hash, against the oracle's hashes and ridx.
+    let rows = expected.records.as_deref().unwrap_or(&[]);
+    for (idx, e) in expected.sections.iter().enumerate() {
+        let mut distinct = e.hashes.clone();
+        distinct.dedup();
+        for h in &distinct {
+            let multiplicity = e.hashes.iter().filter(|x| *x == h).count();
+            let range = hs.equal_range(idx, h);
+            assert_eq!(
+                range.len(),
+                multiplicity,
+                "section {idx} equal_range({h:02x?}) = {range:?}"
+            );
+            let mut want: Vec<&[u8]> = match &e.ridx {
+                Some(ridx) => e
+                    .hashes
+                    .iter()
+                    .zip(ridx)
+                    .filter(|(x, _)| *x == h)
+                    .map(|(_, &r)| rows[r as usize].as_slice())
+                    .collect(),
+                None => Vec::new(),
+            };
+            want.sort_unstable();
+            let mut got = hs.records_for(idx, h);
+            got.sort_unstable();
+            assert_eq!(got, want, "section {idx} records_for({h:02x?})");
+        }
+    }
+
+    // 4. Determinism.
+    assert!(
+        doc.build().expect("second build") == bytes,
+        "rebuild differs"
+    );
+
+    // 5. Rebuild from the decoded records.
+    if doc.opts.with_records {
+        let rhdr = file.rhdr.as_ref().expect("rhdr");
+        let mut b = Builder::with_fields(rhdr.fields.clone());
+        for i in 0..file.record_count() {
+            let rec = file.record(i).expect("record");
+            b.add_raw_record(rec).expect("add_raw_record");
+        }
+        let rebuilt = b
+            .build(&doc.opts.build_options())
+            .expect("build from decoded records");
+        assert!(rebuilt == bytes, "build from decoded records differs");
+    }
+}
 
 /// Cap on probes per section/record sweep: enough to cover interesting
 /// structure (first, middle, last, duplicates) without making corruption
