@@ -171,9 +171,12 @@ impl Builder {
 
     /// Add a record from a line of text: one space-separated column per
     /// field, hex for digests and a decimal integer for sizes. An empty
-    /// column means the value is absent; blank lines are ignored.
+    /// column means the value is absent; blank lines are ignored. One line
+    /// ending (`"\n"`, `"\r\n"` or a lone `'\r'`) is stripped, as the C++
+    /// line reader does; any further `'\r'` is part of the last column.
     pub fn add_text_line(&mut self, line: &str) -> Result<()> {
-        let line = line.trim_end_matches(['\r', '\n']);
+        let line = line.strip_suffix('\n').unwrap_or(line);
+        let line = line.strip_suffix('\r').unwrap_or(line);
         if line.is_empty() {
             return Ok(());
         }
