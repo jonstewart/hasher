@@ -5,3 +5,4 @@
 # It is recommended to check this file in to source control so that
 # everyone who runs the test benefits from these saved cases.
 cc 331d27d9997f2ac34bad7fb64fc422c7fa0ae48c85138268a8e2f12e166a0b31 # shrinks to buf = [0, 0, 0, 1], pos = 2, n = 0
+cc cc70372cc5cbedcdd53da8139ed141908822cb0f7e5d10914e8f37a7b8bc41bf # shrinks to buf = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 128, 0, 0], pos = 11, n = 0

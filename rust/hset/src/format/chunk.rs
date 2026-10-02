@@ -322,8 +322,7 @@ mod proptests {
         }
     }
 
-    /// A reader op on a cursor, reduced to how many bytes it consumed on
-    /// success.
+    /// A reader op on a cursor.
     #[derive(Debug, Clone, Copy)]
     enum Read {
         U8,
@@ -336,17 +335,35 @@ mod proptests {
         Bytes(usize),
     }
 
-    fn apply(c: &mut Cursor<'_>, r: Read) -> Result<usize> {
-        Ok(match r {
-            Read::U8 => c.u8().map(|_| 1)?,
-            Read::LeU16 => c.le_u16().map(|_| 2)?,
-            Read::LeU32 => c.le_u32().map(|_| 4)?,
-            Read::LeU64 => c.le_u64().map(|_| 8)?,
-            Read::BeU16 => c.be_u16().map(|_| 2)?,
-            Read::BeU32 => c.be_u32().map(|_| 4)?,
-            Read::PString => c.pstring().map(|s| pstring_len(&s))?,
-            Read::Bytes(n) => c.bytes(n).map(<[u8]>::len)?,
-        })
+    fn apply(c: &mut Cursor<'_>, r: Read) -> Result<()> {
+        match r {
+            Read::U8 => c.u8().map(drop),
+            Read::LeU16 => c.le_u16().map(drop),
+            Read::LeU32 => c.le_u32().map(drop),
+            Read::LeU64 => c.le_u64().map(drop),
+            Read::BeU16 => c.be_u16().map(drop),
+            Read::BeU32 => c.be_u32().map(drop),
+            Read::PString => c.pstring().map(drop),
+            Read::Bytes(n) => c.bytes(n).map(drop),
+        }
+    }
+
+    /// Bytes `r` consumes at `pos` in `buf`, or `None` if it does not fit.
+    /// Computed from the raw buffer, independently of `Cursor`; a pstring's
+    /// width comes from its length prefix, not from the decoded (lossy) text.
+    fn width(buf: &[u8], pos: usize, r: Read) -> Option<usize> {
+        let w = match r {
+            Read::U8 => 1,
+            Read::LeU16 | Read::BeU16 => 2,
+            Read::LeU32 | Read::BeU32 => 4,
+            Read::LeU64 => 8,
+            Read::Bytes(n) => n,
+            Read::PString => {
+                let p = buf.get(pos..pos.checked_add(2)?)?;
+                2 + usize::from(u16::from_le_bytes([p[0], p[1]]))
+            }
+        };
+        (w <= buf.len() - pos).then_some(w)
     }
 
     /// Shrunk case of `cursor_never_panics`: `pstring` read the length
@@ -407,19 +424,19 @@ mod proptests {
             // Each reader from a fresh cursor at `pos` ...
             for r in reads {
                 let mut c = Cursor::new(&buf, pos).unwrap();
-                match apply(&mut c, r) {
-                    Ok(w) => prop_assert_eq!(c.position(), pos + w, "{:?}", r),
-                    Err(_) => prop_assert_eq!(c.position(), pos, "{:?}", r),
-                }
+                let ok = apply(&mut c, r).is_ok();
+                let w = width(&buf, pos, r);
+                prop_assert_eq!(ok, w.is_some(), "{:?}", r);
+                prop_assert_eq!(c.position(), pos + w.unwrap_or(0), "{:?}", r);
             }
             // ... and all of them in sequence on one cursor.
             let mut c = Cursor::new(&buf, pos).unwrap();
             for r in reads {
                 let before = c.position();
-                match apply(&mut c, r) {
-                    Ok(w) => prop_assert_eq!(c.position(), before + w, "{:?}", r),
-                    Err(_) => prop_assert_eq!(c.position(), before, "{:?}", r),
-                }
+                let ok = apply(&mut c, r).is_ok();
+                let w = width(&buf, before, r);
+                prop_assert_eq!(ok, w.is_some(), "{:?}", r);
+                prop_assert_eq!(c.position(), before + w.unwrap_or(0), "{:?}", r);
             }
         }
 
