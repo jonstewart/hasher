@@ -12,15 +12,21 @@
 //!
 //! [`check_lookup`] is the lookup property: every strategy (hint kind,
 //! search config, hash length) answers like the linear-scan [`NaiveSet`].
+//!
+//! [`check_set_op`] is the set-algebra property: `ops::apply` answers like
+//! [`set_op_model`] over [`Doc::op_rows`] in the [`canonical_layout`], or
+//! fails with the documented input error.
 
+use std::collections::BTreeSet;
 use std::panic::{AssertUnwindSafe, catch_unwind, resume_unwind};
 
-use hset::format::decode;
+use hset::format::{FieldDescriptor, decode};
 use hset::lookup::{HintSpec, Lookup, build_hint, hint_from_parts, make_lookup_with};
-use hset::{Builder, HashType, Hashset};
+use hset::ops::{SetOp, apply};
+use hset::{Builder, Error, HashType, Hashset};
 
-use crate::doc::Doc;
-use crate::oracle::NaiveSet;
+use crate::doc::{Doc, Opts};
+use crate::oracle::{NaiveSet, set_op_model};
 use crate::strategies::{LookupCase, UNSUPPORTED_LENGTH, queries};
 
 /// Build `doc`, decode and check it against `doc.expected()`, load and
@@ -288,5 +294,116 @@ fn check_query(lk: &dyn Lookup, naive: &NaiveSet, q: &[u8]) {
             w.contains(&i),
             "found {i} for {q:02x?} outside window {w:?}"
         );
+    }
+}
+
+/// `doc`'s field descriptors sorted by `(htype, length)`: the layout
+/// `ops::apply` gives its result (names are `doc`'s and play no part in
+/// the rows).
+pub fn canonical_layout(doc: &Doc) -> Vec<FieldDescriptor> {
+    let mut layout = doc.descriptors();
+    layout.sort_by_key(|d| (d.htype, d.length));
+    layout
+}
+
+/// Build both docs, decode, `ops::apply`. Returns the result rows in the
+/// canonical layout (fields ascending by `(htype, length)`) or `None` when
+/// `apply` returned an error.
+pub fn apply_rows(op: SetOp, a: &Doc, b: &Doc) -> Option<BTreeSet<Vec<u8>>> {
+    apply_result(op, a, b).ok()
+}
+
+/// [`apply_rows`] keeping `apply`'s error. The result is built with
+/// [`Opts::default_for_tests`] (records on), decoded, checked to carry the
+/// canonical layout of `a`, and read back as record rows; a result without
+/// records (a single hash section) reads as `[1] ++ hash` rows, the form
+/// [`Doc::op_rows`] gives a hashes-only document.
+fn apply_result(op: SetOp, a: &Doc, b: &Doc) -> hset::Result<BTreeSet<Vec<u8>>> {
+    let (ab, bb) = (a.build().expect("build a"), b.build().expect("build b"));
+    let fa = decode(&ab).expect("decode a");
+    let fb = decode(&bb).expect("decode b");
+    let builder = apply(op, &fa, &fb)?;
+    let out = builder
+        .build(&Opts::default_for_tests().build_options())
+        .expect("build result");
+    let file = decode(&out).expect("decode result");
+    let shape = |fs: &[FieldDescriptor]| -> Vec<(HashType, u64)> {
+        fs.iter().map(|f| (f.htype, f.length)).collect()
+    };
+    let layout = canonical_layout(a);
+    if let Some(rhdr) = &file.rhdr {
+        assert_eq!(
+            shape(&rhdr.fields),
+            shape(&layout),
+            "result fields are not the canonical layout"
+        );
+        Ok((0..file.record_count())
+            .map(|i| file.record(i).expect("result record").to_vec())
+            .collect())
+    } else {
+        let [s] = file.sections.as_slice() else {
+            panic!("a records-less result has {} sections", file.sections.len());
+        };
+        assert_eq!(
+            vec![(s.header.htype, s.header.hash_length)],
+            shape(&layout),
+            "result section is not the canonical layout"
+        );
+        Ok((0..s.len())
+            .map(|i| [&[1u8][..], s.hash(i)].concat())
+            .collect())
+    }
+}
+
+/// Whether `ops::apply` can take `doc` as an operand: it has records, or
+/// it is hashes-only with a single field.
+fn expressible(doc: &Doc) -> bool {
+    doc.opts.with_records || doc.fields.len() == 1
+}
+
+/// `apply_rows` == `set_op_model` over `op_rows` in the canonical layout, or
+/// the documented error: error iff type sets differ, or an operand has
+/// `!with_records && fields.len() != 1`. The error is `Error::Input`; its
+/// Display contains "no records" / "set operations need records" for a
+/// records-less operand (checked first), else "mismatch".
+pub fn check_set_op(op: SetOp, a: &Doc, b: &Doc) {
+    let types = |d: &Doc| -> BTreeSet<(HashType, u64)> {
+        d.descriptors()
+            .iter()
+            .map(|f| (f.htype, f.length))
+            .collect()
+    };
+    let records_less = !expressible(a) || !expressible(b);
+    let mismatch = types(a) != types(b);
+    match apply_result(op, a, b) {
+        Ok(got) => {
+            assert!(
+                !records_less && !mismatch,
+                "{op:?} succeeded but should fail (records-less {records_less}, \
+                 mismatch {mismatch})\na: {a:?}\nb: {b:?}"
+            );
+            let layout = canonical_layout(a);
+            let want = set_op_model(op, &a.op_rows(&layout), &b.op_rows(&layout));
+            assert_eq!(
+                got, want,
+                "{op:?} differs from the model\na: {a:?}\nb: {b:?}"
+            );
+        }
+        Err(e) => {
+            assert!(
+                records_less || mismatch,
+                "{op:?} failed unexpectedly: {e}\na: {a:?}\nb: {b:?}"
+            );
+            assert!(matches!(e, Error::Input(_)), "{op:?} error kind: {e:?}");
+            let msg = e.to_string();
+            if records_less {
+                assert!(
+                    msg.contains("no records") || msg.contains("set operations need records"),
+                    "records-less error: {msg}"
+                );
+            } else {
+                assert!(msg.contains("mismatch"), "mismatch error: {msg}");
+            }
+        }
     }
 }
