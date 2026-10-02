@@ -2,5 +2,7 @@
 //! document and oracles computed independently of `hset`'s builder. Used
 //! only from `tests/` directories and the fuzz crate.
 
+pub mod arb;
 pub mod doc;
 pub mod oracle;
+pub mod strategies;
