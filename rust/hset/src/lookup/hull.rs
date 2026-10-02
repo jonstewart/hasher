@@ -203,7 +203,16 @@ fn fit_block(indices: std::ops::Range<usize>, frac: impl Fn(usize) -> u32) -> Hu
     if pts.is_empty() {
         return HullEntry::EMPTY;
     }
-    let slope = choose_slope(&pts);
+    // A steep slope over a narrow block can predict positions near 2^32,
+    // leaving residuals no `i32` holds. Slope 0 always fits: its residuals
+    // are the indices themselves, below 2^31.
+    let fitted = residual_bounds(choose_slope(&pts), &pts);
+    fitted.unwrap_or_else(|| residual_bounds(0, &pts).expect("indices fit in i32"))
+}
+
+/// The entry for `slope` with the exact residual bounds over `pts`, or
+/// `None` if a bound does not fit in `i32`.
+fn residual_bounds(slope: u32, pts: &[Pt]) -> Option<HullEntry> {
     let probe = HullEntry {
         slope,
         rmin: 0,
@@ -211,16 +220,16 @@ fn fit_block(indices: std::ops::Range<usize>, frac: impl Fn(usize) -> u32) -> Hu
     };
     let mut rmin = i64::MAX;
     let mut rmax = i64::MIN;
-    for p in &pts {
+    for p in pts {
         let r = i64::from(p.y) - probe.predict(p.x);
         rmin = rmin.min(r);
         rmax = rmax.max(r);
     }
-    HullEntry {
+    Some(HullEntry {
         slope,
-        rmin: rmin as i32,
-        rmax: rmax as i32,
-    }
+        rmin: i32::try_from(rmin).ok()?,
+        rmax: i32::try_from(rmax).ok()?,
+    })
 }
 
 /// Build the hull table for `data` (sorted, `L` bytes per hash) at `2^bits`
@@ -349,6 +358,16 @@ mod tests {
             hull_avg * 10 < flat_avg * 8,
             "hull avg width {hull_avg} not < 0.8 * flat avg width {flat_avg}"
         );
+    }
+
+    #[test]
+    fn steep_slope_with_out_of_range_residuals_falls_back() {
+        // Fractions 0xfffffffe and 0xffffffff at indices 0 and 1: slope 1
+        // predicts ~2^32, so its residuals do not fit in i32.
+        let mut data = vec![0u8; 2 * 8];
+        data[..8].copy_from_slice(&0x80ff_ffff_ff80_0000u64.to_be_bytes());
+        data[8..].copy_from_slice(&0x80ff_ffff_ffff_0000u64.to_be_bytes());
+        check_table::<8>(&data, 10);
     }
 
     #[test]
