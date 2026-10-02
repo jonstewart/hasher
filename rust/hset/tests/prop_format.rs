@@ -106,3 +106,26 @@ fn hull_two_hashes_in_one_block_verify() {
     };
     check_doc_roundtrip(&doc);
 }
+
+/// Fuzz finding (`text_input`, crash-9ccfbb73…, bytes `0d 0d a6`, which
+/// `Arbitrary for &str` decodes to `"\r\r"`): `add_text_line` trimmed
+/// every trailing `'\r'`/`'\n'`, so a line of two carriage returns was
+/// taken as blank. Like the C++ line reader, only one `'\r'` is a line
+/// ending; the second is content, and not a valid column. (`add_text`
+/// splits with `str::lines`, which already takes the `"\r\n"` of a
+/// `"\r\r\n"` ending, so that line keeps one `'\r'` and is accepted.)
+#[test]
+fn text_line_strips_only_one_carriage_return() {
+    let md5 = "00112233445566778899aabbccddeeff";
+    for (text, ok) in [
+        ("\r\r", false),
+        (&format!("{md5}\r\r") as &str, false),
+        (&format!("{md5}\r\r\n") as &str, true),
+        ("\r", true),
+        (&format!("{md5}\r\n{md5}\r") as &str, true),
+    ] {
+        let mut b = Builder::new(&[HashType::Md5]).unwrap();
+        let r = b.add_text(text);
+        assert_eq!(r.is_ok(), ok, "{text:?}: {r:?}");
+    }
+}
