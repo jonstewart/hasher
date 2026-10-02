@@ -18,12 +18,31 @@ cd rust
 cargo build --release            # library + `target/release/hset`
 cargo test --workspace           # unit, interop (C++ fixtures), and CLI tests
 cargo clippy --workspace --all-targets -- -D warnings
-cargo bench -p hset              # Criterion: lookup latency/throughput, build cost
+cargo bench -p hset              # Criterion: lookup latency/throughput, build cost, hex codec
 ```
 
 Benchmark knobs: `HSET_BENCH_N` (set size, default 1,000,000),
 `HSET_BENCH_HLEN` (hash length, default 20), `HSET_BENCH_ALL=1` (extra
-variants: fixed block bits, binary single search).
+variants: fixed block bits, binary single search), `HSET_BENCH_HEX_LEVELS=1`
+(hex codec pinned to each SIMD level as well as the detected one).
+
+## Hex codec
+
+`hset::hex` encodes and decodes the digests in text input and output with
+SIMD kernels built on [`fearless_simd`](https://crates.io/crates/fearless_simd),
+which selects the instruction level (SSE2, SSE4.2, AVX2, AVX-512, NEON) at
+runtime. Both kernels work on 16-byte blocks: encode splits nibbles, maps them
+to ASCII with a compare-and-select, and interleaves; decode classifies digits
+and case-folded letters with unsigned compares, accumulates an invalid-lane
+mask that is checked once, and packs nibble pairs through 16-bit lanes. A
+trailing partial block re-runs the kernel on the last full block with
+overlapping output, so SHA-1's 20 bytes cost one and a half blocks rather
+than a scalar tail. `hex::scalar` is the portable reference and the oracle
+for the tests, which sweep every length up to 80 bytes, every byte value, and
+every invalid byte at every position. On the development machine (Westmere,
+SSE4.2) decode runs 2.4x to 7.4x faster than the scalar reference across the
+digest widths and encode 1.4x to 3.2x; see
+`experiments/results/criterion-hex-*.md`.
 
 The full experiment matrix behind the design decisions below is reproducible
 with `experiments/run_all.sh`; see `experiments/README.md`. Results from the

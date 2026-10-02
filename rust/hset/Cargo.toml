@@ -8,6 +8,7 @@ description = "Sorted hash-set (.hset) file format: encoder, decoder, and accele
 [dependencies]
 sha2.workspace = true
 thiserror.workspace = true
+fearless_simd.workspace = true
 
 [dev-dependencies]
 criterion.workspace = true
@@ -18,4 +19,8 @@ harness = false
 
 [[bench]]
 name = "build"
+harness = false
+
+[[bench]]
+name = "hex"
 harness = false
