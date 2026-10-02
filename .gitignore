@@ -64,3 +64,7 @@ bench/bench_eval_probe
 bench/gmon.out
 bench/perf.data
 bench/perf.data.old
+
+# macOS metadata copied in with the tree (AppleDouble forks and Finder state)
+._*
+.DS_Store
