@@ -108,16 +108,24 @@ impl Model for FlatBlocks {
         if dmin > dmax {
             return (0, 0);
         }
+        // Saturating: a corrupt table can hold any `i64`, and the result
+        // is clamped to `[0, n]` anyway.
         let e = i64::from(expected_index(hash, n));
-        let lo = (e + dmin).clamp(0, i64::from(n));
-        let hi = (e + dmax + 1).clamp(lo, i64::from(n));
+        let lo = e.saturating_add(dmin).clamp(0, i64::from(n));
+        let hi = e
+            .saturating_add(dmax)
+            .saturating_add(1)
+            .clamp(lo, i64::from(n));
         (lo as u32, hi as u32)
     }
 
     #[inline(always)]
     fn center(&self, key: u64, hash: &[u8], n: u32) -> i64 {
         let (dmin, dmax) = self.table[block_index(key, self.bits)];
-        i64::from(expected_index(hash, n)) + (dmin + dmax) / 2
+        // The midpoint of two `i64`s fits an `i64`; computed wide so a
+        // corrupt table cannot overflow it.
+        let mid = ((i128::from(dmin) + i128::from(dmax)) / 2) as i64;
+        i64::from(expected_index(hash, n)).saturating_add(mid)
     }
 
     #[inline(always)]
@@ -139,7 +147,8 @@ impl Model for FlatBlocks {
             .table
             .iter()
             .filter(|(lo, hi)| lo <= hi)
-            .map(|(lo, hi)| (hi - lo + 1) as f64)
+            // Wide: a corrupt table's bounds can span more than `i64`.
+            .map(|(lo, hi)| (i128::from(*hi) - i128::from(*lo) + 1) as f64)
             .collect();
         (!widths.is_empty()).then(|| widths.iter().sum::<f64>() / widths.len() as f64)
     }
