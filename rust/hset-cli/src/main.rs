@@ -84,10 +84,10 @@ enum Only {
 #[derive(Args, Clone)]
 struct OutputArgs {
     /// Hash set name
-    #[arg(short = 'n', long, default_value = "")]
+    #[arg(short = 'n', long, default_value = "", allow_hyphen_values = true)]
     name: String,
     /// Hash set description
-    #[arg(short = 'd', long, default_value = "")]
+    #[arg(short = 'd', long, default_value = "", allow_hyphen_values = true)]
     desc: String,
     /// Timestamp to record (ISO-8601 UTC); default is now
     #[arg(long)]
