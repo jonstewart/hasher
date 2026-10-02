@@ -9,14 +9,19 @@
 //! [`check_doc_roundtrip`] is the format property: a [`Doc`] builds,
 //! decodes to its oracle, verifies, answers lookups per the oracle, builds
 //! deterministically and rebuilds from its own decoded records.
+//!
+//! [`check_lookup`] is the lookup property: every strategy (hint kind,
+//! search config, hash length) answers like the linear-scan [`NaiveSet`].
 
 use std::panic::{AssertUnwindSafe, catch_unwind, resume_unwind};
 
 use hset::format::decode;
+use hset::lookup::{HintSpec, Lookup, build_hint, hint_from_parts, make_lookup_with};
 use hset::{Builder, HashType, Hashset};
 
 use crate::doc::Doc;
-use crate::strategies::queries;
+use crate::oracle::NaiveSet;
+use crate::strategies::{LookupCase, UNSUPPORTED_LENGTH, queries};
 
 /// Build `doc`, decode and check it against `doc.expected()`, load and
 /// verify it, check `records_for`/`equal_range` per section against the
@@ -184,5 +189,104 @@ fn exercise_records(hs: &Hashset<'_>) {
         for t in HashType::ALL {
             let _ = hs.field_value(r, t);
         }
+    }
+}
+
+/// `contains_batch` sizes tried by [`check_lookup`] (each one that fits in
+/// the case's query count, plus the full count): around the 8-lane SIMD
+/// width and the 256-query sub-batch cap.
+const BATCH_SIZES: [usize; 8] = [0, 1, 7, 8, 9, 255, 256, 257];
+
+/// Bytes appended to a query to check that a longer query is answered by
+/// its `hlen`-byte prefix (Review Focus 3).
+const EXTRA_BYTES: [u8; 5] = [0xA5; 5];
+
+/// How many queries get the long-query check.
+const LONG_QUERIES: usize = 8;
+
+/// Build the case's hint and lookup, then check `find`, `contains`,
+/// `equal_range`, `window` and `contains_batch` against [`NaiveSet`] for
+/// every query and every stored hash. For the unsupported hash length a
+/// requested hint must be an error.
+pub fn check_lookup(case: &LookupCase) {
+    let hlen = case.hlen;
+    let data = &case.data;
+
+    // 1. The hint; unsupported for UNSUPPORTED_LENGTH.
+    let built = build_hint(hlen, data, case.hint);
+    if hlen == UNSUPPORTED_LENGTH && case.hint != HintSpec::None {
+        assert!(
+            built.is_err(),
+            "build_hint({hlen}, {:?}) should fail: {built:?}",
+            case.hint
+        );
+        return;
+    }
+    let hint = built.expect("build_hint");
+
+    // 2. The lookup and the oracle.
+    let parts = hint.as_ref().map(|(t, b)| hint_from_parts(*t, b));
+    let lk = make_lookup_with(hlen, data, parts.as_ref(), case.cfg).expect("make_lookup_with");
+    let naive = NaiveSet::from_bytes(data, hlen);
+
+    // 3. Every query.
+    let queries: Vec<&[u8]> = case.queries.chunks_exact(hlen).collect();
+    for q in &queries {
+        check_query(lk.as_ref(), &naive, q);
+    }
+
+    // 4. Every stored hash lies inside its own window.
+    for (i, h) in data.chunks_exact(hlen).enumerate() {
+        let w = lk.window(h);
+        assert!(
+            w.contains(&i),
+            "stored hash {i} {h:02x?} outside window {w:?}"
+        );
+        assert_eq!(lk.find(h), naive.find(h), "find(stored {i} {h:02x?})");
+    }
+
+    // 5. Batches of each size that fits, and the whole query list.
+    let m = queries.len();
+    let want: Vec<bool> = queries.iter().map(|q| naive.contains(q)).collect();
+    for size in BATCH_SIZES.into_iter().chain([m]).filter(|&s| s <= m) {
+        let mut out = vec![false; size];
+        lk.contains_batch(&case.queries[..size * hlen], &mut out);
+        assert_eq!(out, want[..size], "contains_batch of {size}");
+    }
+
+    // 6. Review Focus 3: a longer query is answered by its prefix.
+    for q in queries.iter().take(LONG_QUERIES) {
+        let long = [*q, &EXTRA_BYTES[..]].concat();
+        assert_eq!(
+            lk.contains(&long),
+            lk.contains(q),
+            "contains(long {long:02x?})"
+        );
+        assert_eq!(lk.find(&long), lk.find(q), "find(long {long:02x?})");
+        assert_eq!(
+            lk.equal_range(&long),
+            lk.equal_range(q),
+            "equal_range(long {long:02x?})"
+        );
+    }
+}
+
+/// `find`, `contains`, `equal_range` and (when found) `window` for one
+/// exact-length query.
+fn check_query(lk: &dyn Lookup, naive: &NaiveSet, q: &[u8]) {
+    let found = lk.find(q);
+    assert_eq!(found, naive.find(q), "find({q:02x?})");
+    assert_eq!(lk.contains(q), naive.contains(q), "contains({q:02x?})");
+    assert_eq!(
+        lk.equal_range(q),
+        naive.equal_range(q),
+        "equal_range({q:02x?})"
+    );
+    if let Some(i) = found {
+        let w = lk.window(q);
+        assert!(
+            w.contains(&i),
+            "found {i} for {q:02x?} outside window {w:?}"
+        );
     }
 }
