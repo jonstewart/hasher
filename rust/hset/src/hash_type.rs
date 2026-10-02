@@ -143,12 +143,13 @@ impl HashType {
         self.length().is_some()
     }
 
-    /// Parse a user-supplied name. Case, hyphens, and underscores are
-    /// ignored, so `"SHA-1"`, `"sha1"`, and `"Sha_1"` all parse.
+    /// Parse a user-supplied name. Case, hyphens, underscores, and
+    /// whitespace are ignored, so `"SHA-1"`, `"sha1"`, `"Sha_1"`, and the
+    /// display name `"Quick MD5"` all parse.
     pub fn parse(name: &str) -> Result<HashType> {
         let norm: String = name
             .chars()
-            .filter(|c| *c != '-' && *c != '_')
+            .filter(|c| *c != '-' && *c != '_' && !c.is_whitespace())
             .flat_map(char::to_lowercase)
             .collect();
         let t = match norm.as_str() {
