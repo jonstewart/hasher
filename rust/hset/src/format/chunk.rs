@@ -131,9 +131,11 @@ impl<'a> Cursor<'a> {
     }
 
     /// `u16 LE` length-prefixed UTF-8 string (invalid UTF-8 is replaced).
+    /// On error the position is unchanged, as for every other reader.
     pub fn pstring(&mut self) -> Result<String> {
+        let start = self.pos;
         let len = usize::from(self.le_u16()?);
-        let b = self.bytes(len)?;
+        let b = self.bytes(len).inspect_err(|_| self.pos = start)?;
         Ok(String::from_utf8_lossy(b).into_owned())
     }
 }
