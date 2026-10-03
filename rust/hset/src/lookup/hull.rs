@@ -407,6 +407,11 @@ mod proptests {
     }
 
     proptest! {
+        // Kani harnesses for `fit_block` were attempted and dropped: even
+        // two symbolic points exhaust 3 GiB in under a minute, because
+        // `choose_slope`'s `f64` division, `round` and cast are bit-blasted
+        // exactly by CBMC. The coverage is this proptest and
+        // `fit_is_no_worse_than_chord_or_zero_slope`.
         #[test]
         fn fitted_bounds_cover_points(mut xs in prop::collection::vec(any::<u32>(), 1..=64)) {
             xs.sort_unstable();

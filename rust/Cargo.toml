@@ -20,10 +20,10 @@ proptest = "1.11"
 arbitrary = { version = "1.4", features = ["derive"] }
 hset-testkit = { path = "hset-testkit" }
 
-# hset carries #[cfg(kani)] mod proofs and #[cfg(kani_slow)] harnesses for
-# later tasks; declare the cfgs here so clippy/rustc don't warn on them.
+# hset carries #[cfg(kani)] mod proofs; declare the cfg here so clippy/rustc
+# don't warn on it.
 [workspace.lints.rust]
-unexpected_cfgs = { level = "warn", check-cfg = ['cfg(kani)', 'cfg(kani_slow)'] }
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(kani)'] }
 
 [profile.release]
 debug = 1

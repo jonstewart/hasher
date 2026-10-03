@@ -290,6 +290,11 @@ mod proptests {
     }
 
     proptest! {
+        // A Kani harness for `merge` at width 1 was attempted and dropped:
+        // the symbolic-length `memcmp`/`memcpy` behind `row().cmp()` and
+        // `extend_from_slice`, unwound for three operators, took symbolic
+        // execution past four minutes and 3 GiB with sets of two bytes.
+        // The coverage is this proptest and the `prop_ops` tests.
         #[test]
         fn merge_matches_btreeset((width, a, b) in width_and_sets()) {
             let a_bytes = concat(a.iter());
