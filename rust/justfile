@@ -117,6 +117,10 @@ verify:
 
 # Mutation-test one crate: `just mutants hset`. A runaway mutant eats memory
 # first, so on Linux the run sits in a systemd scope with a hard cap.
+# OOMPolicy=continue: the scope's default policy stops the whole unit on the
+# first OOM kill, which would discard the run over one runaway mutant;
+# `continue` kills just that test process and lets cargo-mutants record it
+# as caught.
 # cargo-mutants copies only the `rust/` workspace into a tempdir, so the C++
 # fixtures under `test/` (outside the workspace) are not there; export
 # HSET_FIXTURES_DIR as an absolute path so the copied tree's tests still
@@ -140,6 +144,7 @@ mutants crate:
         exit 0
     fi
     systemd-run --user --scope -q -p MemoryMax={{ mutants_memory }} -p MemorySwapMax=0 \
+        -p OOMPolicy=continue \
         cargo mutants --package {{ crate }} -j {{ mutants_jobs }}
 
 # Mutants only in code changed since main: the daily form. `--relative`

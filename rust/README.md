@@ -29,7 +29,7 @@ The rest runs through `just` (`just --list` for the menu):
 | `test` | `cargo nextest run --workspace`; proptests at their default case count | gate |
 | `check` | `fmt-check lint test` | gate |
 | `prop` | `PROPTEST_CASES=${PROPTEST_CASES:-20000} cargo nextest run --workspace`; the whole suite, since in-crate proptests live in the unit-test binaries and the example tests cost only seconds | nightly |
-| `mutants crate` | `cargo mutants -p crate -j $MUTANTS_JOBS` inside `systemd-run --user --scope -p MemoryMax=$MUTANTS_MEMORY -p MemorySwapMax=0`; without `systemd-run` (macOS) run uncapped with a warning | nightly |
+| `mutants crate` | `cargo mutants -p crate -j $MUTANTS_JOBS` inside `systemd-run --user --scope -p MemoryMax=$MUTANTS_MEMORY -p MemorySwapMax=0 -p OOMPolicy=continue` (the last so an OOM kill takes only the runaway mutant's test, not the whole run); without `systemd-run` (macOS) run uncapped with a warning | nightly |
 | `mutants-diff` | `git diff --relative main... > target/mutants.diff; cargo mutants --workspace --in-diff target/mutants.diff` | on demand |
 | `fuzz target` | `cargo fuzz run -s $FUZZ_SANITIZER target target/fuzz-corpus/target fuzz/corpus/target -- <limits>`; unbounded | on demand |
 | `fuzz-ci` | every target from `cargo fuzz list`, `-max_total_time=$FUZZ_SECONDS` each | nightly |

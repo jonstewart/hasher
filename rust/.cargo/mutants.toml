@@ -22,6 +22,8 @@ exclude_re = [
 ]
 
 # A mutant that breaks a loop bound in the search or the merge runs until
-# stopped; memory is capped by the systemd-run scope in `just mutants`.
+# stopped; memory is capped by the systemd-run scope in `just mutants`,
+# which sets OOMPolicy=continue so an OOM kill removes only that mutant's
+# test process (recorded as caught) instead of aborting the whole run.
 minimum_test_timeout = 60
 timeout_multiplier = 3
