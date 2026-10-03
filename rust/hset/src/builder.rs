@@ -435,6 +435,67 @@ mod tests {
     }
 
     #[test]
+    fn timestamp_formatting_across_months_centuries_and_eras() {
+        // March to December (month index below 10), a century year, the
+        // first and last day of a 400-year era (2000-03-01 is day 0 of
+        // one, 2400-02-29 the last day of the next).
+        assert_eq!(format_utc(1_721_046_896), "2024-07-15T12:34:56Z");
+        assert_eq!(format_utc(951_868_800), "2000-03-01T00:00:00Z");
+        assert_eq!(format_utc(4_107_542_400), "2100-03-01T00:00:00Z");
+        assert_eq!(format_utc(13_569_465_599), "2399-12-31T23:59:59Z");
+        assert_eq!(format_utc(13_574_649_599), "2400-02-29T23:59:59Z");
+    }
+
+    #[test]
+    fn values_render_as_numbers_only_at_eight_bytes() {
+        let fd = |htype, length| FieldDescriptor {
+            htype,
+            name: String::new(),
+            length,
+        };
+        let size = fd(HashType::Size, 8);
+        let entropy = fd(HashType::Entropy, 8);
+        let cases: [(&FieldDescriptor, Vec<u8>, &str); 5] = [
+            (&size, 42u64.to_le_bytes().to_vec(), "42"),
+            (&entropy, 1.5f64.to_le_bytes().to_vec(), "1.5"),
+            // A value of any other width falls back to hex.
+            (&size, vec![1, 2, 3, 4], "01020304"),
+            (&entropy, vec![0xab, 0xcd], "abcd"),
+            (
+                &fd(HashType::Md5, 16),
+                vec![0x0f; 16],
+                "0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f",
+            ),
+        ];
+        for (f, v, want) in cases {
+            assert_eq!(format_value(f, &v), want, "{:?}", f.htype);
+            let mut w = Vec::new();
+            write_value(f, &v, &mut w).unwrap();
+            assert_eq!(String::from_utf8(w).unwrap(), want, "{:?}", f.htype);
+        }
+    }
+
+    #[test]
+    fn builder_reports_types_line_count_and_file_size() {
+        let mut b = Builder::new(&[HashType::Md5, HashType::Size]).unwrap();
+        assert_eq!(b.types(), [HashType::Md5, HashType::Size]);
+        let n = b
+            .add_text(
+                "00112233445566778899aabbccddeeff 1\n 2\nffeeddccbbaa99887766554433221100 3\n",
+            )
+            .unwrap();
+        assert_eq!(n, 3);
+        assert_eq!(b.record_count(), 3);
+        let opts = BuildOptions::new("n", "d").timestamp("2024-01-01T00:00:00Z");
+        let path = std::env::temp_dir().join(format!("hset-write-to-{}.hset", std::process::id()));
+        let size = b.write_to(&path, &opts).unwrap();
+        let written = std::fs::read(&path).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        assert_eq!(size, written.len() as u64);
+        assert_eq!(written, b.build(&opts).unwrap());
+    }
+
+    #[test]
     fn sorted_rows_sorts_and_dedups() {
         let data = [3u8, 0, 1, 0, 2, 0, 1, 0];
         assert_eq!(sorted_rows(&data, 2, true), vec![1, 0, 2, 0, 3, 0]);
