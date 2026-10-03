@@ -64,29 +64,28 @@ fn records_of(f: &HsetFile<'_>) -> Result<(Vec<FieldDescriptor>, Vec<u8>)> {
 }
 
 /// Rewrite rows with layout `from` into layout `to` (fields matched by type).
+/// Every field type of `to` must occur in `from`: [`apply`] builds `to` from
+/// the type set both operands share.
 fn relayout(from: &[FieldDescriptor], rows: &[u8], to: &[FieldDescriptor]) -> Vec<u8> {
     let from_len: usize = from.iter().map(FieldDescriptor::stride).sum();
     let to_len: usize = to.iter().map(FieldDescriptor::stride).sum();
-    let mut src_off: Vec<Option<usize>> = Vec::with_capacity(to.len());
-    for tf in to {
-        let mut off = 0usize;
-        let mut found = None;
-        for ff in from {
-            if ff.htype == tf.htype {
-                found = Some(off);
-                break;
+    let src_off: Vec<usize> = to
+        .iter()
+        .map(|tf| {
+            let mut off = 0usize;
+            for ff in from {
+                if ff.htype == tf.htype {
+                    return off;
+                }
+                off += ff.stride();
             }
-            off += ff.stride();
-        }
-        src_off.push(found);
-    }
+            unreachable!("{} is not a field of the source layout", tf.htype)
+        })
+        .collect();
     let mut out = Vec::with_capacity((rows.len() / from_len.max(1)) * to_len);
     for r in rows.chunks_exact(from_len) {
-        for (tf, so) in to.iter().zip(&src_off) {
-            match so {
-                Some(o) => out.extend_from_slice(&r[*o..*o + tf.stride()]),
-                None => out.resize(out.len() + tf.stride(), 0),
-            }
+        for (tf, &o) in to.iter().zip(&src_off) {
+            out.extend_from_slice(&r[o..o + tf.stride()]);
         }
     }
     out
