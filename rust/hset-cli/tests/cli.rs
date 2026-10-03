@@ -345,3 +345,146 @@ fn make_with_sizes_and_missing_columns() {
     let o = run(&["info", p(&out)]);
     assert!(stdout(&o).contains("block4"), "{}", stdout(&o));
 }
+
+const MD5_A: &str = "00112233445566778899aabbccddeeff";
+const MD5_B: &str = "ffeeddccbbaa99887766554433221100";
+const SHA1_A: &str = "0af8e028c7048ad772ddec2200ec7e0e4d58b0c3";
+const SHA1_B: &str = "1127ceb2c2d789c1d7615b12082ca30222f3c612";
+
+/// `make -t md5,sha1` over two records, with `extra` arguments.
+fn make_two(out: &Path, extra: &[&str]) {
+    let mut args = vec!["make", "-t", "md5,sha1", "-o", p(out)];
+    args.extend_from_slice(extra);
+    let o = run_with_stdin(&args, &format!("{MD5_A} {SHA1_A}\n{MD5_B} {SHA1_B}\n"));
+    assert!(o.status.success(), "{}", stderr(&o));
+}
+
+#[test]
+fn info_prints_table_sizes_in_bytes_and_kib() {
+    let dir = tmpdir("human");
+    let small = dir.join("small.hset");
+    let big = dir.join("big.hset");
+    let input = fixture("md5_sha1_a");
+    for (out, bits) in [(&small, "4"), (&big, "8")] {
+        let o = run(&[
+            "make",
+            "-t",
+            "md5,sha1",
+            "--hint",
+            "block",
+            "--bits",
+            bits,
+            "-o",
+            p(out),
+            p(&input),
+        ]);
+        assert!(o.status.success(), "{}", stderr(&o));
+    }
+    // 16 entries of 16 bytes, then 256 entries: 4096 bytes.
+    let s = stdout(&run(&["info", p(&small)]));
+    assert!(s.contains("; table 256 B\n"), "{s}");
+    let s = stdout(&run(&["info", p(&big)]));
+    assert!(s.contains("; table 4.0 KiB\n"), "{s}");
+}
+
+#[test]
+fn budget_steers_the_chosen_hint_bits() {
+    let dir = tmpdir("budget");
+    let input = fixture("md5_sha1_a");
+    // 344 hashes of 16 bytes: the default 2% budget affords 16 block
+    // entries (4 bits); a budget of the whole hash data affords 256.
+    let default = dir.join("default.hset");
+    let wide = dir.join("wide.hset");
+    for (out, extra) in [(&default, &[][..]), (&wide, &["--budget", "1"][..])] {
+        let mut args = vec!["make", "-t", "md5,sha1", "--hint", "block", "-o", p(out)];
+        args.extend_from_slice(extra);
+        args.push(p(&input));
+        let o = run(&args);
+        assert!(o.status.success(), "{}", stderr(&o));
+    }
+    assert!(stdout(&run(&["info", p(&default)])).contains("hint: block4"));
+    assert!(stdout(&run(&["info", p(&wide)])).contains("hint: block8"));
+
+    // The same through `reindex` of a file without records, which
+    // rebuilds only the hash sections' hints.
+    let hashes_only = dir.join("hashes-only.hset");
+    let o = run(&[
+        "make",
+        "-t",
+        "md5,sha1",
+        "--hint",
+        "block",
+        "--no-records",
+        "-o",
+        p(&hashes_only),
+        p(&input),
+    ]);
+    assert!(o.status.success(), "{}", stderr(&o));
+    assert!(stdout(&run(&["info", p(&hashes_only)])).contains("hint: block4"));
+    let reindexed = dir.join("reindexed.hset");
+    let o = run(&[
+        "reindex",
+        p(&hashes_only),
+        "-o",
+        p(&reindexed),
+        "--hint",
+        "block",
+        "--budget",
+        "1",
+    ]);
+    assert!(o.status.success(), "{}", stderr(&o));
+    let s = stdout(&run(&["info", p(&reindexed)]));
+    assert!(s.contains("records:     none"), "{s}");
+    assert!(s.contains("hint: block8"), "{s}");
+}
+
+#[test]
+fn dump_heads_each_section_only_when_there_are_several() {
+    let dir = tmpdir("dump-heads");
+    let two = dir.join("two.hset");
+    make_two(&two, &["--no-records"]);
+    assert_eq!(
+        stdout(&run(&["dump", p(&two)])),
+        format!("# md5 (2 hashes)\n{MD5_A}\n{MD5_B}\n# sha1 (2 hashes)\n{SHA1_A}\n{SHA1_B}\n")
+    );
+    let one = dir.join("one.hset");
+    let o = run_with_stdin(
+        &["make", "-t", "md5", "--no-records", "-o", p(&one)],
+        &format!("{MD5_A}\n"),
+    );
+    assert!(o.status.success(), "{}", stderr(&o));
+    assert_eq!(stdout(&run(&["dump", p(&one)])), format!("{MD5_A}\n"));
+}
+
+#[test]
+fn query_records_prints_each_match_and_the_misses() {
+    let dir = tmpdir("query-records");
+    let f = dir.join("rec.hset");
+    make_two(&f, &[]);
+    let absent = "00000000000000000000000000000001";
+    let o = run(&["query", "-r", p(&f), MD5_B, absent, MD5_A]);
+    assert_eq!(o.status.code(), Some(1));
+    assert_eq!(
+        stdout(&o),
+        format!("{MD5_B} {SHA1_B}\n{absent}\tmissing\n{MD5_A} {SHA1_A}\n")
+    );
+    let o = run(&["query", "-r", "--found-only", p(&f), MD5_B, absent]);
+    assert_eq!(o.status.code(), Some(1));
+    assert_eq!(stdout(&o), format!("{MD5_B} {SHA1_B}\n"));
+}
+
+#[test]
+fn bench_single_only_times_single_lookups() {
+    let o = run(&[
+        "bench",
+        p(&fixture("good.hset")),
+        "--only",
+        "single",
+        "--queries",
+        "1000",
+        "--hit-fraction",
+        "1",
+    ]);
+    assert!(o.status.success(), "{}", stderr(&o));
+    assert!(stdout(&o).contains("hits 1000/1000"), "{}", stdout(&o));
+}
