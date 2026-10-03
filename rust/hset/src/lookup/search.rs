@@ -765,3 +765,121 @@ impl Lookup for DynBasic<'_> {
         0
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::lookup::model::{FlatBlocks, Full};
+
+    /// `n` 16-byte hashes whose primary keys are given by `key(i)` and
+    /// whose tails hold `i`, so they are sorted and distinct.
+    fn hashes16(n: usize, key: impl Fn(usize) -> u64) -> Vec<u8> {
+        (0..n)
+            .flat_map(|i| {
+                let mut h = [0u8; 16];
+                h[..8].copy_from_slice(&key(i).to_be_bytes());
+                h[8..].copy_from_slice(&(i as u64).to_be_bytes());
+                h
+            })
+            .collect()
+    }
+
+    fn recursive(cfg: SearchConfig) -> SearchConfig {
+        SearchConfig {
+            single: SingleMode::Recursive,
+            ..cfg
+        }
+    }
+
+    #[test]
+    fn debug_shows_the_strategy() {
+        let s = Strategy::<8, _>::new(&[0u8; 8], Full, SearchConfig::default());
+        let d = format!("{s:?}");
+        assert!(d.starts_with("Strategy { hash_length: 8, count: 1,"), "{d}");
+    }
+
+    #[test]
+    fn staged_batch_needs_small_windows() {
+        let one = [0u8; 8];
+        let full = Strategy::<8, _>::new(&one, Full, SearchConfig::default());
+        assert!(!full.uses_staged_batch());
+        let flat = FlatBlocks {
+            bits: 0,
+            table: vec![(0, 0)],
+        };
+        let flat = Strategy::<8, _>::new(&one, flat, SearchConfig::default());
+        assert!(flat.uses_staged_batch());
+    }
+
+    #[test]
+    fn region_radius_is_the_clamped_residual_quantile() {
+        let zeros = |n: usize| vec![0u8; 8 * n];
+        // 49 zero keys predicted at 0 (residuals 0..=48) and one all-ones
+        // key predicted at 49 (residual 0). The 90 % quantile of 50
+        // sorted residuals is element 44, i.e. 43; the clamp for 8-byte
+        // hashes and 2048-byte regions is [64 / 8 + 1, 2048 / 2 / 8] = [9, 128].
+        let mut data = zeros(50);
+        data[49 * 8..].fill(0xff);
+        let wide = SearchConfig {
+            region_bytes: 2048,
+            ..SearchConfig::default()
+        };
+        assert_eq!(Strategy::<8, _>::new(&data, Full, wide).region_radius(), 43);
+        // 50 zero keys: quantile 44, clamped to 512 / 2 / 8 = 32.
+        let cfg = SearchConfig::default();
+        let data = zeros(50);
+        assert_eq!(Strategy::<8, _>::new(&data, Full, cfg).region_radius(), 32);
+        // One key: quantile 0, clamped up to one cache line plus one, 9.
+        let data = zeros(1);
+        assert_eq!(Strategy::<8, _>::new(&data, Full, cfg).region_radius(), 9);
+    }
+
+    #[test]
+    fn recursive_search_steps_past_a_run_of_zero_keys() {
+        // 100 hashes with primary key 0. A query with key 1 lands left of
+        // everything it is compared with, so each level re-aims from a
+        // region whose last key is 0.
+        let data = hashes16(100, |_| 0);
+        let s = Strategy::<16, _>::new(&data, Full, recursive(SearchConfig::default()));
+        let mut q = [0u8; 16];
+        q[7] = 1;
+        assert_eq!(s.find(&q), None);
+        assert_eq!(s.find(&data[50 * 16..51 * 16]), Some(50));
+    }
+
+    /// A corrupt flat hint whose window starts at index 2 for every key.
+    /// The data's keys are all above the all-zero query, so the search
+    /// keeps re-aiming left and must stop at the window, not below it.
+    #[test]
+    fn recursive_search_stays_inside_a_corrupt_window() {
+        let data = hashes16(100, |i| (i as u64 + 1) << 40);
+        let flat = FlatBlocks {
+            bits: 0,
+            table: vec![(2, 1000)],
+        };
+        let s = Strategy::<16, _>::new(&data, flat, recursive(SearchConfig::default()));
+        assert_eq!(s.find(&[0u8; 16]), None);
+        assert_eq!(s.find(&data[50 * 16..51 * 16]), Some(50));
+    }
+
+    /// A corrupt flat hint centred near 2^60 with an unbounded region
+    /// budget: the level-1 radius is about 2^59, and the region around
+    /// the last index must not overflow.
+    #[test]
+    fn recursive_search_survives_a_huge_region_radius() {
+        let data = hashes16(64, |i| (i as u64 + 1) << 40);
+        let flat = FlatBlocks {
+            bits: 0,
+            table: vec![(-(1 << 62), (1 << 62) + (1 << 61))],
+        };
+        let cfg = SearchConfig {
+            region_bytes: usize::MAX,
+            window_prefetch_bytes: 0,
+            ..recursive(SearchConfig::default())
+        };
+        let s = Strategy::<16, _>::new(&data, flat, cfg);
+        for i in [0, 31, 63] {
+            assert_eq!(s.find(&data[i * 16..(i + 1) * 16]), Some(i));
+        }
+    }
+}
