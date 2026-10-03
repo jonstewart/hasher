@@ -285,6 +285,46 @@ mod tests {
     }
 
     #[test]
+    fn full_model_scales_the_key_to_the_set() {
+        // Half the key space is half of 100 positions.
+        assert_eq!(Full.center(1 << 63, &[], 100), 50);
+        assert_eq!(Full.delta(0, 1 << 63, 100), 50);
+    }
+
+    #[test]
+    fn flat_model_centres_on_the_mid_deviation() {
+        let m = FlatBlocks {
+            bits: 1,
+            table: vec![(0, 0), (-3, 9)],
+        };
+        // Expected index of 0x80.. in 100 is 50; the block's deviations
+        // [-3, 9] have midpoint 3.
+        let h = [0x80u8, 0, 0, 0, 0, 0, 0, 0];
+        assert_eq!(m.center(0x8000_0000_0000_0000, &h, 100), 53);
+        assert_eq!(m.delta(0, 1 << 63, 100), 50);
+    }
+
+    #[test]
+    fn hull_model_centres_on_the_line_plus_mid_residual() {
+        let m = HullBlocks {
+            bits: 1,
+            table: vec![
+                HullEntry::EMPTY,
+                HullEntry {
+                    slope: 200,
+                    rmin: -3,
+                    rmax: 9,
+                },
+            ],
+        };
+        // Key 0xC0..: block 1, fraction 2^31, so the line predicts
+        // 2^31 * 200 / 2^32 = 100 and the residual midpoint adds 3.
+        assert_eq!(m.center(0xC000_0000_0000_0000, &[], 0), 103);
+        // A key step of 2^62 is 2^31 fraction units at one bit: 100 positions.
+        assert_eq!(m.delta(0xC000_0000_0000_0000, 1 << 62, 0), 100);
+    }
+
+    #[test]
     fn empty_flat_block_gives_empty_window() {
         let m = FlatBlocks {
             bits: 1,
