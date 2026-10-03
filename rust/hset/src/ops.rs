@@ -266,6 +266,22 @@ mod tests {
         let fb = decode(&b).unwrap();
         assert!(apply(SetOp::Union, &fa, &fb).is_err());
     }
+
+    #[test]
+    fn a_file_without_records_or_hashes_is_named_as_such() {
+        let empty = crate::format::encode(&crate::format::Document {
+            version: crate::format::FORMAT_VERSION,
+            name: "void",
+            desc: "",
+            time: "",
+            records: None,
+            hashsets: vec![],
+        })
+        .unwrap();
+        let f = decode(&empty).unwrap();
+        let e = apply(SetOp::Union, &f, &f).unwrap_err().to_string();
+        assert!(e.contains("'void' has no records and no hashes"), "{e}");
+    }
 }
 
 #[cfg(test)]
