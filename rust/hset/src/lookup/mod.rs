@@ -528,6 +528,7 @@ mod tests {
         let hlen = 12;
         let data = synth::sorted_unique_hashes(500, hlen, 3);
         let s = make_lookup(hlen, &data, None).unwrap();
+        assert_eq!(s.hash_length(), hlen);
         for i in 0..500 {
             assert_eq!(s.find(&data[i * hlen..(i + 1) * hlen]), Some(i));
         }
@@ -552,6 +553,90 @@ mod tests {
             resolve_bits(HintSpec::Block { bits: 8 }, 10_000, 20, &p),
             HintSpec::Block { bits: 8 }
         );
+    }
+
+    #[test]
+    fn is_empty_is_false_for_a_stored_hash() {
+        let one = synth::sorted_unique_hashes(1, 16, 1);
+        assert!(!make_lookup(16, &one, None).unwrap().is_empty());
+        assert!(!make_lookup(12, &[0u8; 12], None).unwrap().is_empty());
+    }
+
+    #[test]
+    fn bits_policy_picks_the_largest_table_within_budget() {
+        // 2 % of 10 000 * 20 B = 4000 B: 12 B << 8 = 3072 B fits,
+        // 12 B << 9 = 6144 B does not.
+        assert_eq!(BitsPolicy::default().choose(10_000, 20, 12), 8);
+        // An unbounded budget stops at `max_bits`, even at `u8::MAX`
+        // where one more step would overflow.
+        let unbounded = BitsPolicy {
+            budget: 1e300,
+            min_bits: 0,
+            max_bits: u8::MAX,
+        };
+        assert_eq!(unbounded.choose(1, 1, 1), u8::MAX);
+    }
+
+    /// The hash count is bytes over hash length: 2^32 one-byte hashes are
+    /// over the limit, 2^31 two-byte hashes are not. The zeroed buffer is
+    /// never read, so the OS does not back its 4 GiB with memory.
+    #[cfg(target_pointer_width = "64")]
+    #[test]
+    fn hash_count_limit_counts_whole_hashes() {
+        let data = vec![0u8; 1 << 32];
+        assert!(build_hint(1, &data, HintSpec::None).is_err());
+        assert_eq!(build_hint(2, &data, HintSpec::None).unwrap(), None);
+    }
+
+    #[test]
+    fn hint_bits_up_to_the_maximum_are_accepted() {
+        let (tag, table) = build_hint(
+            4,
+            &[],
+            HintSpec::Hull {
+                bits: MAX_HINT_BITS,
+            },
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(tag, hint_tag_hull(MAX_HINT_BITS));
+        assert_eq!(table.len(), HULL_ENTRY_LEN << MAX_HINT_BITS);
+    }
+
+    #[test]
+    fn hint_from_parts_checks_kind_and_table_length() {
+        let block = [0u8; BLOCK_ENTRY_LEN << 3];
+        let hull = [0u8; HULL_ENTRY_LEN << 3];
+        assert_eq!(
+            hint_from_parts(0x6203, &block),
+            Hint::Block {
+                bits: 3,
+                table: &block
+            }
+        );
+        assert_eq!(
+            hint_from_parts(0x6803, &hull),
+            Hint::Hull {
+                bits: 3,
+                table: &hull
+            }
+        );
+        // A table of the wrong size for its bits, or an unknown kind, is
+        // kept as an unknown hint.
+        for (tag, table) in [
+            (0x6203, &block[..BLOCK_ENTRY_LEN << 2]),
+            (0x6203, &hull[..]),
+            (0x6803, &hull[..HULL_ENTRY_LEN << 2]),
+            (0x6803, &block[..]),
+            (0x6303, &block[..]),
+        ] {
+            assert_eq!(
+                hint_from_parts(tag, table),
+                Hint::Unknown { tag, data: table },
+                "tag {tag:#06x}, {} bytes",
+                table.len()
+            );
+        }
     }
 
     #[test]
