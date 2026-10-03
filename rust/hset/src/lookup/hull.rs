@@ -371,6 +371,79 @@ mod tests {
     }
 
     #[test]
+    fn width_counts_candidates() {
+        let e = HullEntry {
+            slope: 0,
+            rmin: -2,
+            rmax: 3,
+        };
+        assert_eq!(e.width(), 6);
+        assert_eq!(HullEntry::EMPTY.width(), 0);
+    }
+
+    #[test]
+    fn frac_is_the_32_bits_below_the_block_prefix() {
+        assert_eq!(frac_of(0x1234_5678_9abc_def0, 8), 0x3456_789a);
+        assert_eq!(frac_of(0x1234_5678_9abc_def0, 0), 0x1234_5678);
+    }
+
+    #[test]
+    fn half_hulls_keep_only_their_turns() {
+        // B lies below the chord AC: a lower-hull vertex, not an upper one.
+        let (a, b, c) = (Pt { x: 0, y: 0 }, Pt { x: 10, y: 1 }, Pt { x: 11, y: 2 });
+        assert_eq!(half_hull(&[a, b, c], false), [a, b, c]);
+        assert_eq!(half_hull(&[a, b, c], true), [a, c]);
+    }
+
+    fn pts(xy: &[(u32, u32)]) -> Vec<Pt> {
+        xy.iter().map(|&(x, y)| Pt { x, y }).collect()
+    }
+
+    /// Slope `s` in `choose_slope`'s fixed point.
+    fn fixed(s: f64) -> u32 {
+        (s * 4_294_967_296.0)
+            .round()
+            .clamp(0.0, f64::from(u32::MAX)) as u32
+    }
+
+    #[test]
+    fn slope_of_fewer_than_two_points_is_zero() {
+        assert_eq!(choose_slope(&[]), 0);
+        assert_eq!(choose_slope(&pts(&[(5, 7)])), 0);
+        // Two points: the line through them.
+        assert_eq!(choose_slope(&pts(&[(0, 1), (4, 3)])), fixed(0.5));
+    }
+
+    #[test]
+    fn slope_is_the_best_hull_edge() {
+        // Lower hull (1,1)-(3,4), slope 3/2: too steep. Upper hull
+        // (1,1)-(1,3)-(3,4): a vertical edge, skipped, and slope 1/2,
+        // whose slab is 2 high against 3 for slope 0. The chord is 3/2.
+        let p = pts(&[(1, 1), (1, 2), (1, 3), (3, 4)]);
+        assert_eq!(choose_slope(&p), fixed(0.5));
+    }
+
+    #[test]
+    fn slope_ties_go_to_the_first_candidate() {
+        // Lower edge 1/2, upper edge 1 and the chord 1 all give a slab
+        // 1 high (slope 0 gives 2): the first candidate, the lower
+        // hull's 1/2, wins.
+        let p = pts(&[(0, 0), (2, 1), (2, 2)]);
+        assert_eq!(choose_slope(&p), fixed(0.5));
+    }
+
+    #[test]
+    fn chord_wins_when_the_best_edges_are_too_steep() {
+        // The known gap in `choose_slope` (see
+        // `fit_is_no_worse_than_chord_or_zero_slope`): the hull edges of
+        // slope 4/3 are skipped, the remaining edges of slope 1/2 give a
+        // slab 5/2 high, and the end-to-end chord (4,1)-(9,6) of slope 1
+        // gives 2, so the chord is chosen (1.0 saturates to u32::MAX).
+        let p = pts(&[(4, 1), (6, 2), (6, 3), (7, 4), (7, 5), (9, 6)]);
+        assert_eq!(choose_slope(&p), u32::MAX);
+    }
+
+    #[test]
     fn bytes_roundtrip() {
         let data = synth::sorted_unique_hashes(1000, 16, 5);
         let t = build_table::<16>(&data, 6);
