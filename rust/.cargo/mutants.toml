@@ -1,5 +1,11 @@
 # cargo-mutants configuration. Every exclusion says why the mutation is
 # unobservable; anything else that survives gets a test or is removed.
+#
+# cargo-mutants copies only this workspace into a tempdir per build, so the
+# C++ reference fixtures under `test/` (one level above `rust/`, outside the
+# workspace) are not there; the `mutants` and `mutants-diff` recipes export
+# HSET_FIXTURES_DIR as an absolute path so the fixture-backed tests in the
+# copy still find them (see hset-testkit::fixtures).
 test_tool = "nextest"
 
 # Test infrastructure and benchmarks are not the system under test.

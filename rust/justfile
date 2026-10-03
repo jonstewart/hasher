@@ -117,6 +117,10 @@ verify:
 
 # Mutation-test one crate: `just mutants hset`. A runaway mutant eats memory
 # first, so on Linux the run sits in a systemd scope with a hard cap.
+# cargo-mutants copies only the `rust/` workspace into a tempdir, so the C++
+# fixtures under `test/` (outside the workspace) are not there; export
+# HSET_FIXTURES_DIR as an absolute path so the copied tree's tests still
+# find them (see hset-testkit::fixtures).
 mutants crate:
     #!/bin/sh
     set -eu
@@ -124,6 +128,7 @@ mutants crate:
         echo "mutants: cargo-mutants is required (cargo install cargo-mutants)" >&2
         exit 1
     fi
+    export HSET_FIXTURES_DIR="$(cd ../test && pwd)"
     if ! command -v systemd-run >/dev/null 2>&1; then
         echo "NOTE: systemd-run not found; running cargo-mutants without a memory cap" >&2
         cargo mutants --package {{ crate }} -j {{ mutants_jobs }}
@@ -135,11 +140,14 @@ mutants crate:
 # Mutants only in code changed since main: the daily form. `--relative`
 # keeps diff paths rooted at `rust/`, matching what cargo-mutants expects;
 # without it every path is prefixed with `rust/` and nothing matches.
+# HSET_FIXTURES_DIR, as in `mutants` above, points the copied tree's tests
+# back at the real fixtures.
 mutants-diff:
     #!/bin/sh
     set -eu
     mkdir -p target
     git diff --relative main... > target/mutants.diff
+    export HSET_FIXTURES_DIR="$(cd ../test && pwd)"
     cargo mutants --workspace --in-diff target/mutants.diff -j {{ mutants_jobs }}
 
 # Slow gate, run on a cadence: high-count proptests, bounded fuzzing, the

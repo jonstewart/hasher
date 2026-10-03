@@ -41,6 +41,10 @@ Variables with environment overrides: `FUZZ_SECONDS` (default 60),
 `FUZZ_SANITIZER` (default `none`; the crate has one `unsafe`, the prefetch
 hint, and sanitizer-free builds are portable), `MUTANTS_JOBS` (default 2),
 `MUTANTS_MEMORY` (default `3G`), `PROPTEST_CASES` (default 20000 for `prop`).
+`HSET_FIXTURES_DIR` points the fixture-backed tests at the C++ reference
+fixtures; the `mutants` and `mutants-diff` recipes set it to an absolute
+path because cargo-mutants' per-mutant build copy does not include `test/`,
+which sits outside the `rust/` workspace.
 
 Recipes that depend on a missing optional tool (`cargo-fuzz`, `cargo kani`,
 `systemd-run`) print `SKIP:` or `NOTE:` to stderr and exit 0; `cargo-mutants`

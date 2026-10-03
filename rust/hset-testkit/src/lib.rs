@@ -6,5 +6,6 @@ pub mod arb;
 pub mod checks;
 pub mod corrupt;
 pub mod doc;
+pub mod fixtures;
 pub mod oracle;
 pub mod strategies;

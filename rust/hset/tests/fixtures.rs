@@ -7,9 +7,7 @@ use hset::format::{Hint, decode};
 use hset::{BuildOptions, Builder, HashType, Hashset, HintSpec, SetOp, hex, ops};
 
 fn fixture_path(name: &str) -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../../test")
-        .join(name)
+    hset_testkit::fixtures::fixtures_dir().join(name)
 }
 
 fn fixture(name: &str) -> Vec<u8> {

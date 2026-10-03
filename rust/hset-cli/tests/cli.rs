@@ -8,9 +8,7 @@ fn bin() -> Command {
 }
 
 fn fixture(name: &str) -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../../test")
-        .join(name)
+    hset_testkit::fixtures::fixtures_dir().join(name)
 }
 
 fn tmpdir(tag: &str) -> PathBuf {
