@@ -265,6 +265,32 @@ mod tests {
     }
 
     #[test]
+    fn short_hashes_with_a_record_index_encode() {
+        // A 4-byte hash has a larger record index (8 bytes) than hash data.
+        let doc = Document {
+            version: 2,
+            name: "",
+            desc: "",
+            time: "",
+            records: None,
+            hashsets: vec![HashsetIn {
+                htype: HashType::Md5,
+                name: "short",
+                hash_length: 4,
+                data: &[1, 2, 3, 4],
+                hint: None,
+                ridx: Some(&[0; 8]),
+            }],
+        };
+        let bytes = encode(&doc).unwrap();
+        let f = decode(&bytes).unwrap();
+        assert_eq!(f.sections.len(), 1);
+        assert_eq!(f.sections[0].hash_length(), 4);
+        assert_eq!(f.sections[0].hash(0), &[1, 2, 3, 4]);
+        assert_eq!(f.sections[0].record_index(0), Some(0));
+    }
+
+    #[test]
     fn rejects_ragged_or_zero_length_records() {
         let fields = [FieldDescriptor::for_type(HashType::Md5).unwrap()];
         for (record_length, data) in [(17, &[0u8; 18][..]), (0, &[][..])] {

@@ -100,7 +100,8 @@ exclude_re = [
     # is below 16), the digit and letter lane masks (a byte cannot be
     # both), the narrowed SIMD byte (`w << 4` keeps the high digit in the
     # top nibble of the low byte, `w >> 8` is the low digit; the high
-    # byte is dropped by `narrow`), the big-endian key loads (`k << 8`
+    # byte is dropped by `narrow`; this holds for valid digits, and the
+    # output is unspecified on failure), the big-endian key loads (`k << 8`
     # has a zero low byte), hint tags (`0x6200`/`0x6800` plus a `u8`) and
     # `HHnn` chunk tags (`HHDR` has a zero low half, `log2` is below 16).
     "hex\\.rs:(68:53: replace \\| with \\^ in scalar::decode_into|170:26: replace \\| with \\^ in simd::nibbles|18[89]:28: replace \\| with \\^ in simd::decode_block)\\b",
@@ -113,7 +114,15 @@ exclude_re = [
     # the buffer reallocates, never its contents (capacity beyond the
     # requested minimum is unspecified, so no test can pin it).
     "hex\\.rs:(239:29: replace \\* with [+/] in encode_to_string|307:16: replace / with % in check_rows|316:(22|27): replace \\* with [+/] in encode_rows|316:35: replace \\+ with \\* in encode_rows)\\b",
-    "encode\\.rs:(99:9: replace \\+ with \\*|103:62: replace \\+ with \\*|103:30: replace \\+ with [-*]) in encode\\b",
+    # The `encode` capacity estimate: `*` in place of `+` (99:9, 103:30,
+    # 103:62) multiplies section sizes, so the requested capacity grows
+    # quadratically (over 10^14 bytes for about 1M hashes). Below that the
+    # bytes written are unchanged; whether a huge request fails depends
+    # on the OS's overcommit policy, which no portable test can pin.
+    # (`103:30` with `-` is not excluded: it underflows for hashes shorter
+    # than their 8-byte record index entries, see
+    # `short_hashes_with_a_record_index_encode`.)
+    "encode\\.rs:(99:9|103:62|103:30): replace \\+ with \\* in encode\\b",
     # Hex row paths: at exactly `SCRATCH` bytes the per-row path and the
     # batched path (one row per batch) produce the same bytes, and
     # flushing an empty final batch decodes nothing.
