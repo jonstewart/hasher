@@ -93,12 +93,6 @@ exclude_re = [
     # dy / 0 is +inf or NaN and is rejected by the [0, 1] range check.
     "hull\\.rs:(160:19|167:15): replace > with >= in choose_slope\\b",
 
-    # --- Size limits no test can reach ---
-    # `n > i32::MAX` for hull hints: telling it from `>=` or `==` takes
-    # 2^31 - 1 or 2^31 hashes of at least 4 bytes, an 8 GiB input (and
-    # for `>=`, a hull build over all of it).
-    "mod\\.rs:295:18: replace > with (==|>=) in build_hint\\b",
-
     # --- Outside lookup: equivalent mutants and capacity hints ---
     #
     # `|` -> `^` where the operands share no set bit, so both give the

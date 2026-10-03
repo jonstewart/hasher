@@ -578,29 +578,50 @@ mod tests {
     }
 
     /// The hash count is bytes over hash length: 2^32 one-byte hashes are
-    /// over the limit, 2^31 two-byte hashes are not. The zeroed buffer is
-    /// never read, so the OS does not back its 4 GiB with memory.
+    /// over the limit, 2^31 two-byte hashes are not, and hull hints stop
+    /// at 2^31 - 1 hashes (checked before the hash length, so one-byte
+    /// hashes reach it and fail later as unsupported). The zeroed buffer
+    /// is never read: its 4 GiB are address space only (no page is
+    /// touched), but strict overcommit on a host with less than 4 GiB of
+    /// RAM plus swap may refuse it and abort.
     #[cfg(target_pointer_width = "64")]
     #[test]
     fn hash_count_limit_counts_whole_hashes() {
         let data = vec![0u8; 1 << 32];
         assert!(build_hint(1, &data, HintSpec::None).is_err());
         assert_eq!(build_hint(2, &data, HintSpec::None).unwrap(), None);
+        let hull = HintSpec::Hull { bits: 4 };
+        let err = |len: usize| build_hint(1, &data[..len], hull).unwrap_err().to_string();
+        assert!(
+            err(1 << 31).contains("at most 2^31 - 1 hashes"),
+            "{}",
+            err(1 << 31)
+        );
+        let at_limit = err((1 << 31) - 1);
+        assert!(at_limit.contains("unsupported hash length 1"), "{at_limit}");
     }
 
+    /// `MAX_HINT_BITS` itself passes the bit check: with one-byte hashes
+    /// the build then fails on the hash length, not on the bits.
     #[test]
     fn hint_bits_up_to_the_maximum_are_accepted() {
-        let (tag, table) = build_hint(
-            4,
-            &[],
-            HintSpec::Hull {
-                bits: MAX_HINT_BITS,
-            },
-        )
-        .unwrap()
-        .unwrap();
-        assert_eq!(tag, hint_tag_hull(MAX_HINT_BITS));
-        assert_eq!(table.len(), HULL_ENTRY_LEN << MAX_HINT_BITS);
+        for (spec, want) in [
+            (
+                HintSpec::Hull {
+                    bits: MAX_HINT_BITS,
+                },
+                "unsupported hash length 1",
+            ),
+            (
+                HintSpec::Block {
+                    bits: MAX_HINT_BITS,
+                },
+                "at least 4 bytes",
+            ),
+        ] {
+            let err = build_hint(1, &[], spec).unwrap_err().to_string();
+            assert!(err.contains(want), "{spec:?}: {err}");
+        }
     }
 
     #[test]
