@@ -123,5 +123,7 @@ fn corrupt_empty_sha1_section_does_not_over_allocate() {
         ],
         chunk_edits: vec![],
     };
-    check_corruption(&doc, &c);
+    let bytes = doc.build().expect("build");
+    let m = c.apply(&bytes);
+    assert!(hset_testkit::checks::exercise_loaded(&m), "should load");
 }

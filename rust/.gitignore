@@ -1,6 +1,6 @@
 /target
 **/*.rs.bk
-/mutants.out
+/mutants.out*
 /fuzz/target
 /fuzz/artifacts
 /fuzz/coverage

@@ -12,6 +12,10 @@ test_tool = "nextest"
 exclude_globs = ["hset-testkit/**", "**/benches/**", "**/examples/**"]
 
 exclude_re = [
+    # Written as a bare `proofs::` prefix, not `::proofs::`: cargo-mutants
+    # prints mutant locations as bare paths with no leading `::`, so the
+    # anchored form never matches. Leave the `\b` as-is; don't "simplify"
+    # it back to `::proofs::`.
     "\\bproofs::",           # Kani harnesses: not compiled under cfg(test), no test can see them
     "\\bprefetch\\b",        # cache hint with no observable result
     "\\bprefetch_entry\\b",  # same, on the Model trait

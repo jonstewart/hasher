@@ -110,10 +110,12 @@ fn hull_two_hashes_in_one_block_verify() {
 /// Fuzz finding (`text_input`, crash-9ccfbb73…, bytes `0d 0d a6`, which
 /// `Arbitrary for &str` decodes to `"\r\r"`): `add_text_line` trimmed
 /// every trailing `'\r'`/`'\n'`, so a line of two carriage returns was
-/// taken as blank. Like the C++ line reader, only one `'\r'` is a line
-/// ending; the second is content, and not a valid column. (`add_text`
-/// splits with `str::lines`, which already takes the `"\r\n"` of a
-/// `"\r\r\n"` ending, so that line keeps one `'\r'` and is accepted.)
+/// taken as blank. Only one `'\r'` is a line ending; the second is
+/// content, and not a valid column, when `add_text_line` is called
+/// directly on `"\r\r"`. (`add_text` splits with `str::lines`, which
+/// already takes the `"\r\n"` of a `"\r\r\n"` ending, so that line keeps
+/// one `'\r'` going into `add_text_line`, which strips it too, and the
+/// whole `"\r\r\n"` is accepted as blank.)
 #[test]
 fn text_line_strips_only_one_carriage_return() {
     let md5 = "00112233445566778899aabbccddeeff";

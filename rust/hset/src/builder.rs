@@ -172,8 +172,14 @@ impl Builder {
     /// Add a record from a line of text: one space-separated column per
     /// field, hex for digests and a decimal integer for sizes. An empty
     /// column means the value is absent; blank lines are ignored. One line
-    /// ending (`"\n"`, `"\r\n"` or a lone `'\r'`) is stripped, as the C++
-    /// line reader does; any further `'\r'` is part of the last column.
+    /// ending (`"\n"`, `"\r\n"` or a lone `'\r'`) is stripped; any further
+    /// `'\r'` is part of the last column. Called directly, this is the
+    /// whole rule; through [`add_text`](Self::add_text) or the CLI,
+    /// `BufRead::lines()`/`str::lines()` already strip a `"\r\n"` or `"\n"`
+    /// line terminator first, so a line ending in `"\r\r\n"` keeps one
+    /// `'\r'` going in and that one is stripped here too, making the whole
+    /// `"\r\r\n"` disappear rather than leaving a `'\r'` in the last
+    /// column.
     pub fn add_text_line(&mut self, line: &str) -> Result<()> {
         let line = line.strip_suffix('\n').unwrap_or(line);
         let line = line.strip_suffix('\r').unwrap_or(line);

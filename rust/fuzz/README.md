@@ -17,7 +17,7 @@ outside the workspace (`exclude = ["fuzz"]`), so it builds into
 ## Two corpora
 
 - `fuzz/corpus/<target>/` holds the committed seeds: small, minimised and
-  reviewed. `decode_bytes` is seeded from the `/work/test/*.hset` fixtures
+  reviewed. `decode_bytes` is seeded from the `test/*.hset` fixtures
   under 64 KiB; the others from `just fuzz-seed`.
 - `target/fuzz-corpus/<target>/` is the scratch corpus. `just fuzz` passes
   it first, so every new input libFuzzer finds lands there and the
