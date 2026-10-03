@@ -411,4 +411,53 @@ mod tests {
         assert!(!r.is_ok());
         assert!(r.problems.iter().any(|p| p.contains("not sorted")));
     }
+
+    #[test]
+    fn accessors_expose_the_loaded_file() {
+        let bytes = sample();
+        let hs = Hashset::load(&bytes).unwrap();
+        assert_eq!(hs.raw(), &bytes[..]);
+        assert_eq!(hs.version(), format::FORMAT_VERSION);
+        assert_eq!(hs.version(), 2);
+        let types: Vec<HashType> = hs.sections().iter().map(|s| s.header.htype).collect();
+        assert_eq!(types, [HashType::Md5, HashType::Sha1, HashType::Size]);
+        assert_eq!(
+            format!("{hs:?}"),
+            r#"Hashset { name: "sample", sections: 3, records: 3 }"#
+        );
+    }
+
+    #[test]
+    fn verify_reports_mean_window_and_duplicate_records() {
+        let mut bytes = sample();
+        let hs = Hashset::load(&bytes).unwrap();
+        let size = hs.index_for_type(HashType::Size).unwrap();
+        // The size section has no hint, so each of its 2 hashes is
+        // searched for over the whole section: a window of 2.
+        let r = hs.verify();
+        assert_eq!(r.sections[size].hint, None);
+        assert_eq!(r.sections[size].max_window, 2);
+        assert_eq!(r.sections[size].mean_window, 2.0);
+        assert!(!r.problems.iter().any(|p| p.contains("duplicate")));
+
+        // Copy record 0 over record 1: records stay sorted, one duplicate.
+        let rl = hs.record_header().unwrap().record_length as usize;
+        let rdat = hs
+            .file()
+            .toc
+            .iter()
+            .find(|(_, t)| *t == format::chunk::RDAT)
+            .map(|(o, _)| *o as usize + format::chunk::CHUNK_HEADER_LEN)
+            .unwrap();
+        drop(hs);
+        bytes.copy_within(rdat..rdat + rl, rdat + rl);
+        let hs = Hashset::load(&bytes).unwrap();
+        let r = hs.verify();
+        assert!(
+            r.problems.iter().any(|p| p == "1 duplicate records"),
+            "{:?}",
+            r.problems
+        );
+        assert!(!r.problems.iter().any(|p| p.contains("not sorted")));
+    }
 }
