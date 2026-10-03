@@ -704,6 +704,56 @@ mod tests {
         assert!(out.is_empty());
     }
 
+    #[test]
+    fn decode_rows_names_a_bad_row_in_a_full_middle_batch() {
+        // Width 32 gathers 128 rows per batch; row 200 fails in the second
+        // full batch (rows 128..256), flushed when the batch fills.
+        let data = pseudo_random(32 * 300, 23);
+        let mut strs: Vec<String> = data.as_chunks::<32>().0.iter().map(|r| encode(r)).collect();
+        strs[200].replace_range(9..10, "x");
+        let mut out = Vec::new();
+        let e = decode_rows(strs.iter().map(String::as_str), 32, &mut out).unwrap_err();
+        assert!(e.to_string().contains("row 200:"), "{e}");
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn decode_rows_handles_widths_that_do_not_divide_the_scratch() {
+        // 100 hex digits per row: 81 rows fill the scratch buffer, so 100
+        // rows need a second batch. 5000 digits per row: one row per batch.
+        for (width, rows) in [(50usize, 100usize), (2500, 3)] {
+            let data = pseudo_random(width * rows, width as u64);
+            let strs: Vec<String> = data.chunks_exact(width).map(encode).collect();
+            let mut out = Vec::new();
+            let n = decode_rows(strs.iter().map(String::as_str), width, &mut out).unwrap();
+            assert_eq!(n, rows, "width {width}");
+            assert_eq!(out, data, "width {width}");
+        }
+    }
+
+    #[test]
+    fn encode_to_string_appends_every_short_length() {
+        for len in 0..=SMALL + 1 {
+            let bytes = pseudo_random(len, 0x5EED + len as u64);
+            let mut out = String::from("x");
+            encode_to_string(&bytes, &mut out);
+            assert_eq!(out, format!("x{}", scalar::encode(&bytes)), "len {len}");
+        }
+    }
+
+    #[test]
+    fn simd_decode_rejects_bad_digits_in_both_halves_of_a_lane() {
+        // Lane 3 of both 16-digit halves of a block is invalid: the two
+        // halves' masks must be OR-ed, not XOR-ed, or the errors cancel.
+        for level in levels() {
+            let mut src = vec![b'0'; 32];
+            src[3] = b'g';
+            src[16 + 3] = b'g';
+            let mut out = [0u8; 16];
+            assert!(!simd::decode_into_at(level, &src, &mut out), "{level:?}");
+        }
+    }
+
     // ---- simd kernels vs scalar reference -----------------------------------
 
     /// Every SIMD level we can run here: the baseline the binary is compiled
