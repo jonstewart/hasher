@@ -5,11 +5,11 @@
 - toolchain: rustc 1.98.1 (48a229cea 2026-09-01); cargo-mutants 27.1.0; cargo-nextest 0.9.136; cargo-fuzz 0.13.1; Kani Rust Verifier 0.68.0 (CBMC 6.11.0)
 - commit: 91b82b5 (branch `hashset-lookup-perf`), the last commit before this report's own commit
 
-This is Task 18 of `docs/superpowers/plans/2026-10-02-rust-deep-testing.md`, Steps 4-6: the
-mutation-testing triage, its summary, and the plan's closing commit. Step 1 (the first run)
-is reported here from the merged outcome files and run logs under
-`.superpowers/sdd/2026-10-02-rust-deep-testing/mutants/`; Steps 2-3 (triage of the survivors)
-were done as two prior tasks (18b-1, 18b-2) whose per-row results are reproduced in full below.
+This is Task 18 of `docs/superpowers/plans/2026-10-02-rust-deep-testing.md` (Step 4, the
+mutation-testing run and its triage, through Step 6, the final gate and commit). The first
+run itself is reported here from the merged outcome files and run logs under
+`.superpowers/sdd/2026-10-02-rust-deep-testing/mutants/`; triage of its survivors was done as
+two prior tasks (18b-1, 18b-2) whose per-row results are reproduced in full below.
 
 ## 1. First run: per-crate totals
 
@@ -76,12 +76,16 @@ excluded 25, removed 2; hset-cli killed 16; timeout (detected) 3"). Total resolv
 245+135 = 380 = 332 (hset missed) + 16 (hset-cli missed) + 32 (timeout), with 0 left open.
 
 The 2 removed mutants are `ops.rs:88:46` (`+` -> `-` and `+` -> `*` in `relayout`): a dead
-`None`-arm of a match that the triage's test coverage proved unreachable; they were deleted
-from `.cargo/mutants.toml`'s exclude list check rather than tested, and `cargo mutants -p hset
---list` confirms they no longer appear.
+`None`-arm of a match that `apply()`'s type-set construction made unreachable (every target
+field has a source field of its type, so the zero-fill arm could never run). The arm was
+deleted from the source in commit 2b9efec ("refactor(rust): remove unused zero-fill arm in
+relayout") rather than tested or excluded, and `cargo mutants -p hset --list` confirms the two
+mutants no longer appear.
 
-No bug was found while triaging these 332 + 16 survivors (both triage files' headers record
-"0 bugs" / "Bugs found: none").
+No bug was found while triaging these 332 + 16 survivors: `triage-rest.md`'s header records
+"Bugs found: none" directly, and the lookup group's zero-bugs outcome is recorded in the
+Task 18b-1 report (`task-18b1-report.md`: "117 killed, 99 excluded, 0 removed, 0 open, 0
+bugs") rather than in `triage-lookup.md`'s own header, which gives outcome counts only.
 
 ## 3. Full survivor table
 
@@ -530,11 +534,11 @@ ledger lines:
 | 7 | `prop_lookup.rs` (property) | k-ary single search looped forever when `window_prefetch_bytes` < 8 hashes (KAry, Auto, and Recursive's fallback) | 73d8eec | 4406eb9 |
 | 11 | `prop_cli.rs` (property, CLI oracle) | CLI rejected hyphen-leading `-n`/`-d` values | 4e8c54a | 5de8e51 |
 | 11 | `prop_cli.rs` (property, CLI oracle) | CLI query rejected negative numeric values | 62df2f7 | 557667b |
-| 12 | in-crate proptest (`hash_type`) | `HashType::parse` rejected the display name "Quick MD5" (the C++ reference's `hash_types.cpp` accepts "quick md5") | 5ee88b2 | 7e03cf3 |
+| 12 | in-crate proptest (`hash_type`) | `HashType::parse` rejected the display name "Quick MD5" (the C++ reference's `hash_types.cpp` accepts "quick md5") | e9fefbf | 7e384ee |
 | 13 | in-crate proptest (`format::chunk`) | `Cursor::pstring` advanced its position on a failed body read | 09810b0 (regression), c96338c (test correction) | f3a6b04 |
-| 14 | fuzzing | flat block model arithmetic overflow on corrupt hint bounds | 05cb3d4 | 271fa16 |
-| 14 | fuzzing | `add_text_line` stripped every trailing CR/LF instead of one line ending | 22bc159 | 0746f4c |
-| 14 | fuzzing | test kit's `exercise_loaded` aborted allocating a query of an absurd `hash_length` for an empty section | 5af9f39 | d41e0ba (kit-side fix) |
+| 14 | fuzzing | flat block model arithmetic overflow on corrupt hint bounds | 8157d50 | 6ef42cc |
+| 14 | fuzzing | `add_text_line` stripped every trailing CR/LF instead of one line ending | 7030dd0 | ea85572 |
+| 14 | fuzzing | test kit's `exercise_loaded` aborted allocating a query of an absurd `hash_length` for an empty section | d2eaa8c | 76a0783 (kit-side fix) |
 
 Two further issues were found but parked for the final whole-branch review rather than fixed
 mid-plan, since they are not soundness bugs in the shipped behaviour exercised by any tier:
