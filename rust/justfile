@@ -14,6 +14,9 @@ fuzz_sanitizer := env_var_or_default("FUZZ_SANITIZER", "none")
 mutants_jobs := env_var_or_default("MUTANTS_JOBS", "2")
 # Memory cap for the cargo-mutants scope (Linux only).
 mutants_memory := env_var_or_default("MUTANTS_MEMORY", "3G")
+# Memory cap for the cargo-kani scope (Linux only). 4G passes all 29
+# harnesses here.
+kani_memory := env_var_or_default("KANI_MEMORY", "4G")
 # Proptest cases for `just prop`.
 proptest_cases := env_var_or_default("PROPTEST_CASES", "20000")
 
@@ -106,6 +109,9 @@ fuzz-seed target:
         -set_cover_merge=1 -use_counters=0
 
 # Model-check the pure integer functions of hset with Kani, if installed.
+# A runaway harness eats memory first (an uncapped run killed a session on
+# the dev VM), so on Linux it sits in the same capped systemd scope as
+# `mutants`, with the same OOMPolicy=continue.
 verify:
     #!/bin/sh
     set -eu
@@ -113,19 +119,30 @@ verify:
         echo "SKIP: kani not installed. cargo install kani-verifier && cargo kani setup" >&2
         exit 0
     fi
-    cargo kani -p hset
+    if ! command -v systemd-run >/dev/null 2>&1; then
+        echo "NOTE: systemd-run not found; running cargo kani without a memory cap" >&2
+        cargo kani -p hset
+        exit 0
+    fi
+    systemd-run --user --scope -q -p MemoryMax={{ kani_memory }} -p MemorySwapMax=0 \
+        -p OOMPolicy=continue \
+        cargo kani -p hset
 
-# Mutation-test one crate: `just mutants hset`. A runaway mutant eats memory
-# first, so on Linux the run sits in a systemd scope with a hard cap.
-# OOMPolicy=continue: the scope's default policy stops the whole unit on the
-# first OOM kill, which would discard the run over one runaway mutant;
-# `continue` kills just that test process and lets cargo-mutants record it
-# as caught.
+# Shared cargo-mutants invocation: the cargo-mutants guard, the ../test
+# fixtures guard and HSET_FIXTURES_DIR export, then the capped systemd
+# scope. Private (leading underscore): `mutants` and `mutants-diff` are the
+# public entry points, each calling this with its own cargo-mutants
+# arguments, so the guard and the cap are written once.
+# A runaway mutant eats memory first, so on Linux the run sits in a systemd
+# scope with a hard cap. OOMPolicy=continue: the scope's default policy
+# stops the whole unit on the first OOM kill, which would discard the run
+# over one runaway mutant; `continue` kills just that test process and lets
+# cargo-mutants record it as caught.
 # cargo-mutants copies only the `rust/` workspace into a tempdir, so the C++
 # fixtures under `test/` (outside the workspace) are not there; export
 # HSET_FIXTURES_DIR as an absolute path so the copied tree's tests still
 # find them (see hset-testkit::fixtures).
-mutants crate:
+_mutants-run *args:
     #!/bin/sh
     set -eu
     if ! command -v cargo-mutants >/dev/null 2>&1; then
@@ -140,30 +157,28 @@ mutants crate:
     export HSET_FIXTURES_DIR
     if ! command -v systemd-run >/dev/null 2>&1; then
         echo "NOTE: systemd-run not found; running cargo-mutants without a memory cap" >&2
-        cargo mutants --package {{ crate }} -j {{ mutants_jobs }}
+        cargo mutants {{ args }}
         exit 0
     fi
     systemd-run --user --scope -q -p MemoryMax={{ mutants_memory }} -p MemorySwapMax=0 \
         -p OOMPolicy=continue \
-        cargo mutants --package {{ crate }} -j {{ mutants_jobs }}
+        cargo mutants {{ args }}
+
+# Mutation-test one crate: `just mutants hset`. See `_mutants-run` above
+# for the fixtures export and the memory cap.
+mutants crate:
+    just _mutants-run --package {{ crate }} -j {{ mutants_jobs }}
 
 # Mutants only in code changed since main: the daily form. `--relative`
 # keeps diff paths rooted at `rust/`, matching what cargo-mutants expects;
-# without it every path is prefixed with `rust/` and nothing matches.
-# HSET_FIXTURES_DIR, as in `mutants` above, points the copied tree's tests
-# back at the real fixtures.
+# without it every path is prefixed with `rust/` and nothing matches. See
+# `_mutants-run` above for the fixtures export and the memory cap.
 mutants-diff:
     #!/bin/sh
     set -eu
     mkdir -p target
     git diff --relative main... > target/mutants.diff
-    if [ ! -d ../test ]; then
-        echo "mutants-diff: ../test (the C++ fixtures) not found" >&2
-        exit 1
-    fi
-    HSET_FIXTURES_DIR="$(cd ../test && pwd)"
-    export HSET_FIXTURES_DIR
-    cargo mutants --workspace --in-diff target/mutants.diff -j {{ mutants_jobs }}
+    just _mutants-run --workspace --in-diff target/mutants.diff -j {{ mutants_jobs }}
 
 # Slow gate, run on a cadence: high-count proptests, bounded fuzzing, the
 # Kani harnesses, then mutation testing.
