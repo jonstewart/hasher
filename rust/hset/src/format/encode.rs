@@ -263,4 +263,27 @@ mod tests {
         };
         assert!(encode(&doc).is_err());
     }
+
+    #[test]
+    fn rejects_ragged_or_zero_length_records() {
+        let fields = [FieldDescriptor::for_type(HashType::Md5).unwrap()];
+        for (record_length, data) in [(17, &[0u8; 18][..]), (0, &[][..])] {
+            let doc = Document {
+                version: 2,
+                name: "",
+                desc: "",
+                time: "",
+                records: Some(RecordsIn {
+                    fields: &fields,
+                    record_length,
+                    data,
+                }),
+                hashsets: vec![],
+            };
+            assert!(
+                matches!(encode(&doc), Err(Error::Input(_))),
+                "record length {record_length}"
+            );
+        }
+    }
 }

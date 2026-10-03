@@ -316,6 +316,107 @@ mod tests {
     }
 
     #[test]
+    fn a_short_buffer_is_too_short_only_below_the_first_chunk() {
+        let mut buf = vec![0u8; chunk::FIRST_CHUNK_OFFSET];
+        buf[..8].copy_from_slice(chunk::MAGIC);
+        let short = decode(&buf[..chunk::FIRST_CHUNK_OFFSET - 1]).unwrap_err();
+        assert!(short.to_string().contains("file too short"), "{short}");
+        // 40 bytes hold the whole preamble; what is missing is the FTOC.
+        let e = decode(&buf).unwrap_err();
+        assert!(!e.to_string().contains("file too short"), "{e}");
+    }
+
+    /// A one-section file whose hint chunk is `tag` followed by `table`.
+    fn with_hint(tag: u16, table: &[u8]) -> Vec<u8> {
+        let hashes = [0u8; 32];
+        super::super::encode(&super::super::Document {
+            version: FORMAT_VERSION,
+            name: "",
+            desc: "",
+            time: "",
+            records: None,
+            hashsets: vec![super::super::HashsetIn {
+                htype: HashType::Md5,
+                name: "md5",
+                hash_length: 16,
+                data: &hashes,
+                hint: Some((tag, table)),
+                ridx: None,
+            }],
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn hints_with_bad_bits_or_table_length_decode_as_unknown() {
+        let table = [7u8; 3 * 16];
+        let hint = |tag, len| {
+            let buf = with_hint(tag, &table[..len]);
+            let f = decode(&buf).unwrap();
+            f.sections[0]
+                .hint
+                .map(|h| (h.tag(), matches!(h, Hint::Unknown { .. })))
+        };
+        // Block: 1..=24 bits and 16 << bits table bytes.
+        assert_eq!(hint(hint_tag_block(1), 32), Some((0x6201, false)));
+        assert_eq!(hint(hint_tag_block(1), 31), Some((0x6201, true)));
+        assert_eq!(hint(hint_tag_block(0), 16), Some((0x6200, true)));
+        assert_eq!(hint(hint_tag_block(25), 0), Some((0x6219, true)));
+        // Hull: 0..=24 bits and 12 << bits table bytes.
+        assert_eq!(hint(hint_tag_hull(1), 24), Some((0x6801, false)));
+        assert_eq!(hint(hint_tag_hull(0), 12), Some((0x6800, false)));
+        assert_eq!(hint(hint_tag_hull(1), 23), Some((0x6801, true)));
+        assert_eq!(hint(hint_tag_hull(25), 0), Some((0x6819, true)));
+    }
+
+    /// FTOC, FHDR, then `body` chunks, then FEND, with the FTOC filled in.
+    fn assemble(body: &[(u32, Vec<u8>)]) -> Vec<u8> {
+        let n = body.len() + 3;
+        let mut o = chunk::Out::default();
+        o.bytes(chunk::MAGIC);
+        o.zeros(32);
+        let mut toc = vec![(o.chunk(chunk::FTOC, |w| w.zeros(12 * n)), chunk::FTOC)];
+        let fhdr = o.chunk(chunk::FHDR, |w| {
+            w.le_u64(FORMAT_VERSION);
+            w.pstring("n");
+            w.pstring("t");
+            w.pstring("d");
+        });
+        toc.push((fhdr, chunk::FHDR));
+        for (ty, data) in body {
+            toc.push((o.chunk(*ty, |w| w.bytes(data)), *ty));
+        }
+        toc.push((o.chunk(chunk::FEND, |_| {}), chunk::FEND));
+        let mut p = toc[0].0 + chunk::CHUNK_HEADER_LEN;
+        for (off, ty) in toc {
+            o.buf[p..p + 8].copy_from_slice(&(off as u64).to_le_bytes());
+            o.buf[p + 8..p + 12].copy_from_slice(&ty.to_be_bytes());
+            p += 12;
+        }
+        o.buf
+    }
+
+    #[test]
+    fn filters_are_skipped_inside_a_section_and_rejected_outside() {
+        let mut hhdr = chunk::Out::default();
+        hhdr.pstring("md5");
+        hhdr.le_u64(16);
+        hhdr.le_u64(1);
+        let hhdr = (chunk::HHDR | u32::from(HashType::Md5.log2()), hhdr.buf);
+        let hdat = (chunk::HDAT, vec![0x5a; 16]);
+        let fltr = (chunk::FLTR, vec![1, 2, 3]);
+
+        let inside = assemble(&[hhdr.clone(), fltr.clone(), hdat.clone()]);
+        let f = decode(&inside).unwrap();
+        assert_eq!(f.sections.len(), 1);
+        assert_eq!(f.sections[0].data, &[0x5a; 16]);
+
+        let outside = assemble(&[fltr, hhdr, hdat]);
+        let e = decode(&outside).unwrap_err();
+        assert!(e.to_string().contains("FLTR outside"), "{e}");
+    }
+
+    #[test]
     fn version_1_is_reported_clearly() {
         let mut v1 = vec![0u8; 4096];
         v1[..8].copy_from_slice(b"SetOHash");

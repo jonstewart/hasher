@@ -250,6 +250,28 @@ mod tests {
     }
 
     #[test]
+    fn out_writers_emit_exact_bytes() {
+        let o = Out::with_capacity(100);
+        assert!(o.is_empty());
+        assert!(o.buf.capacity() >= 100);
+        let mut o = Out::default();
+        o.le_i32(-2);
+        o.le_i64(-3);
+        assert!(!o.is_empty());
+        assert_eq!(
+            o.buf,
+            [
+                0xfe, 0xff, 0xff, 0xff, 0xfd, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff
+            ]
+        );
+        let mut o = Out::default();
+        o.pstring("abc");
+        assert_eq!(o.len(), pstring_len("abc"));
+        assert_eq!(pstring_len("abc"), 5);
+        assert_eq!(pstring_len(""), 2);
+    }
+
+    #[test]
     fn truncated_chunk_is_an_error() {
         let mut o = Out::default();
         o.chunk(HDAT, |w| w.zeros(100));

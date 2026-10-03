@@ -209,3 +209,56 @@ impl<'a> HsetFile<'a> {
         self.rdat?.get(start..end)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn derived_lengths() {
+        let rh = RecordHeader {
+            record_length: 0,
+            record_count: 0,
+            fields: vec![
+                FieldDescriptor::for_type(HashType::Md5).unwrap(),
+                FieldDescriptor::for_type(HashType::Size).unwrap(),
+            ],
+        };
+        assert_eq!(rh.computed_record_length(), 17 + 9);
+        assert_eq!(RecordHeader::default().computed_record_length(), 0);
+
+        let table = [0u8; 24];
+        assert_eq!(
+            Hint::Block {
+                bits: 1,
+                table: &table
+            }
+            .byte_len(),
+            26
+        );
+        assert_eq!(
+            Hint::Hull {
+                bits: 1,
+                table: &table[..12]
+            }
+            .byte_len(),
+            14
+        );
+        assert_eq!(Hint::Unknown { tag: 0, data: &[] }.byte_len(), 2);
+
+        let header = |hash_count| HashsetHeader {
+            htype: HashType::Md5,
+            name: String::new(),
+            hash_length: 16,
+            hash_count,
+        };
+        let section = |hash_count| Section {
+            header: header(hash_count),
+            hint: None,
+            data: &[],
+            ridx: None,
+        };
+        assert!(section(0).is_empty());
+        assert!(!section(1).is_empty());
+    }
+}
