@@ -9,7 +9,9 @@ This is Task 18 of `docs/superpowers/plans/2026-10-02-rust-deep-testing.md` (Ste
 mutation-testing run and its triage, through Step 6, the final gate and commit). The first
 run itself is reported here from the merged outcome files and run logs under
 `.superpowers/sdd/2026-10-02-rust-deep-testing/mutants/`; triage of its survivors was done as
-two prior tasks (18b-1, 18b-2) whose per-row results are reproduced in full below.
+two prior tasks (18b-1, 18b-2) whose per-row results are reproduced in full below. The cited
+`.superpowers/...` run logs and reports are local to this VM and not tracked in git; the
+tables in this document are self-contained and do not depend on them.
 
 ## 1. First run: per-crate totals
 
@@ -537,16 +539,18 @@ ledger lines:
 | 12 | in-crate proptest (`hash_type`) | `HashType::parse` rejected the display name "Quick MD5" (the C++ reference's `hash_types.cpp` accepts "quick md5") | e9fefbf | 7e384ee |
 | 13 | in-crate proptest (`format::chunk`) | `Cursor::pstring` advanced its position on a failed body read | 09810b0 (regression), c96338c (test correction) | f3a6b04 |
 | 14 | fuzzing | flat block model arithmetic overflow on corrupt hint bounds | 8157d50 | 6ef42cc |
+| 14 | fuzzing | flat block hint centred near `i64::MIN` overflowed the region-radius sample's `index - centre` | 67981e2 | f97c45a |
 | 14 | fuzzing | `add_text_line` stripped every trailing CR/LF instead of one line ending | 7030dd0 | ea85572 |
 | 14 | fuzzing | test kit's `exercise_loaded` aborted allocating a query of an absurd `hash_length` for an empty section | d2eaa8c | 76a0783 (kit-side fix) |
 
 Two further issues were found but parked for the final whole-branch review rather than fixed
-mid-plan, since they are not soundness bugs in the shipped behaviour exercised by any tier:
-`lookup::hull::choose_slope` discards slopes above 1 instead of capping them (Task 12, wider
-but still-correct windows on clustered inputs), and `ops::relayout` matches record fields by
-hash type only, so a file listing the same type twice with different lengths would copy bytes
-from the wrong field (Task 18b-2 implementer note; no survivor pointed at it, and the correct
-semantics depend on the C++ reference).
+mid-plan: `lookup::hull::choose_slope` discards slopes above 1 instead of capping them (Task
+12; not a soundness bug, just wider but still-correct windows on clustered inputs), and
+`ops::relayout` matches record fields by hash type only, so a file listing the same type
+twice with different lengths copies bytes from the wrong field — silent wrong output on a
+file with duplicate field types; it matches the C++ reference's own behaviour, so this is
+parity rather than a regression, and is left as a follow-up (Task 18b-2 implementer note; no
+survivor pointed at it, and the correct semantics depend on the C++ reference).
 
 ## 6. Final gate
 
