@@ -98,6 +98,32 @@ exclude_re = [
     # 2^31 - 1 or 2^31 hashes of at least 4 bytes, an 8 GiB input (and
     # for `>=`, a hull build over all of it).
     "mod\\.rs:295:18: replace > with (==|>=) in build_hint\\b",
+
+    # --- Outside lookup: equivalent mutants and capacity hints ---
+    #
+    # `|` -> `^` where the operands share no set bit, so both give the
+    # same value: a hex digit pair (`h << 4` has a zero low nibble, `l`
+    # is below 16), the digit and letter lane masks (a byte cannot be
+    # both), the narrowed SIMD byte (`w << 4` keeps the high digit in the
+    # top nibble of the low byte, `w >> 8` is the low digit; the high
+    # byte is dropped by `narrow`), the big-endian key loads (`k << 8`
+    # has a zero low byte), hint tags (`0x6200`/`0x6800` plus a `u8`) and
+    # `HHnn` chunk tags (`HHDR` has a zero low half, `log2` is below 16).
+    "hex\\.rs:(68:53: replace \\| with \\^ in scalar::decode_into|170:26: replace \\| with \\^ in simd::nibbles|18[89]:28: replace \\| with \\^ in simd::decode_block)\\b",
+    "key\\.rs:(22:26: replace \\| with \\^ in key64|34:22: replace \\| with \\^ in key64_dyn)\\b",
+    "structs\\.rs:(84:12: replace \\| with \\^ in hint_tag_block|89:12: replace \\| with \\^ in hint_tag_hull)\\b",
+    "encode\\.rs:143:31: replace \\| with \\^ in encode\\b",
+    # `Md5 = 1 << 0` and `1 >> 0` are both 1.
+    "hash_type\\.rs:15:13: replace << with >>",
+    # Sizes passed to `reserve` / `with_capacity`: they only decide when
+    # the buffer reallocates, never its contents (capacity beyond the
+    # requested minimum is unspecified, so no test can pin it).
+    "hex\\.rs:(239:29: replace \\* with [+/] in encode_to_string|307:16: replace / with % in check_rows|316:(22|27): replace \\* with [+/] in encode_rows|316:35: replace \\+ with \\* in encode_rows)\\b",
+    "encode\\.rs:(99:9: replace \\+ with \\*|103:62: replace \\+ with \\*|103:30: replace \\+ with [-*]) in encode\\b",
+    # Hex row paths: at exactly `SCRATCH` bytes the per-row path and the
+    # batched path (one row per batch) produce the same bytes, and
+    # flushing an empty final batch decodes nothing.
+    "hex\\.rs:(324:18: replace > with >= in encode_rows|359:13: replace > with >= in encode_rows_to_writer|434:20: replace > with >= in decode_rows|455:17: replace > with >= in decode_rows)\\b",
 ]
 
 # A mutant that breaks a loop bound in the search or the merge runs until
