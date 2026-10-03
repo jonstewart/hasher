@@ -1,0 +1,21 @@
+# cargo-mutants configuration. Every exclusion says why the mutation is
+# unobservable; anything else that survives gets a test or is removed.
+test_tool = "nextest"
+
+# Test infrastructure and benchmarks are not the system under test.
+exclude_globs = ["hset-testkit/**", "**/benches/**", "**/examples/**"]
+
+exclude_re = [
+    "\\bproofs::",           # Kani harnesses: not compiled under cfg(test), no test can see them
+    "\\bprefetch\\b",        # cache hint with no observable result
+    "\\bprefetch_entry\\b",  # same, on the Model trait
+    "::describe\\b",         # diagnostics text
+    "::table_bytes\\b",      # diagnostics
+    "::mean_window\\b",      # diagnostics; only steers which batch path runs, answers are identical
+    "SetOp::name\\b",        # diagnostics
+]
+
+# A mutant that breaks a loop bound in the search or the merge runs until
+# stopped; memory is capped by the systemd-run scope in `just mutants`.
+minimum_test_timeout = 60
+timeout_multiplier = 3

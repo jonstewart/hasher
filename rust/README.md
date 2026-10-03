@@ -16,10 +16,47 @@ rust/
 ```sh
 cd rust
 cargo build --release            # library + `target/release/hset`
-cargo test --workspace           # unit, interop (C++ fixtures), and CLI tests
-cargo clippy --workspace --all-targets -- -D warnings
 cargo bench -p hset              # Criterion: lookup latency/throughput, build cost, hex codec
 ```
+
+The rest runs through `just` (`just --list` for the menu):
+
+| Recipe | Runs | Tier |
+|---|---|---|
+| `default` | `just --list` | |
+| `fmt` / `fmt-check` | `cargo fmt --all` / `-- --check` | gate |
+| `lint` | `cargo clippy --workspace --all-targets -- -D warnings`, then the same over `fuzz/Cargo.toml` so targets never rot | gate |
+| `test` | `cargo nextest run --workspace`; proptests at their default case count | gate |
+| `check` | `fmt-check lint test` | gate |
+| `prop` | `PROPTEST_CASES=${PROPTEST_CASES:-20000} cargo nextest run --workspace`; the whole suite, since in-crate proptests live in the unit-test binaries and the example tests cost only seconds | nightly |
+| `mutants crate` | `cargo mutants -p crate -j $MUTANTS_JOBS` inside `systemd-run --user --scope -p MemoryMax=$MUTANTS_MEMORY -p MemorySwapMax=0`; without `systemd-run` (macOS) run uncapped with a warning | nightly |
+| `mutants-diff` | `git diff --relative main... > target/mutants.diff; cargo mutants --workspace --in-diff target/mutants.diff` | on demand |
+| `fuzz target` | `cargo fuzz run -s $FUZZ_SANITIZER target target/fuzz-corpus/target fuzz/corpus/target -- <limits>`; unbounded | on demand |
+| `fuzz-ci` | every target from `cargo fuzz list`, `-max_total_time=$FUZZ_SECONDS` each | nightly |
+| `fuzz-seed` | `cargo fuzz cmin target` merging the scratch corpus into `fuzz/corpus/target` | on demand |
+| `verify` | `cargo kani -p hset` | nightly |
+| `check-slow` | `prop fuzz-ci verify`, then `just mutants` for `hset` and `hset-cli` | nightly |
+
+Variables with environment overrides: `FUZZ_SECONDS` (default 60),
+`FUZZ_SANITIZER` (default `none`; the crate has one `unsafe`, the prefetch
+hint, and sanitizer-free builds are portable), `MUTANTS_JOBS` (default 2),
+`MUTANTS_MEMORY` (default `3G`), `PROPTEST_CASES` (default 20000 for `prop`).
+
+Recipes that depend on a missing optional tool (`cargo-fuzz`, `cargo kani`,
+`systemd-run`) print `SKIP:` or `NOTE:` to stderr and exit 0; `cargo-mutants`
+and `cargo-nextest` are required by the gate and their absence is an error.
+
+`hset-testkit` holds Rust-internal oracles (reference hex codec, brute-force
+lookup, etc.) used from each crate's `tests/` directory and from the fuzz
+crate. The fuzz crate's targets, corpora and invocation are documented in
+`fuzz/README.md`. `just verify` runs 29 Kani harnesses over the pure integer
+functions of `hset`; on Linux, cap the memory a runaway harness can use with
+`systemd-run --user --scope -p MemoryMax=3G -p MemorySwapMax=0 -- cargo kani
+-p hset`. Mutation testing (`cargo-mutants`, configured in
+`.cargo/mutants.toml`) is triaged on a strict policy: every surviving mutant
+gets a new test that kills it, an `exclude_re` line with a comment saying why
+it is unobservable, or removal of dead code, and the triage summary is
+written to `experiments/results/mutants-<host>-<date>.md`.
 
 Benchmark knobs: `HSET_BENCH_N` (set size, default 1,000,000),
 `HSET_BENCH_HLEN` (hash length, default 20), `HSET_BENCH_ALL=1` (extra

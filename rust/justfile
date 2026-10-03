@@ -38,6 +38,12 @@ lint:
 # nextest does not run doctests, so they run separately to keep this the
 # same test set as `cargo test --workspace`.
 test:
+    #!/bin/sh
+    set -eu
+    if ! command -v cargo-nextest >/dev/null 2>&1; then
+        echo "test: cargo-nextest is required (cargo install cargo-nextest)" >&2
+        exit 1
+    fi
     cargo nextest run --workspace
     cargo test --workspace --doc
 
@@ -108,3 +114,39 @@ verify:
         exit 0
     fi
     cargo kani -p hset
+
+# Mutation-test one crate: `just mutants hset`. A runaway mutant eats memory
+# first, so on Linux the run sits in a systemd scope with a hard cap.
+mutants crate:
+    #!/bin/sh
+    set -eu
+    if ! command -v cargo-mutants >/dev/null 2>&1; then
+        echo "mutants: cargo-mutants is required (cargo install cargo-mutants)" >&2
+        exit 1
+    fi
+    if ! command -v systemd-run >/dev/null 2>&1; then
+        echo "NOTE: systemd-run not found; running cargo-mutants without a memory cap" >&2
+        cargo mutants --package {{ crate }} -j {{ mutants_jobs }}
+        exit 0
+    fi
+    systemd-run --user --scope -q -p MemoryMax={{ mutants_memory }} -p MemorySwapMax=0 \
+        cargo mutants --package {{ crate }} -j {{ mutants_jobs }}
+
+# Mutants only in code changed since main: the daily form. `--relative`
+# keeps diff paths rooted at `rust/`, matching what cargo-mutants expects;
+# without it every path is prefixed with `rust/` and nothing matches.
+mutants-diff:
+    #!/bin/sh
+    set -eu
+    mkdir -p target
+    git diff --relative main... > target/mutants.diff
+    cargo mutants --workspace --in-diff target/mutants.diff -j {{ mutants_jobs }}
+
+# Slow gate, run on a cadence: high-count proptests, bounded fuzzing, the
+# Kani harnesses, then mutation testing.
+check-slow: prop fuzz-ci verify
+    #!/bin/sh
+    set -eu
+    for crate in hset hset-cli; do
+        just mutants "$crate"
+    done
