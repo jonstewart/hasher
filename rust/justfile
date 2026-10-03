@@ -128,7 +128,12 @@ mutants crate:
         echo "mutants: cargo-mutants is required (cargo install cargo-mutants)" >&2
         exit 1
     fi
-    export HSET_FIXTURES_DIR="$(cd ../test && pwd)"
+    if [ ! -d ../test ]; then
+        echo "mutants: ../test (the C++ fixtures) not found" >&2
+        exit 1
+    fi
+    HSET_FIXTURES_DIR="$(cd ../test && pwd)"
+    export HSET_FIXTURES_DIR
     if ! command -v systemd-run >/dev/null 2>&1; then
         echo "NOTE: systemd-run not found; running cargo-mutants without a memory cap" >&2
         cargo mutants --package {{ crate }} -j {{ mutants_jobs }}
@@ -147,7 +152,12 @@ mutants-diff:
     set -eu
     mkdir -p target
     git diff --relative main... > target/mutants.diff
-    export HSET_FIXTURES_DIR="$(cd ../test && pwd)"
+    if [ ! -d ../test ]; then
+        echo "mutants-diff: ../test (the C++ fixtures) not found" >&2
+        exit 1
+    fi
+    HSET_FIXTURES_DIR="$(cd ../test && pwd)"
+    export HSET_FIXTURES_DIR
     cargo mutants --workspace --in-diff target/mutants.diff -j {{ mutants_jobs }}
 
 # Slow gate, run on a cadence: high-count proptests, bounded fuzzing, the

@@ -18,9 +18,14 @@ use std::env;
 use std::path::PathBuf;
 
 /// Directory holding the reference fixtures, honouring `HSET_FIXTURES_DIR`
-/// when set and falling back to `test/` two levels above this crate.
+/// when set to a non-empty value and falling back to `test/` two levels
+/// above this crate otherwise. An empty `HSET_FIXTURES_DIR` (e.g. `VAR=`
+/// with no value, as opposed to unset) is treated the same as unset, rather
+/// than resolving to the current directory.
 pub fn fixtures_dir() -> PathBuf {
-    if let Some(dir) = env::var_os("HSET_FIXTURES_DIR") {
+    if let Some(dir) = env::var_os("HSET_FIXTURES_DIR")
+        && !dir.is_empty()
+    {
         return PathBuf::from(dir);
     }
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../test")
