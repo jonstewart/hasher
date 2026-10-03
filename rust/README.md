@@ -26,7 +26,7 @@ The rest runs through `just` (`just --list` for the menu):
 | `default` | `just --list` | |
 | `fmt` / `fmt-check` | `cargo fmt --all` / `-- --check` | gate |
 | `lint` | `cargo clippy --workspace --all-targets -- -D warnings`, then the same over `fuzz/Cargo.toml` so targets never rot | gate |
-| `test` | `cargo nextest run --workspace`; proptests at their default case count | gate |
+| `test` | `cargo nextest run --workspace`, then `cargo test --workspace --doc` (nextest skips doctests); proptests at their default case count | gate |
 | `check` | `fmt-check lint test` | gate |
 | `prop` | `PROPTEST_CASES=${PROPTEST_CASES:-20000} cargo nextest run --workspace`; the whole suite, since in-crate proptests live in the unit-test binaries and the example tests cost only seconds | nightly |
 | `mutants crate` | `cargo mutants -p crate -j $MUTANTS_JOBS` inside `systemd-run --user --scope -p MemoryMax=$MUTANTS_MEMORY -p MemorySwapMax=0 -p OOMPolicy=continue` (the last so an OOM kill takes only the runaway mutant's test, not the whole run); without `systemd-run` (macOS) run uncapped with a warning | nightly |
@@ -34,33 +34,41 @@ The rest runs through `just` (`just --list` for the menu):
 | `fuzz target` | `cargo fuzz run -s $FUZZ_SANITIZER target target/fuzz-corpus/target fuzz/corpus/target -- <limits>`; unbounded | on demand |
 | `fuzz-ci` | every target from `cargo fuzz list`, `-max_total_time=$FUZZ_SECONDS` each | nightly |
 | `fuzz-seed` | `cargo fuzz cmin target` merging the scratch corpus into `fuzz/corpus/target` | on demand |
-| `verify` | `cargo kani -p hset` | nightly |
+| `verify` | `cargo kani -p hset` inside the same capped `systemd-run` scope as `mutants` (`MemoryMax=$KANI_MEMORY`); without `systemd-run` run uncapped with a warning | nightly |
 | `check-slow` | `prop fuzz-ci verify`, then `just mutants` for `hset` and `hset-cli` | nightly |
+
+`cargo test --workspace` run bare, without `just`, runs the same test set
+but takes about 44 s on the 4-core VM because it lacks nextest's
+process-per-test parallelism; the commit-gate's 30 s budget is measured on
+`just test` (21 to 25 s), not the bare command.
 
 Variables with environment overrides: `FUZZ_SECONDS` (default 60),
 `FUZZ_SANITIZER` (default `none`; the crate has one `unsafe`, the prefetch
 hint, and sanitizer-free builds are portable), `MUTANTS_JOBS` (default 2),
-`MUTANTS_MEMORY` (default `3G`), `PROPTEST_CASES` (default 20000 for `prop`).
+`MUTANTS_MEMORY` (default `3G`), `KANI_MEMORY` (default `4G`),
+`PROPTEST_CASES` (default 20000 for `prop`).
 `HSET_FIXTURES_DIR` points the fixture-backed tests at the C++ reference
 fixtures; the `mutants` and `mutants-diff` recipes set it to an absolute
 path because cargo-mutants' per-mutant build copy does not include `test/`,
 which sits outside the `rust/` workspace.
 
 Recipes that depend on a missing optional tool (`cargo-fuzz`, `cargo kani`,
-`systemd-run`) print `SKIP:` or `NOTE:` to stderr and exit 0; `cargo-mutants`
-and `cargo-nextest` are required by the gate and their absence is an error.
+`systemd-run`) print `SKIP:` or `NOTE:` to stderr and exit 0; `cargo-nextest`
+is required by the gate (`just test`/`just check`) and its absence is an
+error, and `cargo-mutants` is required by the `mutants`/`mutants-diff`
+recipes the same way.
 
 `hset-testkit` holds Rust-internal oracles (reference hex codec, brute-force
 lookup, etc.) used from each crate's `tests/` directory and from the fuzz
 crate. The fuzz crate's targets, corpora and invocation are documented in
 `fuzz/README.md`. `just verify` runs 29 Kani harnesses over the pure integer
-functions of `hset`; on Linux, cap the memory a runaway harness can use with
-`systemd-run --user --scope -p MemoryMax=3G -p MemorySwapMax=0 -- cargo kani
--p hset`. Mutation testing (`cargo-mutants`, configured in
-`.cargo/mutants.toml`) is triaged on a strict policy: every surviving mutant
-gets a new test that kills it, an `exclude_re` line with a comment saying why
-it is unobservable, or removal of dead code, and the triage summary is
-written to `experiments/results/mutants-<host>-<date>.md`.
+functions of `hset`, in the same capped `systemd-run` scope `mutants` uses
+(`MemoryMax=$KANI_MEMORY`) when `systemd-run` is available. Mutation testing
+(`cargo-mutants`, configured in `.cargo/mutants.toml`) is triaged on a
+strict policy: every surviving mutant gets a new test that kills it, an
+`exclude_re` line with a comment saying why it is unobservable, or removal
+of dead code, and the triage summary is written to
+`experiments/results/mutants-<host>-<date>.md`.
 
 Benchmark knobs: `HSET_BENCH_N` (set size, default 1,000,000),
 `HSET_BENCH_HLEN` (hash length, default 20), `HSET_BENCH_ALL=1` (extra

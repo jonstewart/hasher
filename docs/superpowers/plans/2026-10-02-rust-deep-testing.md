@@ -13,7 +13,7 @@
 ## Global Constraints
 
 - All paths below are relative to `rust/` unless they start with `docs/` or `/work/`.
-- `just test` and `cargo test --workspace` stay under 30 s on the 4-core VM and run the same test set (nextest skips doctests, so `test` also runs `cargo test --workspace --doc`).
+- `just test` and `cargo test --workspace` stay under 30 s on the 4-core VM and run the same test set (nextest skips doctests, so `test` also runs `cargo test --workspace --doc`). (Outcome 2026-10-03: measured on `just test`; the bare command runs the same set in about 44 s.)
 - Oracles are Rust-internal only: no C++ or Python build, no differential tests against `libhasher`.
 - `proptest` and `arbitrary` are never dependencies of `hset` or `hset-cli`, only dev-dependencies and `hset-testkit` dependencies.
 - The test kit is used only from `tests/` directories and the fuzz crate, never from `#[cfg(test)]` modules inside `hset`.
@@ -984,6 +984,12 @@ git commit -m "test(rust): cargo-fuzz targets over the test kit, dictionary, see
 
 ### Task 15: Kani fast harnesses and `just verify`
 
+**Outcome (2026-10-03):** the eight `format::chunk` Cursor harnesses and
+`synth::below_is_below` were pulled from the "Fast" table below and
+reclassified as "not amenable" (covered by proptest and fuzz instead): the
+Cursor error path's `format!` and `below`'s 128-bit product do not converge
+under Kani without stubbing or production changes (commit 8b4d434).
+
 **Files:**
 - Modify: `hset/src/lookup/hull.rs`, `hset/src/lookup/model.rs`, `hset/src/key.rs`, `hset/src/format/chunk.rs`, `hset/src/hex.rs`, `hset/src/hash_type.rs`, `hset/src/lookup/mod.rs`, `hset/src/synth.rs` (each gains `#[cfg(kani)] mod proofs` at the bottom), `justfile`
 
@@ -1099,6 +1105,20 @@ git commit -m "verify(rust): slow Kani harnesses for hull fitting and row merge 
 ---
 
 ### Task 17: Mutation testing configuration, `check-slow`, and the README tier table
+
+**Outcome (2026-10-03):** the base commit (205a170) already diverged from
+the draft recipes below in two places: `mutants-diff`'s `git diff` gained
+`--relative` (cargo-mutants expects diff paths rooted at `rust/`; without
+it every path is prefixed with `rust/` and nothing matches), and the
+`exclude_re` pattern is `\bproofs::`, not `::proofs::` (cargo-mutants prints
+mutant locations as bare paths with no leading `::`). Three follow-up fixes
+landed after: 8a4ef6c and fc760dc add `HSET_FIXTURES_DIR` (cargo-mutants
+copies only the `rust/` workspace into its per-mutant tempdir, so the C++
+fixtures under `test/`, outside the workspace, were missing until the
+`mutants`/`mutants-diff` recipes exported it) and harden the guard against
+a missing `../test`; 574f3c9 adds `OOMPolicy=continue` to the `mutants`
+systemd-run scope (the scope's default policy stopped the whole run on the
+first OOM kill from one runaway mutant).
 
 **Files:**
 - Create: `.cargo/mutants.toml`

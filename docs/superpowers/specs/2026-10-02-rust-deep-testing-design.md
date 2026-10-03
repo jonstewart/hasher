@@ -366,3 +366,39 @@ commit, separate from the test-infrastructure commits.
 - `just mutants hset` completes with every survivor triaged.
 - All recipes run on the Mac with at most `NOTE:`/`SKIP:` output for
   Linux-only tooling.
+
+## Outcomes (2026-10-03)
+
+What was actually delivered differs from this design in several places:
+
+- The `kani_slow` cfg and the `verify-slow` recipe were removed outright:
+  every harness planned for it (`fit_block` on 3 and 4 points, `merge` on
+  row sets) exceeded a 3 GiB memory cap within minutes, and an uncapped run
+  was OOM-killed at around 10 GiB on the 11 GiB dev VM, taking the tmux
+  session with it. `check-slow` now depends on `verify` only (no
+  `verify-slow`).
+- The eight `format::chunk` Cursor harnesses and `synth::below_is_below`
+  were reclassified from "Fast" to "Not amenable (covered by proptest and
+  fuzz instead)": the Cursor error path's `format!` and `below`'s 128-bit
+  product do not converge under Kani without stubbing or production
+  changes.
+- `HSET_FIXTURES_DIR`: cargo-mutants copies only the `rust/` workspace into
+  its per-mutant tempdir, so the C++ reference fixtures under `test/` (one
+  level above `rust/`, outside the workspace) are not there. The `mutants`
+  and `mutants-diff` recipes export it as an absolute path, and
+  fixture-backed tests resolve it at runtime with a fallback to the old
+  relative path.
+- The `mutants` (and now `mutants-diff`) systemd-run scope sets
+  `OOMPolicy=continue`: the scope's default policy stops the whole unit on
+  the first OOM kill, which would discard an entire mutants run over one
+  runaway mutant; `continue` kills just that test process and cargo-mutants
+  records it as caught.
+- `MUTANTS_MEMORY` (default `3G`) and `KANI_MEMORY` (default `4G`) are both
+  `env_var_or_default` knobs in the `justfile`, used by the `mutants`/
+  `mutants-diff` and `verify` systemd-run scopes respectively.
+- `mutants-diff` uses `git diff --relative main...`, not plain `git diff
+  main...`: cargo-mutants expects diff paths rooted at `rust/`, and without
+  `--relative` every path is prefixed with `rust/` and nothing matches.
+- The Kani-harness exclusion pattern in `.cargo/mutants.toml` is written as
+  `\bproofs::`, not `::proofs::`: cargo-mutants prints mutant locations as
+  bare paths with no leading `::`, so the anchored form never matched.
