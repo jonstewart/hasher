@@ -223,6 +223,9 @@ mod tests {
         assert_eq!(HashType::Size.length(), Some(8));
         assert_eq!(HashType::Fuzzy.length(), None);
         assert!(!HashType::Fuzzy.is_storable());
+        for t in HashType::ALL {
+            assert_eq!(t.is_storable(), t != HashType::Fuzzy, "{t:?}");
+        }
         assert!(!HashType::Size.is_digest());
         assert!(HashType::Blake3.is_digest());
     }
