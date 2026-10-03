@@ -156,6 +156,85 @@ mod tests {
         let nm = near_misses(&d, hl, 500, 4);
         assert!(nm.chunks_exact(hl).all(|h| rows.binary_search(&h).is_err()));
     }
+
+    /// The published SplitMix64 test vector (Vigna's `splitmix64.c`, seed
+    /// 1234567) and the state-0 output `SplitMix64::new` substitutes for.
+    #[test]
+    fn next_u64_matches_the_reference_outputs() {
+        let mut r = SplitMix64::new(1_234_567);
+        let got: Vec<u64> = (0..5).map(|_| r.next_u64()).collect();
+        assert_eq!(
+            got,
+            [
+                6_457_827_717_110_365_317,
+                3_203_168_211_198_807_973,
+                9_817_491_932_198_370_423,
+                4_593_380_528_125_082_431,
+                16_408_922_859_458_223_821,
+            ]
+        );
+        // Seed 0 starts from the golden-ratio increment, i.e. the
+        // reference generator's second output from state 0.
+        let mut z = SplitMix64::new(0);
+        assert_eq!(z.next_u64(), 0x6e78_9e6a_a1b9_65f4);
+    }
+
+    /// `below` is the high half of `next_u64() * bound` (Lemire's
+    /// multiply-shift); with seed 1 the first draws scaled to 10 are
+    /// these, and a bound of 2^63 halves the raw outputs.
+    #[test]
+    fn below_takes_the_high_half_of_the_product() {
+        let mut r = SplitMix64::new(1);
+        let got: Vec<u64> = (0..8).map(|_| r.below(10)).collect();
+        assert_eq!(got, [5, 7, 9, 4, 4, 7, 8, 5]);
+        assert_eq!(r.below(1 << 63), 2_633_352_815_946_178_260);
+        assert_eq!(r.below(1 << 63), 7_323_326_090_023_318_475);
+    }
+
+    /// `fill` writes whole outputs little-endian and the first bytes of one
+    /// more for a ragged tail; a whole buffer draws no extra output.
+    #[test]
+    fn fill_writes_outputs_little_endian() {
+        let mut r = SplitMix64::new(1);
+        let mut buf = [0u8; 11];
+        r.fill(&mut buf);
+        assert_eq!(crate::hex::encode(&buf), "c15c0289ec2d0a9167ec8e");
+        let mut whole = [0u8; 8];
+        let mut r = SplitMix64::new(1);
+        r.fill(&mut whole);
+        let mut next = [0u8; 3];
+        r.fill(&mut next);
+        assert_eq!(crate::hex::encode(&next), "67ec8e");
+    }
+
+    /// Hand-traced outputs of the generators over a three-row table
+    /// (expected bytes from a straight transcription of each function
+    /// over the SplitMix64 reference recurrence).
+    #[test]
+    fn generators_produce_the_traced_outputs() {
+        let data = [0x10, 0x20, 0x30, 0x40, 0x50, 0x60];
+        let hex = |v: &[u8]| crate::hex::encode(v);
+        // Leading bytes from the clustered set; seed 0 means seed 0xABC.
+        assert_eq!(
+            hex(&adversarial_hashes(4, 3, 7)),
+            "801c0280da11fefe61ffeb2c"
+        );
+        assert_eq!(hex(&adversarial_hashes(2, 2, 0)), "7f97ff31");
+        assert_eq!(hex(&adversarial_hashes(2, 2, 0xABC)), "7f97ff31");
+        // Hits copy a stored row, misses are fresh random bytes.
+        assert_eq!(
+            hex(&queries(&data, 2, 6, 0.5, 3)),
+            "5060cfc93040506050607f48"
+        );
+        // An empty table can only miss, whatever the hit fraction.
+        assert_eq!(hex(&queries(&[], 2, 2, 1.0, 3)), "ed8f89a9");
+        // A draw equal to the hit fraction is a miss (the test is `<`).
+        let u = (SplitMix64::new(3).next_u64() >> 11) as f64 / (1u64 << 53) as f64;
+        assert_eq!(hex(&queries(&data, 2, 1, u, 3)), "89a9");
+        // Each near miss is a stored row with exactly one bit flipped.
+        assert_eq!(hex(&near_misses(&data, 2, 4, 3)), "1028324010241060");
+        assert_eq!(near_misses(&[], 2, 2, 3), [0u8; 4]);
+    }
 }
 
 #[cfg(test)]
