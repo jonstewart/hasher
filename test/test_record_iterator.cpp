@@ -1,9 +1,12 @@
 #include "hashset/record_iterator.h"
 
 #include <algorithm>
+#include <array>
 #include <cstring>
 #include <iterator>
 #include <numeric>
+#include <random>
+#include <vector>
 
 #include <catch2/catch_test_macros.hpp>
 
@@ -360,34 +363,155 @@ TEST_CASE("RecordIterator_sort_small") {
 }
 
 TEST_CASE("RecordIterator_sort_large") {
-/*
-  uint8_t dat[1000];
+  // large enough that std::sort partitions rather than insertion sorting
+  const size_t rlen = 3;
+  const size_t rcount = 1000;
 
-  const size_t rlen = 2;
-  const size_t rcount = std::size(dat) / rlen;
+  std::mt19937 rng(42);
+  std::uniform_int_distribution<int> byte(0, 255);
 
-  std::iota(
-    std::reverse_iterator(reinterpret_cast<uint16_t*>(std::end(dat))),
-    std::reverse_iterator(reinterpret_cast<uint16_t*>(std::begin(dat))),
-    0
-  );
+  std::vector<std::array<uint8_t, rlen>> recs(rcount);
+  for (auto& r: recs) {
+    for (auto& b: r) {
+      b = byte(rng);
+    }
+  }
 
-  uint8_t exp[1000];
-  std::iota(
-    reinterpret_cast<uint16_t*>(std::begin(exp)),
-    reinterpret_cast<uint16_t*>(std::end(exp)),
-    0
-  );
+  std::vector<uint8_t> dat;
+  for (const auto& r: recs) {
+    dat.insert(dat.end(), r.begin(), r.end());
+  }
 
-  RecordIterator beg(std::begin(dat), rlen);
-  RecordIterator end(std::end(dat), rlen);
+  std::sort(recs.begin(), recs.end());
+
+  RecordIterator beg(dat.data(), rlen);
+  RecordIterator end(dat.data() + dat.size(), rlen);
 
   std::sort(beg, end);
 
   for (size_t i = 0; i < rcount; ++i) {
-    CHECK(!std::memcmp(dat + i*rlen, exp + i*rlen, rlen));
+    CHECK(!std::memcmp(dat.data() + i*rlen, recs[i].data(), rlen));
   }
-*/
+}
+
+TEST_CASE("HashRecordIterator_sort_large") {
+  // large enough that std::sort partitions rather than insertion sorting
+  const size_t hlen = 3;
+  const size_t hcount = 1000;
+
+  std::mt19937 rng(42);
+  std::uniform_int_distribution<int> byte(0, 255);
+
+  std::vector<uint8_t> hashes(hcount * hlen);
+  for (auto& b: hashes) {
+    b = byte(rng);
+  }
+
+  // record the original position of each hash
+  std::vector<uint64_t> idx(hcount);
+  std::iota(idx.begin(), idx.end(), 0);
+
+  const std::vector<uint8_t> orig(hashes);
+
+  HashRecordIterator beg(0, hashes.data(), hlen, idx.data());
+  HashRecordIterator end(hcount, hashes.data(), hlen, idx.data());
+
+  std::sort(beg, end);
+
+  for (size_t i = 0; i < hcount; ++i) {
+    // the hashes are sorted
+    if (i > 0) {
+      CHECK(std::memcmp(hashes.data() + (i-1)*hlen, hashes.data() + i*hlen, hlen) <= 0);
+    }
+
+    // each index still points to its hash
+    REQUIRE(idx[i] < hcount);
+    CHECK(!std::memcmp(hashes.data() + i*hlen, orig.data() + idx[i]*hlen, hlen));
+  }
+}
+
+TEST_CASE("RecordIterator_value_type_is_a_copy") {
+  uint8_t dat[] = {
+    0x11, 0x11,
+    0x22, 0x22
+  };
+
+  const uint8_t exp[] = { 0x11, 0x11 };
+
+  const size_t rlen = 2;
+
+  RecordIterator beg(std::begin(dat), rlen);
+
+  // std::sort initializes its pivot this way, from the prvalue proxy; the
+  // value must not alias the record it came from
+  RecordIterator::value_type v = *beg;
+
+  *beg = *(beg + 1);
+
+  CHECK(!std::memcmp(v.rec.data(), exp, rlen));
+}
+
+TEST_CASE("HashRecordProxy_swap") {
+  uint8_t dat[] = {
+    0x11, 0x11,
+    0x22, 0x22
+  };
+
+  uint64_t idx[] = { 1, 2 };
+
+  const uint8_t exp[] = {
+    0x22, 0x22,
+    0x11, 0x11
+  };
+
+  const uint64_t exp_idx[] = { 2, 1 };
+
+  const size_t hlen = 2;
+
+  HashRecordProxy a{{dat, hlen}, idx};
+  HashRecordProxy b{{dat + hlen, hlen}, idx + 1};
+
+  std::swap(a, b);
+
+  CHECK(!std::memcmp(dat, exp, std::size(dat)));
+  CHECK(idx[0] == exp_idx[0]);
+  CHECK(idx[1] == exp_idx[1]);
+}
+
+TEST_CASE("HashRecordIterator_value_type_is_a_copy") {
+  uint8_t dat[] = {
+    0x11, 0x11,
+    0x22, 0x22,
+    0x33, 0x33
+  };
+
+  uint64_t idx[] = { 1, 2, 3 };
+
+  const size_t hlen = 2;
+
+  HashRecordIterator beg(0, dat, hlen, idx);
+
+  // std::sort initializes its pivot this way, from the prvalue proxy; the
+  // value must not alias the hash and index it came from
+  HashRecordIterator::value_type v = *beg;
+
+  *beg = *(beg + 1);
+
+  // store the value elsewhere to check both its hash and its index
+  *(beg + 2) = v;
+
+  const uint8_t exp[] = {
+    0x22, 0x22,
+    0x22, 0x22,
+    0x11, 0x11
+  };
+
+  const uint64_t exp_idx[] = { 2, 2, 1 };
+
+  CHECK(!std::memcmp(dat, exp, std::size(dat)));
+  CHECK(idx[0] == exp_idx[0]);
+  CHECK(idx[1] == exp_idx[1]);
+  CHECK(idx[2] == exp_idx[2]);
 }
 
 TEST_CASE("RecordIterator_unique") {

@@ -11,8 +11,10 @@
 #include <cstring>
 #include <iostream>
 #include <fstream>
+#include <set>
 #include <sstream>
 #include <string>
+#include <tuple>
 
 TEST_CASE("hset_round_trip") {
   const std::string hsetfile = "test/sha1.hset";
@@ -112,6 +114,78 @@ auto read_hset(
   REQUIRE(hset);
 
   return std::make_pair(std::move(f), std::move(hset));
+}
+
+TEST_CASE("hset_records_sorted_unique") {
+  auto [buf, h] = read_hset(
+    "test/md5_sha1_a",
+    { SFHASH_MD5, SFHASH_SHA_1 },
+    "test/md5_sha1_a.hset"
+  );
+
+  // each distinct input line is one record
+  std::set<std::string> lines;
+  {
+    std::ifstream in("test/md5_sha1_a");
+    std::string line;
+    while (std::getline(in, line)) {
+      if (!line.empty()) {
+        lines.insert(line);
+      }
+    }
+  }
+
+  const size_t rlen = h->holder.rhdr.record_length;
+  const uint8_t* beg = h->holder.rdat.beg;
+  const uint8_t* end = h->holder.rdat.end;
+
+  REQUIRE(h->holder.rhdr.record_count == lines.size());
+  REQUIRE(static_cast<size_t>(end - beg) == lines.size() * rlen);
+
+  for (const uint8_t* r = beg + rlen; r < end; r += rlen) {
+    // strictly ascending, so sorted and unique
+    CHECK(std::memcmp(r - rlen, r, rlen) < 0);
+  }
+}
+
+TEST_CASE("hset_ridx_points_to_records") {
+  auto [buf, h] = read_hset(
+    "test/md5_sha1_a",
+    { SFHASH_MD5, SFHASH_SHA_1 },
+    "test/md5_sha1_a.hset"
+  );
+
+  for (size_t tidx = 0; tidx < h->holder.hsets.size(); ++tidx) {
+    const auto& hhdr = std::get<HashsetHeader>(h->holder.hsets[tidx]);
+    const auto& hdat = std::get<ConstHashsetData>(h->holder.hsets[tidx]);
+
+    const auto hlen = hhdr.hash_length;
+    const uint8_t* hashes = static_cast<const uint8_t*>(hdat.beg);
+
+    const int foff = hashset_record_field_index_for_type(
+      h->holder.rhdr,
+      static_cast<SFHASH_HashAlgorithm>(hhdr.hash_type)
+    );
+    REQUIRE(foff >= 0);
+
+    for (size_t i = 0; i < hhdr.hash_count; ++i) {
+      if (i > 0) {
+        // the hashes are sorted
+        CHECK(std::memcmp(hashes + (i-1)*hlen, hashes + i*hlen, hlen) <= 0);
+      }
+
+      // the record for the ith hash contains that hash
+      const uint8_t* f = static_cast<const uint8_t*>(
+        sfhash_hashset_record_field(
+          sfhash_hashset_record_for_hash(h.get(), tidx, i),
+          foff
+        )
+      );
+
+      CHECK(f[0] == 0x01);
+      CHECK(!std::memcmp(f + 1, hashes + i*hlen, hlen));
+    }
+  }
 }
 
 TEST_CASE("hset_union_round_trip") {

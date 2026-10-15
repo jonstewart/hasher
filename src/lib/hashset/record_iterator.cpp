@@ -57,6 +57,7 @@ void swap_em(HashRecordProxy& a, HashRecordProxy& b) {
   std::memcpy(tmp.get(), a.rec.data(), a.rec.size());
   std::memcpy(a.rec.data(), b.rec.data(), a.rec.size());
   std::memcpy(b.rec.data(), tmp.get(), a.rec.size());
+  std::swap(*a.idx, *b.idx);
 }
 
 void swap(HashRecordProxy a, HashRecordProxy b) {
