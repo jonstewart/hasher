@@ -6,21 +6,18 @@
 #include <iterator>
 #include <memory>
 #include <ostream>
-// C++20: #include <span>
+#include <span>
 
 #include <iostream>
 
-#include "cpp20.h"
 #include "hex.h"
 #include "hashset/arrow_proxy.h"
 
 struct RecordProxy {
-// C++20: std::span<uint8_t> rec;
-  span<uint8_t> rec;
+  std::span<uint8_t> rec;
   std::unique_ptr<uint8_t[]> tmp;
 
-// C++20: RecordProxy(std::span<uint8_t> rec): rec(rec) {
-  RecordProxy(span<uint8_t> rec): rec(rec) {
+  RecordProxy(std::span<uint8_t> rec): rec(rec) {
   }
 
   RecordProxy(const RecordProxy& o): rec(o.rec) {
@@ -218,15 +215,13 @@ private:
 // C++20: static_assert(std::random_access_iterator<RecordIterator>);
 
 struct HashRecordProxy {
-// C++20: std::span<uint8_t> rec;
-  span<uint8_t> rec;
+  std::span<uint8_t> rec;
   uint64_t* idx;
 
   std::unique_ptr<uint8_t[]> tmp;
   uint64_t tmp_idx;
 
-// C++20:  HashRecordProxy(std::span<uint8_t> rec, uint64_t* idx): rec(rec), idx(idx) {
-  HashRecordProxy(span<uint8_t> rec, uint64_t* idx): rec(rec), idx(idx) {
+  HashRecordProxy(std::span<uint8_t> rec, uint64_t* idx): rec(rec), idx(idx) {
   }
 
   HashRecordProxy(const HashRecordProxy& o): rec(o.rec), idx(o.idx) {

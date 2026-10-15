@@ -1,6 +1,6 @@
 #include "hashset/hset_encoder_chunks.h"
 
-#include "cpp20.h"
+#include <bit>
 #include "rwutil.h"
 #include "util.h"
 
@@ -93,12 +93,12 @@ size_t write_fhdr(
 }
 
 uint32_t make_hhnn_type(uint32_t hash_type) {
-  return Chunk::Type::HHDR | (bit_width(hash_type) - 1);
+  return Chunk::Type::HHDR | (std::bit_width(hash_type) - 1);
 }
 
 std::string make_hhnn_str(uint32_t hash_type) {
   // nn is stored big-endian
-  hash_type = to_be<uint16_t>(bit_width(hash_type) - 1);
+  hash_type = to_be<uint16_t>(std::bit_width(hash_type) - 1);
   return {
     'H',
     'H',
@@ -364,7 +364,7 @@ size_t write_rhdr_data(
   out += write_le<uint64_t>(record_count, out);
 
   for (const auto& hi: fields) {
-    out += write_le<uint16_t>(bit_width(static_cast<uint32_t>(hi.type)) - 1, out);
+    out += write_le<uint16_t>(std::bit_width(static_cast<uint32_t>(hi.type)) - 1, out);
     out += write_pstring(hi.name, out);
     out += write_le<uint64_t>(hi.length, out);
   }

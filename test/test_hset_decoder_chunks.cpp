@@ -1,4 +1,3 @@
-#include "cpp20.h"
 #include "hasher/common.h"
 #include "hashset/hset_decoder_chunks.h"
 
@@ -7,7 +6,7 @@
 #include <ostream>
 #include <utility>
 
-// C++20: #include <bit>
+#include <bit>
 
 template <typename L, typename R>
 std::ostream& operator<<(std::ostream& out, const std::pair<L,R>& p) {
@@ -126,7 +125,7 @@ TEST_CASE("parse_hhdr") {
     0x89, 0x67, 0x45, 0x23, 0x01, 0x00, 0x00, 0x00
   };
 
-  const uint32_t htype = bit_width(static_cast<uint32_t>(SFHASH_SHA_1)) - 1;
+  const uint32_t htype = std::bit_width(static_cast<uint32_t>(SFHASH_SHA_1)) - 1;
 
   const Chunk ch{Chunk::Type::HHDR | htype, std::begin(buf), std::end(buf)};
 

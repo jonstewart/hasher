@@ -1,4 +1,3 @@
-#include "cpp20.h"
 #include "hex.h"
 #include "rwutil.h"
 #include "hasher/common.h"
@@ -7,7 +6,7 @@
 #include <algorithm>
 #include <cstring>
 #include <initializer_list>
-//C++20: #include <span>
+#include <span>
 #include <string_view>
 #include <tuple>
 #include <utility>
@@ -86,8 +85,7 @@ TEST_CASE("length_fhdr") {
 }
 
 template <auto func, typename... Args>
-// C++20: void chunk_data_tester(const std::span<const uint8_t> exp, Args&&... args) {
-void chunk_data_tester(const span<const uint8_t> exp, Args&&... args) {
+void chunk_data_tester(const std::span<const uint8_t> exp, Args&&... args) {
   std::vector<char> buf(exp.size());
   CHECK(func(std::forward<Args>(args)..., buf.data()) == exp.size());
   CHECK(!std::memcmp(buf.data(), exp.data(), exp.size()));
@@ -117,8 +115,7 @@ TEST_CASE("write_fhdr_data") {
   };
 
   chunk_data_tester<write_fhdr_data>(
-// C++20:    std::span{exp}, version, name, desc, ts
-    span{exp}, version, name, desc, ts
+    std::span{exp}, version, name, desc, ts
   );
 }
 
@@ -144,8 +141,7 @@ TEST_CASE("write_hhnn_data") {
   };
 
   chunk_data_tester<write_hhnn_data>(
-// C++20:   std::span{exp}, hi, hash_count
-    span{exp}, hi, hash_count
+    std::span{exp}, hi, hash_count
   );
 }
 
@@ -174,8 +170,7 @@ TEST_CASE("write_hint_data") {
   }
 
   chunk_data_tester<write_hint_data>(
-// C++20:    std::span{exp}, block_bounds
-    span{exp}, block_bounds
+    std::span{exp}, block_bounds
   );
 }
 
@@ -229,8 +224,7 @@ TEST_CASE("write_length_data") {
   };
 
   chunk_data_tester<write_filter_data>(
-// C++20:    std::span{exp}, filter
-    span<uint8_t>{exp}, &filter
+    std::span{exp}, &filter
   );
 }
 
@@ -294,8 +288,7 @@ TEST_CASE("write_rhdr_data") {
   };
 
   chunk_data_tester<write_rhdr_data>(
-// C++20:   std::span{exp}, fields, record_count
-    span{exp}, fields, record_count
+    std::span{exp}, fields, record_count
   );
 }
 
@@ -348,8 +341,7 @@ TEST_CASE("write_ftoc_data") {
   };
 
   chunk_data_tester<write_ftoc_data>(
-// C++20:   std::span{exp}, toc
-    span{exp}, toc
+    std::span{exp}, toc
   );
 }
 

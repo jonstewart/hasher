@@ -1,7 +1,6 @@
 #include "hashset/hset_encoder.h"
 
 #include <algorithm>
-// C++20: #include <bit>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
@@ -28,7 +27,6 @@
 
 namespace bip = boost::interprocess;
 
-#include "cpp20.h"
 #include "error.h"
 #include "hex.h"
 #include "rwutil.h"
