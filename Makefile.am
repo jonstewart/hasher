@@ -140,20 +140,20 @@ test_test_SOURCES = \
 	test/test_parser.cpp \
 	test/test_util.cpp
 
-test_test_CFLAGS = $(AM_CFLAGS) $(CATCH2_CFLAGS)
+test_test_CPPFLAGS = $(AM_CPPFLAGS) $(CATCH2_CFLAGS)
 
 test_test_LDADD = $(HASHER_LIB) $(TEST_LIBS) $(CATCH2_LIBS)
 
 test_bench_hex_SOURCES = \
 	test/bench_hex.cpp
 
-test_bench_hex_CFLAGS = $(AM_CFLAGS) $(CATCH2_CFLAGS)
+test_bench_hex_CPPFLAGS = $(AM_CPPFLAGS) $(CATCH2_CFLAGS)
 test_bench_hex_LDADD = $(HASHER_LIB) $(TEST_LIBS) $(CATCH2_LIBS)
 
 test_bench_hsd_SOURCES = \
 	test/bench_hashset.cpp
 
-test_bench_hsd_CFLAGS = $(AM_CFLAGS) $(CATCH2_CFLAGS)
+test_bench_hsd_CPPFLAGS = $(AM_CPPFLAGS) $(CATCH2_CFLAGS)
 test_bench_hsd_LDADD = $(HASHER_LIB) $(TEST_LIBS) $(CATCH2_LIBS)
 
 FORMAT_COMMAND := tools/git-clang-format -f --style=file
