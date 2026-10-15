@@ -45,3 +45,4 @@
 /test-suite.log
 /test/*.log
 /test/*.trs
+/test/*.hset
