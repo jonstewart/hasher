@@ -1,8 +1,8 @@
 # tlsh-bench
 
 Criterion benchmarks that drive libhasher's TLSH C API through FFI. They
-exist so that distance-kernel and (later) index-accelerated kNN work can be
-measured from the same harness that downstream Rust callers would use.
+exist so that the distance kernel and the index-accelerated hash set kNN can
+be measured from the same harness that downstream Rust callers would use.
 
 The crate is standalone (`publish = false`) and is not part of the autotools
 build.
@@ -19,11 +19,21 @@ cargo test
 cargo bench
 ```
 
-`cargo bench` writes Criterion's HTML report to `target/criterion/report/index.html`.
-For a quick smoke run:
+`cargo bench` writes Criterion's HTML report to
+`target/criterion/report/index.html` (one page per group and benchmark under
+`target/criterion/<group>/<benchmark>/<N>/report/index.html`).
+
+The hash set benchmark is the slow one; these are the settings the table
+below was measured with:
 
 ```
-cargo bench -- --warm-up-time 1 --measurement-time 2
+cargo bench -- hset_knn --warm-up-time 1 --measurement-time 3
+```
+
+`TLSH_BENCH_N` overrides the hash set sizes (a comma-separated list):
+
+```
+TLSH_BENCH_N=10000,100000 cargo bench -- hset_knn
 ```
 
 ### Pointing at a different build
@@ -44,16 +54,77 @@ its place; `otool -L` / `ldd` on the bench binary should not list libhasher.
 
 ## What is measured
 
-| group            | measures                                                                        |
-|------------------|---------------------------------------------------------------------------------|
-| `tlsh_diff_pair` | one `sfhash_tlsh_diff` call                                                     |
-| `knn_brute_ffi`  | brute-force k=10 nearest neighbours over N in {10 000, 100 000} synthetic digests, 20 queries per iteration; throughput is rows scanned |
-| `tlsh_hash_4mib` | `sfhash_create_hasher`/`update`/`get_hashes` over a 4 MiB random buffer         |
+| group            | benchmark          | measures                                                                 |
+|------------------|--------------------|--------------------------------------------------------------------------|
+| `tlsh_diff_pair` |                    | one `sfhash_tlsh_diff` call                                              |
+| `knn_brute_ffi`  | `N`                | brute-force k=10 over N in {10 000, 100 000} digest-space perturbations in memory, one `sfhash_tlsh_diff` call per row |
+| `tlsh_hash_4mib` | `sfhash_hasher`    | `sfhash_create_hasher`/`update`/`get_hashes` over a 4 MiB random buffer  |
+| `hset_knn`       | `naive_brute_ffi`  | the naive baseline: brute-force kNN in Rust over the hset's rows held in memory, one `sfhash_tlsh_diff` FFI call per row |
+| `hset_knn`       | `hset_knn_brute`   | `sfhash_hashset_tlsh_knn_with(..., SFHASH_TLSH_KNN_BRUTE)`: libhasher's popcount kernel over every row of the file |
+| `hset_knn`       | `hset_knn_index`   | `sfhash_hashset_tlsh_knn_with(..., SFHASH_TLSH_KNN_INDEX)`: the TIVF inverted-file index over the lower-bound embedding (`docs/TLSH_EMBEDDING.md`) |
+| `hset_knn`       | `hset_knn_default` | `sfhash_hashset_tlsh_knn`, which picks the index when the file has one   |
 
-The corpus is generated in Rust (`make_corpus` in `src/lib.rs`): a few
-hundred random seed digests, each row a digest-space perturbation of one of
-them. It mirrors `perturb_tlsh_corpus` in `test/tlsh_corpus.cpp`; the C++
-Catch2 bench (`test/bench_tlsh`) uses real hashed content for its seeds.
+`hset_knn` runs for N in {10 000, 100 000, 1 000 000} rows by default. Each
+N builds a TLSH-only hset once (through the builder API, with the TIVF index
+and without the TVEC vectors, which kNN does not need) in a fresh directory
+under the system temp dir, loads it, and answers 20 fixed queries per
+iteration with k = 10, max_distance = 144 and the length included. Before
+timing, the harness asserts that the four strategies return identical
+`(index, distance)` lists for every query. Corpus generation, build and load
+times are printed to stderr and not benchmarked; the files are removed when
+the group finishes.
+
+Throughput is `rows x queries` per iteration, so Criterion's `elem/s` is rows
+scanned per second for the brute-force cases and the equivalent rate for the
+index, which touches only a fraction of the rows.
+
+All kNN groups return matches nearest first, ties by ascending row index,
+exactly as the C API does, so the naive baseline and the hash set calls are
+comparable element for element.
+
+### Corpora
+
+`make_hashed_corpus` in `src/lib.rs` mirrors `make_tlsh_corpus` in
+`test/tlsh_corpus.cpp`: families of real content (random base buffers of
+1 KiB to 64 KiB over full-byte, small-alphabet, text-like and run-length
+alphabets, plus 9 mutated copies each with byte flips over 0.5 to 5 % of the
+bytes, small insertions and deletions and a duplicated or moved block) are
+hashed through `sfhash_create_hasher(SFHASH_TLSH)`. At most 20 000 digests
+are hashed; larger corpora are filled up by digest-space perturbation
+(`perturb_corpus`, as `perturb_tlsh_corpus` in C++). Everything is
+deterministic per seed (SplitMix64, so the digests differ from the C++
+corpus, which uses mt19937_64).
+
+`knn_brute_ffi` keeps using the cheaper purely digest-space corpus
+(`make_corpus`). Queries are corpus rows perturbed once at a 5 % bucket flip
+rate.
+
+## Results
+
+Apple M-series, `cargo bench -- hset_knn --warm-up-time 1 --measurement-time 3`,
+20 queries per iteration, k = 10, max_distance = 144, include_length = true.
+Times are per query (the Criterion iteration time divided by 20).
+
+| rows      | `naive_brute_ffi` | `hset_knn_brute` | `hset_knn_index` | `hset_knn_default` | naive / index | brute / index |
+|-----------|-------------------|------------------|------------------|--------------------|---------------|---------------|
+| 10 000    | 30.3 us           | 7.1 us           | 3.0 us           | 3.0 us             | 10x           | 2.3x          |
+| 100 000   | 302 us            | 58.8 us          | 9.8 us           | 9.9 us             | 31x           | 6.0x          |
+| 1 000 000 | 3.04 ms           | 560 us           | 17.1 us          | 17.0 us            | 178x          | 33x           |
+
+Criterion's own figures for the same run (per iteration of 20 queries) were
+606 us / 141 us / 60.6 us / 60.5 us at 10 000 rows, 6.04 ms / 1.18 ms /
+197 us / 198 us at 100 000 and 60.8 ms / 11.2 ms / 342 us / 341 us at
+1 000 000; the throughput column read 330 Melem/s for the naive scan,
+1.4 to 1.8 Gelem/s for the kernel brute force and 3.3 / 10.2 / 58.4 Gelem/s
+for the index. Building the 1M-row hset (sort, dedup, TIVF index) took 1.45 s
+and the file was 40.6 MiB; generating the corpus took 1.4 s.
+
+The naive baseline is roughly a few nanoseconds per row (an FFI call per
+pair), the kernel brute force a fraction of a nanosecond per row, and the
+index is close to flat in N. For the C++ view of the same comparison,
+including the reference `Tlsh::totalDiff` brute force (not reachable through
+the C API, so not benchmarked here), see `test/bench_tlsh.cpp` and section 5
+of `docs/TLSH_EMBEDDING.md`.
 
 ## Tests
 
@@ -63,3 +134,12 @@ Catch2 bench (`test/bench_tlsh`) uses real hashed content for its seeds.
 `include/hasher/hasher.h`), hex round trips, distances, a hashing vector
 cross-checked against libhasher, and that the heap-based kNN agrees with
 an exhaustive sort.
+
+The hash set tests build a 2000-digest hset with the builder API into a
+temporary directory and check the row count (rows are deduplicated), the
+sorted row order, that `tlsh_knn` with `INDEX`, `BRUTE` and the default give
+the same answer as a pure-Rust brute force over `sfhash_tlsh_diff` for 20
+queries x k in {1, 10} x max_distance in {30, 144, 1000} x both
+`include_length` settings, and that the TVEC matrix has `n x 264` floats
+whose rows equal `sfhash_tlsh_embed` of the corresponding hash. A second
+hset is built with neither optional section to check the fallbacks.

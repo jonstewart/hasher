@@ -1,11 +1,18 @@
 //! Thin wrappers over libhasher's TLSH C API (`include/hasher/tlsh.h`,
-//! `include/hasher/hasher.h`), plus a deterministic synthetic digest
-//! generator and a brute-force kNN used by the Criterion benchmarks.
+//! `include/hasher/hasher.h`) and the hash set API (`include/hasher/hashset.h`:
+//! loading, the TLSH kNN strategies, the embedding vectors and the builder),
+//! plus deterministic synthetic corpora and a brute-force kNN used by the
+//! Criterion benchmarks.
 
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
 use std::ffi::{c_char, c_int, c_void, CStr, CString};
+use std::fmt;
+use std::fs;
 use std::mem::MaybeUninit;
+use std::path::Path;
+use std::ptr;
+use std::slice;
 
 /// `SFHASH_TLSH_DIGEST_LENGTH`
 pub const TLSH_DIGEST_LENGTH: usize = 36;
@@ -13,6 +20,18 @@ pub const TLSH_DIGEST_LENGTH: usize = 36;
 pub const TLSH_HEX_LENGTH: usize = 72;
 /// `SFHASH_TLSH` from `SFHASH_HashAlgorithm`
 pub const SFHASH_TLSH: u32 = 1 << 15;
+/// `SFHASH_TLSH_EMBEDDING_DIMS`
+pub const TLSH_EMBEDDING_DIMS: usize = 264;
+
+/// `SFHASH_TLSH_KNN_BRUTE`: scan every row.
+pub const TLSH_KNN_BRUTE: u32 = 1;
+/// `SFHASH_TLSH_KNN_INDEX`: prune with the TIVF index stored in the file.
+pub const TLSH_KNN_INDEX: u32 = 2;
+
+/// `SFHASH_HSET_TLSH_VECTORS`: write the TVEC embedding matrix.
+pub const HSET_TLSH_VECTORS: u32 = 1;
+/// `SFHASH_HSET_TLSH_INDEX`: write the TIVF kNN index.
+pub const HSET_TLSH_INDEX: u32 = 2;
 
 /// Mirror of `struct SFHASH_HashValues`. Keep in sync with
 /// `include/hasher/hasher.h`; `tests::hash_values_layout` checks the size.
@@ -47,6 +66,32 @@ pub struct RawHasher {
     _private: [u8; 0],
 }
 
+/// Opaque `SFHASH_Hashset`.
+#[repr(C)]
+pub struct RawHashset {
+    _private: [u8; 0],
+}
+
+/// Opaque `SFHASH_HashsetBuildCtx`.
+#[repr(C)]
+pub struct RawBuildCtx {
+    _private: [u8; 0],
+}
+
+/// `struct SFHASH_Error`.
+#[repr(C)]
+pub struct RawError {
+    pub message: *mut c_char,
+}
+
+/// `struct SFHASH_TlshMatch`.
+#[repr(C)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub struct TlshMatch {
+    pub index: u64,
+    pub distance: u32,
+}
+
 pub mod ffi {
     use super::*;
 
@@ -56,10 +101,58 @@ pub mod ffi {
         pub fn sfhash_tlsh_is_null(digest: *const c_void) -> bool;
         pub fn sfhash_tlsh_diff(a: *const c_void, b: *const c_void, include_length: bool) -> c_int;
 
+        pub fn sfhash_tlsh_embed(digest: *const c_void, out: *mut f32);
+
         pub fn sfhash_create_hasher(hash_algs: u32) -> *mut RawHasher;
         pub fn sfhash_update_hasher(hasher: *mut RawHasher, beg: *const c_void, end: *const c_void);
         pub fn sfhash_get_hashes(hasher: *mut RawHasher, out_hashes: *mut HashValues);
+        pub fn sfhash_reset_hasher(hasher: *mut RawHasher);
         pub fn sfhash_destroy_hasher(hasher: *mut RawHasher);
+
+        pub fn sfhash_free_error(err: *mut RawError);
+
+        pub fn sfhash_load_hashset(beg: *const c_void, end: *const c_void, err: *mut *mut RawError) -> *mut RawHashset;
+        pub fn sfhash_destroy_hashset(hset: *mut RawHashset);
+        pub fn sfhash_hashset_index_for_type(hset: *const RawHashset, htype: u32) -> c_int;
+        pub fn sfhash_hashset_count(hset: *const RawHashset, tidx: usize) -> u64;
+        pub fn sfhash_hashset_hash(hset: *const RawHashset, tidx: usize, idx: usize) -> *const c_void;
+        pub fn sfhash_hashset_tlsh_knn(
+            hset: *const RawHashset,
+            tidx: usize,
+            digest: *const c_void,
+            k: usize,
+            max_distance: u32,
+            include_length: bool,
+            out: *mut TlshMatch,
+        ) -> usize;
+        pub fn sfhash_hashset_tlsh_knn_with(
+            hset: *const RawHashset,
+            tidx: usize,
+            digest: *const c_void,
+            k: usize,
+            max_distance: u32,
+            include_length: bool,
+            strategy: u32,
+            out: *mut TlshMatch,
+        ) -> usize;
+        pub fn sfhash_hashset_tlsh_knn_strategies(hset: *const RawHashset, tidx: usize) -> u32;
+        pub fn sfhash_hashset_tlsh_vectors(hset: *const RawHashset, tidx: usize, dims: *mut usize) -> *const f32;
+
+        pub fn sfhash_hashset_builder_open(
+            hashset_name: *const c_char,
+            hashset_desc: *const c_char,
+            record_order: *const u32,
+            record_order_length: usize,
+            write_records: bool,
+            write_hashsets: bool,
+            output_file: *const c_char,
+            temp_dir: *const c_char,
+            err: *mut *mut RawError,
+        ) -> *mut RawBuildCtx;
+        pub fn sfhash_hashset_builder_set_tlsh_options(bctx: *mut RawBuildCtx, options: u32);
+        pub fn sfhash_hashset_builder_add_hash(bctx: *mut RawBuildCtx, hash: *const c_void, length: usize);
+        pub fn sfhash_hashset_builder_write(bctx: *mut RawBuildCtx, err: *mut *mut RawError) -> u64;
+        pub fn sfhash_hashset_builder_destroy(bctx: *mut RawBuildCtx);
     }
 }
 
@@ -106,6 +199,13 @@ impl TlshDigest {
     #[inline]
     pub fn diff(&self, other: &TlshDigest, include_length: bool) -> i32 {
         unsafe { ffi::sfhash_tlsh_diff(self.0.as_ptr().cast(), other.0.as_ptr().cast(), include_length) }
+    }
+
+    /// `sfhash_tlsh_embed`: the lower-bound Euclidean embedding.
+    pub fn embed(&self) -> [f32; TLSH_EMBEDDING_DIMS] {
+        let mut out = [0f32; TLSH_EMBEDDING_DIMS];
+        unsafe { ffi::sfhash_tlsh_embed(self.0.as_ptr().cast(), out.as_mut_ptr()) };
+        out
     }
 
     pub fn l(&self) -> u8 {
@@ -171,6 +271,18 @@ impl TlshHasher {
             ffi::sfhash_get_hashes(self.raw, hv.as_mut_ptr());
             TlshDigest(hv.assume_init().tlsh)
         }
+    }
+
+    /// Forgets everything fed so far.
+    pub fn reset(&mut self) {
+        unsafe { ffi::sfhash_reset_hasher(self.raw) }
+    }
+
+    /// Resets, hashes `data`, and returns its digest.
+    pub fn hash(&mut self, data: &[u8]) -> TlshDigest {
+        self.reset();
+        self.update(data);
+        self.digest()
     }
 }
 
@@ -361,6 +473,523 @@ pub fn knn_sorted(corpus: &[TlshDigest], query: &TlshDigest, k: usize) -> Vec<(i
     all.into_iter().take(k).map(|r| r.0).collect()
 }
 
+/// An error reported by libhasher through `SFHASH_Error`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HashsetError(pub String);
+
+impl fmt::Display for HashsetError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for HashsetError {}
+
+impl From<std::io::Error> for HashsetError {
+    fn from(e: std::io::Error) -> Self {
+        HashsetError(e.to_string())
+    }
+}
+
+/// Converts and frees a `SFHASH_Error*` set by a C call (null means no error).
+fn take_error(err: *mut RawError, fallback: &str) -> HashsetError {
+    if err.is_null() {
+        return HashsetError(fallback.to_owned());
+    }
+    let msg = unsafe {
+        let m = (*err).message;
+        let s = if m.is_null() {
+            fallback.to_owned()
+        } else {
+            CStr::from_ptr(m).to_string_lossy().into_owned()
+        };
+        ffi::sfhash_free_error(err);
+        s
+    };
+    HashsetError(msg)
+}
+
+fn c_string(s: &str, what: &str) -> Result<CString, HashsetError> {
+    CString::new(s).map_err(|_| HashsetError(format!("{what} contains a NUL byte")))
+}
+
+fn path_c_string(p: &Path, what: &str) -> Result<CString, HashsetError> {
+    let s = p
+        .to_str()
+        .ok_or_else(|| HashsetError(format!("{what} is not valid UTF-8")))?;
+    c_string(s, what)
+}
+
+/// A loaded hash set (`SFHASH_Hashset`). Owns the file bytes, which libhasher
+/// reads in place, for as long as the handle lives.
+pub struct Hashset {
+    raw: *mut RawHashset,
+    // 8-byte aligned so that the float32 TVEC matrix (page aligned in the
+    // file) stays at least 8-byte aligned in memory; `len` is the byte count.
+    _bytes: Vec<u64>,
+    len: usize,
+}
+
+// The handle is only read after construction; the file bytes are immutable.
+unsafe impl Send for Hashset {}
+unsafe impl Sync for Hashset {}
+
+impl Hashset {
+    /// Reads an hset file and loads it.
+    pub fn open(path: impl AsRef<Path>) -> Result<Hashset, HashsetError> {
+        let data = fs::read(path.as_ref())?;
+        Hashset::from_bytes(&data)
+    }
+
+    /// Loads an hset from its bytes (copied into an aligned buffer).
+    pub fn from_bytes(data: &[u8]) -> Result<Hashset, HashsetError> {
+        let len = data.len();
+        let mut words = vec![0u64; len.div_ceil(8)];
+        let bytes: &mut [u8] =
+            unsafe { slice::from_raw_parts_mut(words.as_mut_ptr().cast(), words.len() * 8) };
+        bytes[..len].copy_from_slice(data);
+
+        let beg = words.as_ptr().cast::<u8>();
+        let mut err: *mut RawError = ptr::null_mut();
+        let raw = unsafe { ffi::sfhash_load_hashset(beg.cast(), beg.add(len).cast(), &mut err) };
+        if raw.is_null() {
+            return Err(take_error(err, "sfhash_load_hashset failed"));
+        }
+        debug_assert!(err.is_null());
+        Ok(Hashset { raw, _bytes: words, len })
+    }
+
+    /// The size of the hset file in bytes.
+    pub fn file_len(&self) -> usize {
+        self.len
+    }
+
+    /// `sfhash_hashset_index_for_type`: the hash set index for a hash type.
+    pub fn index_for_type(&self, htype: u32) -> Option<usize> {
+        let i = unsafe { ffi::sfhash_hashset_index_for_type(self.raw, htype) };
+        usize::try_from(i).ok()
+    }
+
+    /// The index of the TLSH hash set, if there is one.
+    pub fn tlsh_index(&self) -> Option<usize> {
+        self.index_for_type(SFHASH_TLSH)
+    }
+
+    /// `sfhash_hashset_count`: rows in hash set `tidx`.
+    pub fn count(&self, tidx: usize) -> u64 {
+        unsafe { ffi::sfhash_hashset_count(self.raw, tidx) }
+    }
+
+    /// `sfhash_hashset_hash`: the idx-th (bytewise sorted) TLSH row.
+    pub fn hash(&self, tidx: usize, idx: usize) -> TlshDigest {
+        assert!((idx as u64) < self.count(tidx), "row {idx} out of range");
+        let p = unsafe { ffi::sfhash_hashset_hash(self.raw, tidx, idx) };
+        assert!(!p.is_null());
+        let mut d = TlshDigest::NULL;
+        unsafe { ptr::copy_nonoverlapping(p.cast::<u8>(), d.0.as_mut_ptr(), TLSH_DIGEST_LENGTH) };
+        d
+    }
+
+    /// All TLSH rows of hash set `tidx`, in file order.
+    pub fn tlsh_rows(&self, tidx: usize) -> Vec<TlshDigest> {
+        let n = self.count(tidx) as usize;
+        (0..n).map(|i| self.hash(tidx, i)).collect()
+    }
+
+    /// `sfhash_hashset_tlsh_knn_strategies`: OR of `TLSH_KNN_*`.
+    pub fn tlsh_knn_strategies(&self, tidx: usize) -> u32 {
+        unsafe { ffi::sfhash_hashset_tlsh_knn_strategies(self.raw, tidx) }
+    }
+
+    /// k nearest neighbours within `max_distance`, written to `out` (resized
+    /// to the number found), nearest first, ties by ascending index.
+    /// `strategy` is `TLSH_KNN_BRUTE`, `TLSH_KNN_INDEX`, or `None` for
+    /// `sfhash_hashset_tlsh_knn` (the index when the file has one).
+    #[allow(clippy::too_many_arguments)]
+    pub fn tlsh_knn_into(
+        &self,
+        tidx: usize,
+        digest: &TlshDigest,
+        k: usize,
+        max_distance: u32,
+        include_length: bool,
+        strategy: Option<u32>,
+        out: &mut Vec<TlshMatch>,
+    ) -> usize {
+        out.clear();
+        out.resize(k, TlshMatch::default());
+        let n = unsafe {
+            match strategy {
+                None => ffi::sfhash_hashset_tlsh_knn(
+                    self.raw,
+                    tidx,
+                    digest.0.as_ptr().cast(),
+                    k,
+                    max_distance,
+                    include_length,
+                    out.as_mut_ptr(),
+                ),
+                Some(s) => ffi::sfhash_hashset_tlsh_knn_with(
+                    self.raw,
+                    tidx,
+                    digest.0.as_ptr().cast(),
+                    k,
+                    max_distance,
+                    include_length,
+                    s,
+                    out.as_mut_ptr(),
+                ),
+            }
+        };
+        assert!(n <= k, "kNN wrote {n} matches for k={k}");
+        out.truncate(n);
+        n
+    }
+
+    /// `tlsh_knn_into` as `(index, distance)` pairs.
+    pub fn tlsh_knn(
+        &self,
+        tidx: usize,
+        digest: &TlshDigest,
+        k: usize,
+        max_distance: u32,
+        include_length: bool,
+        strategy: Option<u32>,
+    ) -> Vec<(u64, u32)> {
+        let mut out = Vec::with_capacity(k);
+        self.tlsh_knn_into(tidx, digest, k, max_distance, include_length, strategy, &mut out);
+        out.iter().map(|m| (m.index, m.distance)).collect()
+    }
+
+    /// `sfhash_hashset_tlsh_vectors`: the n x 264 row-major float32
+    /// embedding matrix, or `None` when the file has no TVEC section.
+    pub fn tlsh_vectors(&self, tidx: usize) -> Option<&[f32]> {
+        let mut dims = 0usize;
+        let p = unsafe { ffi::sfhash_hashset_tlsh_vectors(self.raw, tidx, &mut dims) };
+        if p.is_null() {
+            return None;
+        }
+        assert_eq!(dims, TLSH_EMBEDDING_DIMS);
+        let n = self.count(tidx) as usize;
+        Some(unsafe { slice::from_raw_parts(p, n * dims) })
+    }
+}
+
+impl Drop for Hashset {
+    fn drop(&mut self) {
+        unsafe { ffi::sfhash_destroy_hashset(self.raw) }
+    }
+}
+
+/// Writes a TLSH-only hset (record order `[SFHASH_TLSH]`, hash sets only, no
+/// records) of `digests` to `path` through the builder API, with the
+/// optional sections selected by `options` (OR of `HSET_TLSH_*`). Null
+/// digests are skipped; rows are sorted and deduplicated by the writer. The
+/// builder's temporary files go in the output file's directory. Returns the
+/// size of the file written.
+pub fn build_tlsh_hset(
+    path: impl AsRef<Path>,
+    digests: &[TlshDigest],
+    options: u32,
+) -> Result<u64, HashsetError> {
+    let path = path.as_ref();
+    let temp_dir = match path.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p.to_path_buf(),
+        _ => Path::new(".").to_path_buf(),
+    };
+
+    let name = c_string("tlsh-bench", "name")?;
+    let desc = c_string("synthetic TLSH corpus", "description")?;
+    let out_c = path_c_string(path, "output path")?;
+    let tmp_c = path_c_string(&temp_dir, "temp dir")?;
+    let order = [SFHASH_TLSH];
+
+    let mut err: *mut RawError = ptr::null_mut();
+    let bctx = unsafe {
+        ffi::sfhash_hashset_builder_open(
+            name.as_ptr(),
+            desc.as_ptr(),
+            order.as_ptr(),
+            order.len(),
+            false,
+            true,
+            out_c.as_ptr(),
+            tmp_c.as_ptr(),
+            &mut err,
+        )
+    };
+    if bctx.is_null() {
+        return Err(take_error(err, "sfhash_hashset_builder_open failed"));
+    }
+
+    struct Guard(*mut RawBuildCtx);
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            unsafe { ffi::sfhash_hashset_builder_destroy(self.0) }
+        }
+    }
+    let guard = Guard(bctx);
+
+    unsafe {
+        ffi::sfhash_hashset_builder_set_tlsh_options(bctx, options);
+        for d in digests {
+            if !d.is_null() {
+                ffi::sfhash_hashset_builder_add_hash(bctx, d.0.as_ptr().cast(), TLSH_DIGEST_LENGTH);
+            }
+        }
+    }
+
+    let mut err: *mut RawError = ptr::null_mut();
+    let written = unsafe { ffi::sfhash_hashset_builder_write(bctx, &mut err) };
+    drop(guard);
+    if !err.is_null() {
+        return Err(take_error(err, "sfhash_hashset_builder_write failed"));
+    }
+    Ok(written)
+}
+
+/// Brute-force kNN with the hash set API's contract: rows with
+/// `diff <= max_distance`, nearest first, ties by ascending index, at most
+/// k, as `(index, distance)`. Null rows (diff -1) never match.
+pub fn knn_brute_with(
+    corpus: &[TlshDigest],
+    query: &TlshDigest,
+    k: usize,
+    max_distance: u32,
+    include_length: bool,
+) -> Vec<(u64, u32)> {
+    if k == 0 {
+        return Vec::new();
+    }
+    let mut heap: BinaryHeap<(u32, u64)> = BinaryHeap::with_capacity(k + 1);
+    for (i, d) in corpus.iter().enumerate() {
+        let dist = query.diff(d, include_length);
+        if dist < 0 || dist as u32 > max_distance {
+            continue;
+        }
+        let dist = dist as u32;
+        if heap.len() < k {
+            heap.push((dist, i as u64));
+        } else if dist < heap.peek().map(|t| t.0).unwrap_or(u32::MAX) {
+            heap.pop();
+            heap.push((dist, i as u64));
+        }
+    }
+    heap.into_sorted_vec().into_iter().map(|(d, i)| (i, d)).collect()
+}
+
+/******************************************************************************
+ Family corpus: hashed content, like test/tlsh_corpus.cpp
+******************************************************************************/
+
+/// A base digest and the digests of mutated copies of the same content.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TlshFamily {
+    pub base: TlshDigest,
+    pub variants: Vec<TlshDigest>,
+}
+
+impl SplitMix64 {
+    /// log-uniform in [lo, hi], like file sizes
+    pub fn log_uniform(&mut self, lo: usize, hi: usize) -> usize {
+        if hi <= lo {
+            return lo;
+        }
+        let l = (lo as f64).ln();
+        let h = (hi as f64).ln();
+        let v = (l + self.unit() * (h - l)).exp() as usize;
+        v.clamp(lo, hi)
+    }
+}
+
+#[derive(Clone, Debug)]
+enum Alphabet {
+    /// uniform bytes
+    Full,
+    /// 4-24 distinct byte values
+    Small(Vec<u8>),
+    /// words of skewed lowercase letters, whitespace, punctuation
+    Text,
+    /// run-length structured binary
+    Runs,
+}
+
+// letters weighted roughly by English frequency
+const TEXT_LETTERS: &[u8] =
+    b"eeeeeeettttttaaaaaaooooooiiiiiinnnnnnsssssshhhhhhrrrrrrdddduuullllccmmwwffggyyppbbvkjxqz";
+
+fn pick_alphabet(rng: &mut SplitMix64) -> Alphabet {
+    match rng.below(4) {
+        0 => Alphabet::Full,
+        1 => {
+            let n = rng.between(4, 24) as usize;
+            let mut symbols: Vec<u8> = Vec::with_capacity(n);
+            while symbols.len() < n {
+                let b = rng.below(256) as u8;
+                if !symbols.contains(&b) {
+                    symbols.push(b);
+                }
+            }
+            Alphabet::Small(symbols)
+        }
+        2 => Alphabet::Text,
+        _ => Alphabet::Runs,
+    }
+}
+
+fn random_symbol(rng: &mut SplitMix64, a: &Alphabet) -> u8 {
+    match a {
+        Alphabet::Small(s) => s[rng.below(s.len() as u64) as usize],
+        Alphabet::Text => TEXT_LETTERS[rng.below(TEXT_LETTERS.len() as u64) as usize],
+        _ => rng.below(256) as u8,
+    }
+}
+
+fn make_content(rng: &mut SplitMix64, a: &Alphabet, len: usize) -> Vec<u8> {
+    let mut v: Vec<u8> = Vec::with_capacity(len + 64);
+    match a {
+        Alphabet::Full => {
+            while v.len() < len {
+                v.extend_from_slice(&rng.next_u64().to_le_bytes());
+            }
+        }
+        Alphabet::Small(_) => {
+            while v.len() < len {
+                v.push(random_symbol(rng, a));
+            }
+        }
+        Alphabet::Text => {
+            while v.len() < len {
+                let wlen = rng.between(1, 11);
+                for _ in 0..wlen {
+                    v.push(random_symbol(rng, a));
+                }
+                match rng.below(16) {
+                    0 => v.extend_from_slice(b".\n"),
+                    1 => v.extend_from_slice(b", "),
+                    _ => v.push(b' '),
+                }
+            }
+        }
+        Alphabet::Runs => {
+            while v.len() < len {
+                let rlen = rng.between(1, 16) as usize;
+                let b = rng.below(256) as u8;
+                v.extend(std::iter::repeat_n(b, rlen));
+            }
+        }
+    }
+    v.truncate(len);
+    v
+}
+
+/// Byte flips over 0.5-5% of the content, a few small insertions and
+/// deletions, and sometimes a duplicated or moved block.
+fn mutate(rng: &mut SplitMix64, base: &[u8], a: &Alphabet) -> Vec<u8> {
+    let mut v = base.to_vec();
+
+    let rate = 0.005 + rng.unit() * 0.045;
+    let flips = ((rate * v.len() as f64) as usize).max(1);
+    for _ in 0..flips {
+        let i = rng.below(v.len() as u64) as usize;
+        v[i] = random_symbol(rng, a);
+    }
+
+    let edits = rng.below(5);
+    for _ in 0..edits {
+        let pos = rng.below(v.len() as u64 + 1) as usize;
+        let n = rng.between(1, 64) as usize;
+        if rng.chance(0.5) {
+            let ins: Vec<u8> = (0..n).map(|_| random_symbol(rng, a)).collect();
+            v.splice(pos..pos, ins);
+        } else if pos + n <= v.len() && v.len() - n >= 64 {
+            v.drain(pos..pos + n);
+        }
+    }
+
+    if v.len() >= 16 && rng.chance(0.3) {
+        let n = rng.between(1, (v.len() / 8).max(1) as u64) as usize;
+        let src = rng.below((v.len() - n + 1) as u64) as usize;
+        let block: Vec<u8> = v[src..src + n].to_vec();
+        if rng.chance(0.5) {
+            v.drain(src..src + n); // move rather than copy
+        }
+        let dst = rng.below(v.len() as u64 + 1) as usize;
+        v.splice(dst..dst, block);
+    }
+
+    v
+}
+
+/// For each family: random base content of a log-uniform length in
+/// `[min_len, max_len]` over a per-family alphabet (full 256, a small
+/// alphabet, text-like words, run-length binary), then `variants_per_family`
+/// mutated copies, all hashed with libhasher's TLSH hasher. Null digests are
+/// skipped and families with a null base dropped. Deterministic per seed.
+pub fn make_families(
+    seed: u64,
+    families: usize,
+    variants_per_family: usize,
+    min_len: usize,
+    max_len: usize,
+) -> Vec<TlshFamily> {
+    let mut rng = SplitMix64::new(seed);
+    let mut hasher = TlshHasher::new();
+    let mut out = Vec::with_capacity(families);
+
+    for _ in 0..families {
+        let a = pick_alphabet(&mut rng);
+        let len = rng.log_uniform(min_len, max_len);
+        let base = make_content(&mut rng, &a, len);
+
+        let base_digest = hasher.hash(&base);
+        if base_digest.is_null() {
+            continue;
+        }
+
+        let mut variants = Vec::with_capacity(variants_per_family);
+        for _ in 0..variants_per_family {
+            let d = hasher.hash(&mutate(&mut rng, &base, &a));
+            if !d.is_null() {
+                variants.push(d);
+            }
+        }
+        out.push(TlshFamily { base: base_digest, variants });
+    }
+    out
+}
+
+/// `make_families` with the C++ defaults (1 KiB - 64 KiB), flattened: base
+/// then variants, family by family.
+pub fn make_family_corpus(seed: u64, families: usize, variants_per_family: usize) -> Vec<TlshDigest> {
+    let mut out = Vec::with_capacity(families * (variants_per_family + 1));
+    for fam in make_families(seed, families, variants_per_family, 1024, 65536) {
+        out.push(fam.base);
+        out.extend(fam.variants);
+    }
+    out
+}
+
+/// The counterpart of `make_tlsh_corpus` in `test/tlsh_corpus.cpp`: a family
+/// corpus of ~min(n, 20000) hashed digests (families of 10), perturbed in
+/// digest space up to exactly `n` digests.
+pub fn make_hashed_corpus(seed: u64, n: usize) -> Vec<TlshDigest> {
+    const VARIANTS_PER_FAMILY: usize = 9;
+    const MAX_HASHED: usize = 20_000;
+
+    let hashed = n.min(MAX_HASHED);
+    let families = hashed.div_ceil(VARIANTS_PER_FAMILY + 1);
+
+    let mut corpus = make_family_corpus(seed, families, VARIANTS_PER_FAMILY);
+    if corpus.len() > n {
+        corpus.truncate(n);
+    } else if corpus.len() < n {
+        let extra = perturb_corpus(seed ^ 0x9E37_79B9_7F4A_7C15, &corpus, n - corpus.len(), 0.05);
+        corpus.extend(extra);
+    }
+    corpus
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -473,5 +1102,183 @@ mod tests {
             assert!(fast.windows(2).all(|w| w[0] <= w[1]));
         }
         assert_eq!(knn_brute(&corpus[..3], &corpus[0], 10).len(), 3);
+    }
+
+    /// A fresh directory under the system temp dir, removed on drop.
+    struct TempDir(std::path::PathBuf);
+
+    impl TempDir {
+        fn new(tag: &str) -> TempDir {
+            let nanos = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0);
+            let p = std::env::temp_dir().join(format!("tlsh-bench-{tag}-{}-{nanos}", std::process::id()));
+            fs::create_dir_all(&p).unwrap();
+            TempDir(p)
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn unique_sorted(v: &[TlshDigest]) -> Vec<TlshDigest> {
+        let mut u: Vec<TlshDigest> = v.iter().copied().filter(|d| !d.is_null()).collect();
+        u.sort_unstable();
+        u.dedup();
+        u
+    }
+
+    #[test]
+    fn hset_build_load_knn_vectors() {
+        let corpus = make_corpus(21, 2000);
+        let expected = unique_sorted(&corpus);
+
+        let dir = TempDir::new("test");
+        let path = dir.0.join("corpus.hset");
+        let written = build_tlsh_hset(&path, &corpus, HSET_TLSH_VECTORS | HSET_TLSH_INDEX).unwrap();
+        assert_eq!(written, fs::metadata(&path).unwrap().len());
+
+        let hset = Hashset::open(&path).unwrap();
+        assert_eq!(hset.file_len() as u64, written);
+        let tidx = hset.tlsh_index().expect("TLSH hash set");
+        assert_eq!(hset.index_for_type(1), None); // no MD5
+
+        // count and sorted, deduplicated rows
+        assert_eq!(hset.count(tidx), expected.len() as u64);
+        let rows = hset.tlsh_rows(tidx);
+        assert_eq!(rows, expected);
+        assert!(rows.windows(2).all(|w| w[0] < w[1]));
+
+        // both strategies are available and agree with a pure-Rust brute force
+        assert_eq!(hset.tlsh_knn_strategies(tidx), TLSH_KNN_BRUTE | TLSH_KNN_INDEX);
+        let mut rng = SplitMix64::new(22);
+        for _ in 0..20 {
+            let pick = &corpus[rng.below(corpus.len() as u64) as usize];
+            let q = perturb(&mut rng, pick, 0.05);
+            for k in [1usize, 10] {
+                for maxd in [30u32, 144, 1000] {
+                    for incl in [true, false] {
+                        let want = knn_brute_with(&rows, &q, k, maxd, incl);
+                        let brute = hset.tlsh_knn(tidx, &q, k, maxd, incl, Some(TLSH_KNN_BRUTE));
+                        let index = hset.tlsh_knn(tidx, &q, k, maxd, incl, Some(TLSH_KNN_INDEX));
+                        let dflt = hset.tlsh_knn(tidx, &q, k, maxd, incl, None);
+                        assert_eq!(brute, want, "brute k={k} maxd={maxd} incl={incl}");
+                        assert_eq!(index, want, "index k={k} maxd={maxd} incl={incl}");
+                        assert_eq!(dflt, want, "default k={k} maxd={maxd} incl={incl}");
+                        assert!(want.len() <= k);
+                        assert!(want.iter().all(|&(_, d)| d <= maxd));
+                    }
+                }
+            }
+        }
+
+        // an exact row is its own nearest neighbour at distance 0
+        let hits = hset.tlsh_knn(tidx, &rows[17], 1, 0, true, None);
+        assert_eq!(hits, vec![(17, 0)]);
+        assert!(hset.tlsh_knn(tidx, &TlshDigest::NULL, 10, 1000, true, None).is_empty());
+        assert!(hset.tlsh_knn(tidx, &rows[0], 10, 1000, true, Some(TLSH_KNN_BRUTE | TLSH_KNN_INDEX)).is_empty());
+
+        // vectors: n x 264, row r is the embedding of row r
+        let vec = hset.tlsh_vectors(tidx).expect("TVEC section");
+        assert_eq!(vec.len(), rows.len() * TLSH_EMBEDDING_DIMS);
+        assert_eq!(&vec[..TLSH_EMBEDDING_DIMS], &rows[0].embed()[..]);
+        let last = rows.len() - 1;
+        assert_eq!(&vec[last * TLSH_EMBEDDING_DIMS..], &rows[last].embed()[..]);
+    }
+
+    #[test]
+    fn hset_without_optional_sections() {
+        let corpus = make_corpus(23, 500);
+        let dir = TempDir::new("plain");
+        let path = dir.0.join("plain.hset");
+        build_tlsh_hset(&path, &corpus, 0).unwrap();
+
+        let hset = Hashset::open(&path).unwrap();
+        let tidx = hset.tlsh_index().unwrap();
+        assert_eq!(hset.count(tidx), unique_sorted(&corpus).len() as u64);
+        assert_eq!(hset.tlsh_knn_strategies(tidx), TLSH_KNN_BRUTE);
+        assert!(hset.tlsh_vectors(tidx).is_none());
+
+        let rows = hset.tlsh_rows(tidx);
+        let q = perturb(&mut SplitMix64::new(1), &corpus[3], 0.05);
+        let want = knn_brute_with(&rows, &q, 10, 144, true);
+        assert_eq!(hset.tlsh_knn(tidx, &q, 10, 144, true, None), want);
+        assert_eq!(hset.tlsh_knn(tidx, &q, 10, 144, true, Some(TLSH_KNN_BRUTE)), want);
+        // the index is not available
+        assert!(hset.tlsh_knn(tidx, &q, 10, 144, true, Some(TLSH_KNN_INDEX)).is_empty());
+    }
+
+    #[test]
+    fn hset_errors() {
+        assert!(Hashset::from_bytes(b"not an hset file at all").is_err());
+        assert!(Hashset::open("/nonexistent/dir/x.hset").is_err());
+        let r = build_tlsh_hset("/nonexistent/dir/x.hset", &make_corpus(1, 10), 0);
+        assert!(r.is_err());
+    }
+
+    #[test]
+    fn families_are_deterministic_and_clustered() {
+        let fams = make_families(31, 8, 4, 1024, 8192);
+        assert_eq!(fams, make_families(31, 8, 4, 1024, 8192));
+        assert_ne!(fams, make_families(32, 8, 4, 1024, 8192));
+        assert!(!fams.is_empty());
+
+        let mut within = Vec::new();
+        let mut between = Vec::new();
+        for (i, f) in fams.iter().enumerate() {
+            assert!(!f.base.is_null());
+            assert!(f.variants.iter().all(|v| !v.is_null()));
+            for v in &f.variants {
+                within.push(f.base.diff(v, true));
+            }
+            for g in fams.iter().skip(i + 1) {
+                between.push(f.base.diff(&g.base, true));
+            }
+        }
+        // variants of one content are far closer than unrelated content
+        let mean = |v: &[i32]| v.iter().map(|&x| x as f64).sum::<f64>() / v.len() as f64;
+        assert!(!within.is_empty() && !between.is_empty());
+        assert!(mean(&within) < mean(&between) / 2.0, "within {within:?} between {between:?}");
+
+        let flat = make_family_corpus(31, 3, 2);
+        assert!(flat.len() <= 9 && flat.len() >= 3);
+
+        let c = make_hashed_corpus(33, 250);
+        assert_eq!(c.len(), 250);
+        assert_eq!(c, make_hashed_corpus(33, 250));
+        assert!(c.iter().all(|d| !d.is_null()));
+        let small = make_hashed_corpus(33, 25);
+        assert_eq!(small.len(), 25);
+    }
+
+    #[test]
+    fn knn_brute_with_contract() {
+        let corpus = make_corpus(41, 1000);
+        let q = perturb(&mut SplitMix64::new(42), &corpus[5], 0.05);
+
+        let all = knn_brute_with(&corpus, &q, 1000, u32::MAX, true);
+        let mut by_sort: Vec<(u32, u64)> = corpus
+            .iter()
+            .enumerate()
+            .map(|(i, d)| (q.diff(d, true) as u32, i as u64))
+            .collect();
+        by_sort.sort_unstable();
+        assert_eq!(all, by_sort.into_iter().map(|(d, i)| (i, d)).collect::<Vec<_>>());
+
+        let top = knn_brute_with(&corpus, &q, 10, u32::MAX, true);
+        assert_eq!(top, all[..10].to_vec());
+        let near = knn_brute_with(&corpus, &q, 1000, 50, true);
+        assert!(near.iter().all(|&(_, d)| d <= 50));
+        assert_eq!(near.len(), all.iter().filter(|&&(_, d)| d <= 50).count());
+        assert!(knn_brute_with(&corpus, &q, 0, 1000, true).is_empty());
+        assert!(knn_brute_with(&[TlshDigest::NULL], &q, 5, 1000, true).is_empty());
+
+        // the old (unfiltered, include_length) kNN agrees
+        let legacy: Vec<(u64, u32)> = knn_brute(&corpus, &q, 10).into_iter().map(|(d, i)| (i as u64, d as u32)).collect();
+        assert_eq!(legacy, top);
     }
 }
