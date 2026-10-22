@@ -100,21 +100,74 @@ and `docs/TLSH_EMBEDDING.md`.
 
 ## Open issues
 
-- **Rebuild cost is superlinear in cell size.** Per cell with m rows and
-  k = m/T lists, k-means++ seeding, Lloyd iterations over a sample that grows
-  with k, and the final assignment are each O(m · k · d) = O(m² · d / T),
-  d = 256; summed over cells the build is Σ m_c², dominated by the largest
-  cells, and a single large cell is handled by one thread. Observed at
-  T = 32: 1.45 s at 1M rows, 3.3 s at 1.43M, 24.5 s at 4.0M. Candidate
-  mitigations, in order: two-level (√k) or bisecting k-means inside large
-  cells (O(m^1.5) or O(m log k)); a sample cap independent of k for the Lloyd
-  iterations; int8/NEON or random-projected (JL, 32-dim) distances for the
-  assignment, with exact medoid radii computed afterwards in full space;
-  within-cell parallelism for the assignment pass; lazy per-cell rebuilds
-  (recluster only cells whose list count exceeds 1.5x ⌈m/T⌉ after merges).
+- **Rebuild cost is superlinear in cell size.** See "Rebuild scaling" below.
 - **Daily-scale incremental merges** (batch ≈ 40% of master) degrade pruning
   to ~1.9x rows scanned; rebuild when rows scanned matter.
 - **x86 kernel path untested** (scalar fallback; NEON only on arm64).
 - **Full-embedding L caveat**: the 264-dim embedding's bound holds for
   diff ≤ 144 and ignores L wraparound at multi-terabyte inputs; the index is
   unaffected (L is constant within a cell).
+
+## Rebuild scaling: analysis and plan
+
+**Complexity.** The index build runs an independent k-means per header cell.
+For a cell of m rows and k = m/T lists, three phases each cost O(m · k · d)
+with d = 256 float dimensions: k-means++ seeding, the Lloyd iterations (up to
+10, over a sample of 32k rows, so O(k² · d) per iteration), and the final
+assignment of all m rows to the nearest of k centroids. A cell therefore costs
+Θ(m² · d / T) and the build Θ(d / T · Σ_c m_c²): dominated by the largest
+cells, not by n. Evenly spread rows give n²/C over C cells; a real corpus,
+concentrated in a few dozen L values, sits nearer n². Parallelism is per cell,
+so one giant cell occupies one thread and bounds the wall time regardless of
+core count.
+
+**Observed** (T = 32, 15 threads, synthetic corpus): 1.45 s at 1.0M rows,
+3.3 s at 1.43M, 24.5 s at 4.0M (2.8x the rows, 7.4x the time; quadratic
+predicts 7.9x). T = 16: 48 s at 4.0M; T = 64: 8.5 s. Extrapolated to 100M rows
+with the same cell occupancy: hours.
+
+**Correctness principle.** The index is exact because, and only because, every
+member of a list lies within the list's stored `radius2` of its medoid, and
+both are computed exactly with the integer kernel over the full planes after
+the partition is chosen. How rows are partitioned into lists is a quality knob
+(rows scanned per query, hence time), never a correctness knob. Every
+mitigation below changes only the partition; `test/test_tlsh_ivf.cpp`,
+`test/test_hset_tlsh_vectors.cpp` and `test/test_hset_merge*.cpp` assert
+kNN == brute force for whatever partition the builder produces, and
+`test/bench_hset_merge.cpp` / `test/bench_tlsh.cpp` measure the quality side.
+
+**Mitigations (planned, not implemented), in order:**
+
+1. *Hierarchical or bisecting k-means inside large cells.* Two levels of √k
+   clusters give O(m^1.5 · d); bisecting k-means gives O(m · log k · d). No
+   effect on results.
+2. *Cap the Lloyd sample independently of k.* Today the iterations run over a
+   random subset of up to max(32k, 2048) rows of the cell, followed by one
+   exact nearest-centroid assignment of all rows; a fixed cap (e.g. 4096)
+   makes the iterations linear in m. Centroids, partition and index bytes
+   change slightly; kNN results do not; the build stays deterministic per
+   seed. Also parallelize the final assignment pass within a cell so a giant
+   cell no longer serializes on one thread.
+3. *Cheaper distances for the assignment only.* Body coordinates are in
+   {-1, 0, 1}, so the dot product with an int8-quantized centroid is NEON byte
+   arithmetic (~8–16x fewer cycles than 256 float ops); alternatively assign
+   in a seeded 32-dim random projection (Johnson–Lindenstrauss). Medoid and
+   radius are then computed exactly in full space, so kNN results are
+   unchanged; only boundary assignments move. Side benefit: an integer
+   assignment path makes the index bytes reproducible across compilers and
+   platforms, which the float path is not (accumulation order).
+4. *Lazy per-cell rebuilds* (recluster only cells whose list count exceeds
+   1.5x ⌈m/T⌉ after merges) as an additional operation. Decision (Jon,
+   2026-10-22): the full rebuild (`build_tlsh_ivf`) must always remain
+   available; lazy rebuilds supplement it, they never replace it.
+5. *Locality-order partition for huge cells*: sort the cell's rows by a
+   locality-preserving key on the body planes (Gray-code / plane-prefix
+   order), cut into runs of T, compute medoid and radius exactly. O(m log m),
+   trivially parallel, no floating point (bit-reproducible everywhere), but
+   lower quality than k-means (coherent in the leading planes only), which
+   coalescing and the rows-scanned statistic expose. Usable as the initial
+   partition that (1) refines, or as a fallback. To be evaluated once real
+   data is available.
+
+Items 1–3 together are expected to bring the 4M build from 24.5 s to the low
+seconds and 100M rows to minutes rather than hours.
