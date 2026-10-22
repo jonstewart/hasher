@@ -84,6 +84,9 @@ TEST_CASE("tlsh_ivf_build_invariants") {
       CHECK(tlsh_embed_body_dist2(med, rows[ivf.ids[i]]) <= ivf.radius2[c]);
       medoid_is_member |= rows[ivf.ids[i]] == med;
     }
+    // build_tlsh_ivf picks a member as the medoid; the format does not
+    // require it (an index carried through merge_tlsh_ivf may have dropped
+    // its medoid row), so this holds for fresh indexes only
     CHECK(medoid_is_member);
   }
 }
