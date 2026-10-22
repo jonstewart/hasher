@@ -129,7 +129,7 @@ src_mkhashset_mkhashset_LDADD = $(HASHER_LIB) $(PROJECT_LIBS)
 
 bin_PROGRAMS = src/fuzzy/fuzzy src/hasher/hasher src/mkhashset/mkhashset
 
-check_PROGRAMS = test/test test/bench_hex test/bench_hsd
+check_PROGRAMS = test/test test/bench_hex test/bench_hsd test/bench_tlsh
 
 TESTS = \
 	test/test \
@@ -155,7 +155,9 @@ test_test_SOURCES = \
 	test/test_record_iterator.cpp \
 	test/test_parser.cpp \
 	test/test_tlsh.cpp \
-	test/test_util.cpp
+	test/test_tlsh_corpus.cpp \
+	test/test_util.cpp \
+	test/tlsh_corpus.cpp
 
 test_test_CPPFLAGS = $(AM_CPPFLAGS) $(CATCH2_CFLAGS)
 
@@ -172,6 +174,13 @@ test_bench_hsd_SOURCES = \
 
 test_bench_hsd_CPPFLAGS = $(AM_CPPFLAGS) $(CATCH2_CFLAGS)
 test_bench_hsd_LDADD = $(HASHER_LIB) $(TEST_LIBS) $(CATCH2_LIBS)
+
+test_bench_tlsh_SOURCES = \
+	test/bench_tlsh.cpp \
+	test/tlsh_corpus.cpp
+
+test_bench_tlsh_CPPFLAGS = $(AM_CPPFLAGS) $(CATCH2_CFLAGS)
+test_bench_tlsh_LDADD = $(HASHER_LIB) $(TEST_LIBS) $(CATCH2_LIBS)
 
 FORMAT_COMMAND := tools/git-clang-format -f --style=file
 
