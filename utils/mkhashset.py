@@ -33,9 +33,50 @@ HASH_TYPE = {
     'sha3_384':  1 <<  8,
     'sha3_512':  1 <<  9,
     'blake3':    1 << 10,
-    'quick_md5': 1 << 13,
+    'quick_md5': 1 << 14,
+    'tlsh':      1 << 15,
     'other':     1 << 31
 }
+
+# hash lengths in bytes, where the hex input doesn't tell us directly
+HASH_LENGTH = {
+    'tlsh': 36
+}
+
+
+def tlsh_from_hex(s):
+    """Decode a TLSH string ("T1" + 70 hex, bare 70 hex, or "TNULL") into
+    libhasher's 36-byte canonical form (see include/hasher/tlsh.h):
+
+      L, Q, plane_hi[16], plane_lo[16], checksum, 0
+
+    where bit i of plane_hi/plane_lo is bit 1/bit 0 of bucket code i.
+    """
+    if s.upper() == 'TNULL':
+        return bytes(HASH_LENGTH['tlsh'])
+    if s[:2].upper() == 'T1':
+        s = s[2:]
+    if len(s) != 70:
+        raise ValueError(f'bad TLSH string: {s!r}')
+    raw = bytes.fromhex(s)
+
+    def swap_nibbles(b):
+        return ((b & 0x0F) << 4) | (b >> 4)
+
+    checksum = swap_nibbles(raw[0])
+    length = swap_nibbles(raw[1])
+    q = raw[2]
+    # body bytes are stored reversed in the hex form; body[i] packs bucket
+    # codes 4i..4i+3 at bit positions 2j
+    body = raw[3:35][::-1]
+    plane_hi = bytearray(16)
+    plane_lo = bytearray(16)
+    for i in range(128):
+        code = (body[i // 4] >> (2 * (i % 4))) & 3
+        plane_hi[i // 8] |= (code >> 1) << (i % 8)
+        plane_lo[i // 8] |= (code & 1) << (i % 8)
+
+    return bytes([length, q]) + bytes(plane_hi) + bytes(plane_lo) + bytes([checksum, 0])
 
 
 def nonempty_lines(src):
@@ -57,6 +98,7 @@ def write_cstring(b, field_width, buf):
 
 
 def run(hash_type, hashset_name, hashset_desc, inlines, outbuf):
+    parse_hash = tlsh_from_hex if hash_type == 'tlsh' else bytes.fromhex
     hash_type = HASH_TYPE[hash_type]
 
     hashset_name = hashset_name.encode('UTF-8')
@@ -80,7 +122,7 @@ def run(hash_type, hashset_name, hashset_desc, inlines, outbuf):
 
     for line in nonempty_lines(inlines):
         cols = line.split(' ')
-        hashes.append(bytes.fromhex(cols[0]))
+        hashes.append(parse_hash(cols[0]))
         if len(cols) == 2:
             sizes.append(int(cols[1]))
 
