@@ -7,6 +7,13 @@
 #include "tlsh_digest.h"
 #include "hasher/hashset.h"
 
+// optional counters filled in by the index-based searches
+struct TlshKnnStats {
+  uint64_t cells = 0; // header cells visited
+  uint64_t lists = 0; // IVF lists whose bound was evaluated
+  uint64_t rows = 0;  // rows whose distance was computed
+};
+
 /*
  * Brute-force k nearest neighbours of q in [beg, end) by TLSH distance.
  *

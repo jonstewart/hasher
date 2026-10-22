@@ -62,19 +62,7 @@ float tlsh_embed_dist2(const float* a, const float* b, bool include_length) {
 }
 
 float tlsh_embed_dist2(const TlshDigest& a, const TlshDigest& b, bool include_length) {
-  // body: per bucket 1, 1, 1 (adjacent), 2, 2 (two apart), 5 (0 vs 3):
-  // popcount(X ^ Y) + popcount(Y) + 4 * popcount(X & Y & S)
-  uint32_t body = 0;
-  for (size_t i = 0; i < 16; i += 8) {
-    const uint64_t lo_a = load_u64(a.lo + i);
-    const uint64_t hi_a = load_u64(a.hi + i);
-    const uint64_t x = lo_a ^ load_u64(b.lo + i);
-    const uint64_t y = hi_a ^ load_u64(b.hi + i);
-    const uint64_t s = ~(lo_a ^ hi_a);
-    body += std::popcount(x ^ y) + std::popcount(y) + 4 * std::popcount(x & y & s);
-  }
-
-  float d = static_cast<float>(body);
+  float d = static_cast<float>(tlsh_embed_body_dist2(a, b));
   if (include_length) {
     d += sq(static_cast<float>(a.L) - static_cast<float>(b.L));
   }
@@ -98,6 +86,23 @@ float tlsh_embed_dist2_to_point(const TlshDigest& d, const float* p, bool includ
   s += sq(((d.checksum & 1) ? CS_SCALE : 0.f) - p[261]);
   s += sq(((d.checksum & 2) ? CS_SCALE : 0.f) - p[262]);
   s += sq(((d.checksum & 4) ? CS_SCALE : 0.f) - p[263]);
+  return s;
+}
+
+void tlsh_embed_body(const TlshDigest& d, float* out) {
+  for (size_t i = 0; i < 128; ++i) {
+    const uint8_t c = d.bucket(i);
+    out[2 * i] = BODY_X[c];
+    out[2 * i + 1] = BODY_Y[c];
+  }
+}
+
+float tlsh_embed_body_dist2_to_point(const TlshDigest& d, const float* p) {
+  float s = 0.f;
+  for (size_t i = 0; i < 128; ++i) {
+    const uint8_t c = d.bucket(i);
+    s += sq(BODY_X[c] - p[2 * i]) + sq(BODY_Y[c] - p[2 * i + 1]);
+  }
   return s;
 }
 

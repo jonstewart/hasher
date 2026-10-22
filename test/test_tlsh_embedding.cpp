@@ -165,6 +165,24 @@ TEST_CASE("tlsh_embed_lower_bound_on_corpus_pairs") {
   CHECK(tightness / bounded_pairs > 0.5);
 }
 
+TEST_CASE("tlsh_embed_body_dist2_matches_float") {
+  const auto corpus = make_tlsh_corpus(5, 300);
+  for (size_t i = 0; i + 1 < corpus.size(); ++i) {
+    const auto& a = corpus[i];
+    const auto& b = corpus[i + 1];
+    std::vector<float> va(TLSH_EMBED_BODY_DIMS), vb(TLSH_EMBED_BODY_DIMS);
+    tlsh_embed_body(a, va.data());
+    tlsh_embed_body(b, vb.data());
+    float s = 0;
+    for (size_t j = 0; j < TLSH_EMBED_BODY_DIMS; ++j) {
+      s += (va[j] - vb[j]) * (va[j] - vb[j]);
+    }
+    CHECK(static_cast<float>(tlsh_embed_body_dist2(a, b)) == s);
+    CHECK(tlsh_embed_body_dist2(a, b) <= tlsh_body_diff(a, b));
+    CHECK(tlsh_embed_body_dist2_to_point(a, vb.data()) == Approx(s).margin(1e-3));
+  }
+}
+
 TEST_CASE("tlsh_embed_dist2_to_point") {
   const auto corpus = make_tlsh_corpus(99, 200);
   std::vector<float> centroid(TLSH_EMBED_DIMS, 0.f);

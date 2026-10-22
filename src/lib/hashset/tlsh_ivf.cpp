@@ -1,6 +1,7 @@
 #include "hashset/tlsh_ivf.h"
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstring>
 #include <limits>
@@ -10,14 +11,25 @@
 
 #include "rwutil.h"
 #include "throw.h"
+#include "hashset/tlsh_cells.h"
+#include "hashset/tlsh_header_order.h"
 
 namespace {
 
-constexpr size_t D = TLSH_EMBED_DIMS;
+constexpr size_t BD = TLSH_EMBED_BODY_DIMS;
 
-// k-means over the embeddings of rows [beg, end) (all sharing one L value),
-// appending lists to ivf. Row indexes written to ids are offset by base.
-void cluster_group(
+inline float dist2(const float* a, const float* b) {
+  float s = 0.f;
+  for (size_t j = 0; j < BD; ++j) {
+    const float d = a[j] - b[j];
+    s += d * d;
+  }
+  return s;
+}
+
+// k-means over the body embeddings of one cell's rows [beg, end), appending
+// its lists to ivf. Row indexes written to ids are offset by base.
+void cluster_cell(
   const TlshDigest* beg,
   const TlshDigest* end,
   uint64_t base,
@@ -28,30 +40,29 @@ void cluster_group(
   const size_t m = end - beg;
   const size_t k = std::max<size_t>(1, (m + target_list_size - 1) / target_list_size);
 
-  // embeddings of (a sample of) the group
-  const size_t sample_cap = std::max<size_t>(k * 64, 4096);
+  // body embeddings of (a sample of) the cell
+  const size_t sample_cap = std::max<size_t>(k * 32, 2048);
   std::vector<uint32_t> sample(m);
   std::iota(sample.begin(), sample.end(), 0u);
   if (m > sample_cap) {
     std::shuffle(sample.begin(), sample.end(), rng);
     sample.resize(sample_cap);
-    std::sort(sample.begin(), sample.end());
   }
 
-  std::vector<float> emb(sample.size() * D);
+  std::vector<float> emb(sample.size() * BD);
   for (size_t i = 0; i < sample.size(); ++i) {
-    tlsh_embed(beg[sample[i]], &emb[i * D]);
+    tlsh_embed_body(beg[sample[i]], &emb[i * BD]);
   }
 
-  std::vector<float> cent(k * D, 0.f);
+  std::vector<float> cent(k * BD, 0.f);
 
   if (k == 1) {
     for (size_t i = 0; i < sample.size(); ++i) {
-      for (size_t j = 0; j < D; ++j) {
-        cent[j] += emb[i * D + j];
+      for (size_t j = 0; j < BD; ++j) {
+        cent[j] += emb[i * BD + j];
       }
     }
-    for (size_t j = 0; j < D; ++j) {
+    for (size_t j = 0; j < BD; ++j) {
       cent[j] /= sample.size();
     }
   }
@@ -59,14 +70,12 @@ void cluster_group(
     // k-means++ seeding on the sample
     std::vector<float> best(sample.size(), std::numeric_limits<float>::max());
     std::uniform_int_distribution<size_t> pick(0, sample.size() - 1);
-    size_t first = pick(rng);
-    std::copy_n(&emb[first * D], D, &cent[0]);
+    std::copy_n(&emb[pick(rng) * BD], BD, &cent[0]);
 
     for (size_t c = 1; c < k; ++c) {
       double total = 0;
       for (size_t i = 0; i < sample.size(); ++i) {
-        const float d2 = tlsh_embed_dist2(&emb[i * D], &cent[(c - 1) * D]);
-        best[i] = std::min(best[i], d2);
+        best[i] = std::min(best[i], dist2(&emb[i * BD], &cent[(c - 1) * BD]));
         total += best[i];
       }
       size_t chosen = pick(rng);
@@ -81,12 +90,12 @@ void cluster_group(
           }
         }
       }
-      std::copy_n(&emb[chosen * D], D, &cent[c * D]);
+      std::copy_n(&emb[chosen * BD], BD, &cent[c * BD]);
     }
 
     // Lloyd iterations
     std::vector<uint32_t> assign(sample.size(), 0);
-    std::vector<float> sum(k * D);
+    std::vector<float> sum(k * BD);
     std::vector<uint32_t> cnt(k);
     for (int iter = 0; iter < 10; ++iter) {
       bool changed = false;
@@ -94,7 +103,7 @@ void cluster_group(
         float bd = std::numeric_limits<float>::max();
         uint32_t bc = 0;
         for (size_t c = 0; c < k; ++c) {
-          const float d2 = tlsh_embed_dist2(&emb[i * D], &cent[c * D]);
+          const float d2 = dist2(&emb[i * BD], &cent[c * BD]);
           if (d2 < bd) {
             bd = d2;
             bc = c;
@@ -112,29 +121,31 @@ void cluster_group(
       std::fill(cnt.begin(), cnt.end(), 0u);
       for (size_t i = 0; i < sample.size(); ++i) {
         ++cnt[assign[i]];
-        for (size_t j = 0; j < D; ++j) {
-          sum[assign[i] * D + j] += emb[i * D + j];
+        for (size_t j = 0; j < BD; ++j) {
+          sum[assign[i] * BD + j] += emb[i * BD + j];
         }
       }
       for (size_t c = 0; c < k; ++c) {
         if (cnt[c]) {
-          for (size_t j = 0; j < D; ++j) {
-            cent[c * D + j] = sum[c * D + j] / cnt[c];
+          for (size_t j = 0; j < BD; ++j) {
+            cent[c * BD + j] = sum[c * BD + j] / cnt[c];
           }
         }
       }
     }
   }
 
-  // final assignment of every row, radius per list
+  // final assignment of every row; the medoid of a list is its member
+  // nearest the centroid
   std::vector<uint32_t> assign(m);
-  std::vector<float> rad(k, 0.f);
+  std::vector<float> med_dist(k, std::numeric_limits<float>::max());
+  std::vector<uint32_t> medoid(k, 0);
   std::vector<uint32_t> cnt(k, 0);
   for (size_t i = 0; i < m; ++i) {
     float bd = std::numeric_limits<float>::max();
     uint32_t bc = 0;
     for (size_t c = 0; c < k; ++c) {
-      const float d2 = tlsh_embed_dist2_to_point(beg[i], &cent[c * D]);
+      const float d2 = tlsh_embed_body_dist2_to_point(beg[i], &cent[c * BD]);
       if (d2 < bd) {
         bd = d2;
         bc = c;
@@ -142,7 +153,17 @@ void cluster_group(
     }
     assign[i] = bc;
     ++cnt[bc];
-    rad[bc] = std::max(rad[bc], bd);
+    if (bd < med_dist[bc]) {
+      med_dist[bc] = bd;
+      medoid[bc] = static_cast<uint32_t>(i);
+    }
+  }
+
+  // exact squared embedding radius about the medoid
+  std::vector<uint32_t> rad2(k, 0);
+  for (size_t i = 0; i < m; ++i) {
+    const uint32_t c = assign[i];
+    rad2[c] = std::max(rad2[c], tlsh_embed_body_dist2(beg[medoid[c]], beg[i]));
   }
 
   // emit nonempty lists; ids ascending within a list
@@ -161,14 +182,10 @@ void cluster_group(
     if (!cnt[c]) {
       continue;
     }
-    ivf.centroids.insert(ivf.centroids.end(), &cent[c * D], &cent[(c + 1) * D]);
-    // store the Euclidean radius, padded slightly for float rounding
-    ivf.radius.push_back(std::sqrt(rad[c]) * (1.f + 1e-5f) + 1e-4f);
+    ivf.medoids.push_back(beg[medoid[c]]);
+    ivf.radius2.push_back(rad2[c]);
     ivf.list_start.push_back(id_base + start[c + 1]);
   }
-  // compact: lists with cnt == 0 were skipped, but their id range is empty,
-  // so list_start remains consistent (the previous list's end equals the
-  // skipped list's start).
 }
 
 } // namespace
@@ -185,57 +202,71 @@ TlshIvf build_tlsh_ivf(
 
   TlshIvf ivf;
   ivf.n = n;
+  ivf.cell_lists.resize(TLSH_CELL_COUNT + 1);
   ivf.list_start.push_back(0);
   ivf.ids.reserve(n);
 
   std::mt19937_64 rng(seed);
 
   const TlshDigest* g = beg;
-  while (g != end) {
+  for (uint32_t c = 0; c < TLSH_CELL_COUNT; ++c) {
+    ivf.cell_lists[c] = static_cast<uint32_t>(ivf.lists());
     const TlshDigest* ge = g;
-    while (ge != end && ge->L == g->L) {
+    while (ge != end && tlsh_cell_id(*ge) == c) {
       ++ge;
     }
-    cluster_group(g, ge, g - beg, target_list_size, rng, ivf);
+    THROW_IF(ge != end && tlsh_cell_id(*ge) < c, "rows are not sorted");
+    if (ge != g) {
+      cluster_cell(g, ge, g - beg, target_list_size, rng, ivf);
+    }
     g = ge;
   }
+  THROW_IF(g != end, "rows are not sorted");
+  ivf.cell_lists[TLSH_CELL_COUNT] = static_cast<uint32_t>(ivf.lists());
 
   return ivf;
 }
 
 TlshIvfView make_tlsh_ivf_view(const TlshIvf& ivf) {
   TlshIvfView v;
-  v.dims = ivf.dims;
   v.lists = static_cast<uint32_t>(ivf.lists());
   v.n = ivf.n;
-  v.centroids = ivf.centroids.data();
-  v.radius = ivf.radius.data();
+  v.cell_lists = ivf.cell_lists.data();
+  v.medoids = ivf.medoids.data();
+  v.radius2 = ivf.radius2.data();
   v.list_start = ivf.list_start.data();
   v.ids = ivf.ids.data();
   return v;
 }
 
+namespace {
+
 constexpr size_t TIVF_HEADER = 32;
+constexpr uint16_t TIVF_VERSION = 3;
+
+} // namespace
 
 size_t length_tivf_data(uint32_t lists, uint64_t n) {
   return TIVF_HEADER +
-         static_cast<size_t>(lists) * D * sizeof(float) +
-         static_cast<size_t>(lists) * sizeof(float) +
+         (TLSH_CELL_COUNT + 1) * sizeof(uint32_t) +
+         static_cast<size_t>(lists) * sizeof(TlshDigest) +
+         static_cast<size_t>(lists) * sizeof(uint32_t) +
          (static_cast<size_t>(lists) + 1) * sizeof(uint64_t) +
          n * sizeof(uint32_t);
 }
 
 size_t write_tivf_data(const TlshIvf& ivf, char* out) {
   const char* beg = out;
-  out += write_le<uint16_t>(1, out);                                  // version
+  out += write_le<uint16_t>(TIVF_VERSION, out);
   out += write_le<uint16_t>(0, out);                                  // flags
-  out += write_le<uint32_t>(ivf.dims, out);
+  out += write_le<uint32_t>(BD, out);                                 // dims
   out += write_le<uint32_t>(static_cast<uint32_t>(ivf.lists()), out);
   out += write_le<uint32_t>(0, out);                                  // reserved
   out += write_le<uint64_t>(ivf.n, out);
   out += write_le<uint64_t>(0, out);                                  // reserved
-  out += write_bytes(ivf.centroids.data(), ivf.centroids.size() * sizeof(float), out);
-  out += write_bytes(ivf.radius.data(), ivf.radius.size() * sizeof(float), out);
+  out += write_bytes(ivf.cell_lists.data(), ivf.cell_lists.size() * sizeof(uint32_t), out);
+  out += write_bytes(ivf.medoids.data(), ivf.medoids.size() * sizeof(TlshDigest), out);
+  out += write_bytes(ivf.radius2.data(), ivf.radius2.size() * sizeof(uint32_t), out);
   out += write_bytes(ivf.list_start.data(), ivf.list_start.size() * sizeof(uint64_t), out);
   out += write_bytes(ivf.ids.data(), ivf.ids.size() * sizeof(uint32_t), out);
   return out - beg;
@@ -244,11 +275,11 @@ size_t write_tivf_data(const TlshIvf& ivf, char* out) {
 TlshIvfView parse_tivf_data(const uint8_t* beg, const uint8_t* end) {
   const uint8_t* cur = beg;
   const uint16_t version = read_le<uint16_t>(beg, cur, end);
-  THROW_IF(version != 1, "unsupported TIVF version " << version);
+  THROW_IF(version != TIVF_VERSION, "unsupported TIVF version " << version);
   read_le<uint16_t>(beg, cur, end); // flags
+  const uint32_t dims = read_le<uint32_t>(beg, cur, end);
+  THROW_IF(dims != BD, "unsupported TIVF dims " << dims);
   TlshIvfView v;
-  v.dims = read_le<uint32_t>(beg, cur, end);
-  THROW_IF(v.dims != D, "unsupported TIVF dims " << v.dims);
   v.lists = read_le<uint32_t>(beg, cur, end);
   read_le<uint32_t>(beg, cur, end); // reserved
   v.n = read_le<uint64_t>(beg, cur, end);
@@ -257,23 +288,21 @@ TlshIvfView parse_tivf_data(const uint8_t* beg, const uint8_t* end) {
     static_cast<size_t>(end - beg) != length_tivf_data(v.lists, v.n),
     "TIVF payload has wrong length"
   );
-  v.centroids = reinterpret_cast<const float*>(cur);
-  cur += static_cast<size_t>(v.lists) * D * sizeof(float);
-  v.radius = reinterpret_cast<const float*>(cur);
-  cur += static_cast<size_t>(v.lists) * sizeof(float);
+  v.cell_lists = reinterpret_cast<const uint32_t*>(cur);
+  cur += (TLSH_CELL_COUNT + 1) * sizeof(uint32_t);
+  v.medoids = reinterpret_cast<const TlshDigest*>(cur);
+  cur += static_cast<size_t>(v.lists) * sizeof(TlshDigest);
+  v.radius2 = reinterpret_cast<const uint32_t*>(cur);
+  cur += static_cast<size_t>(v.lists) * sizeof(uint32_t);
   v.list_start = reinterpret_cast<const uint64_t*>(cur);
   cur += (static_cast<size_t>(v.lists) + 1) * sizeof(uint64_t);
   v.ids = reinterpret_cast<const uint32_t*>(cur);
+  THROW_IF(v.cell_lists[0] != 0 || v.cell_lists[TLSH_CELL_COUNT] != v.lists, "bad TIVF cell_lists");
+  THROW_IF(v.list_start[0] != 0 || v.list_start[v.lists] != v.n, "bad TIVF list_start");
   return v;
 }
 
 namespace {
-
-struct Cand {
-  float bound;
-  uint32_t list;
-  bool operator<(const Cand& o) const { return bound > o.bound; } // min-heap
-};
 
 struct Hit {
   uint32_t distance;
@@ -283,6 +312,18 @@ struct Hit {
   }
 };
 
+// lists shorter than this are scanned without evaluating their bound
+constexpr uint64_t MIN_BOUNDED_LIST = 4;
+
+// Lower bound on the squared body-embedding distance from q to any member of
+// a list, given the squared distance d2 to the medoid and the list's squared
+// radius r2 (triangle inequality in embedding space). Slightly relaxed so
+// float rounding can never prune a valid row.
+inline float list_bound(uint32_t d2, uint32_t r2) {
+  const float b = std::sqrt(static_cast<float>(d2)) - std::sqrt(static_cast<float>(r2));
+  return b > 0.f ? std::max(0.f, b * b - 1e-2f) : 0.f;
+}
+
 } // namespace
 
 std::vector<SFHASH_TlshMatch> tlsh_knn_ivf(
@@ -291,51 +332,29 @@ std::vector<SFHASH_TlshMatch> tlsh_knn_ivf(
   const TlshDigest& q,
   size_t k,
   uint32_t max_distance,
-  bool include_length)
+  bool include_length,
+  TlshKnnStats* stats)
 {
   std::vector<SFHASH_TlshMatch> out;
-  if (k == 0 || ivf.empty() || q.is_null()) {
+  if (k == 0 || ivf.empty() || !rows || q.is_null()) {
     return out;
   }
 
-  if (include_length) {
-    max_distance = std::min(max_distance, TLSH_EMBED_MAX_BOUNDED_DIFF);
-  }
+  const TlshHeaderOrder order(q, include_length);
 
-  float qv[D];
-  tlsh_embed(q, qv);
-
-  // lower bound per list
-  std::vector<Cand> cands;
-  cands.reserve(ivf.lists);
-  const float tau0 = static_cast<float>(max_distance);
-  for (uint32_t c = 0; c < ivf.lists; ++c) {
-    const float dc = std::sqrt(tlsh_embed_dist2(qv, &ivf.centroids[static_cast<size_t>(c) * D], include_length));
-    const float b = std::max(0.f, dc - ivf.radius[c]);
-    const float b2 = b * b;
-    if (b2 <= tau0) {
-      cands.push_back({ b2, c });
-    }
-  }
-  std::make_heap(cands.begin(), cands.end());
-
-  // bounded max-heap of the best (distance, index) hits; tau is the largest
-  // distance that can still be useful (inclusive)
   std::priority_queue<Hit> best;
-  uint32_t tau = max_distance;
+  uint32_t tau = max_distance; // inclusive bound on useful distances
 
-  while (!cands.empty()) {
-    std::pop_heap(cands.begin(), cands.end());
-    const Cand c = cands.back();
-    cands.pop_back();
-    if (c.bound > static_cast<float>(tau)) {
-      break;
+  std::vector<std::pair<float, uint32_t>> lists; // (body bound, list)
+
+  auto scan = [&](uint64_t lb, uint64_t le, uint32_t ch) {
+    if (stats) {
+      stats->rows += le - lb;
     }
-    const uint64_t lb = ivf.list_start[c.list], le = ivf.list_start[c.list + 1];
     for (uint64_t i = lb; i < le; ++i) {
       const uint32_t id = ivf.ids[i];
       const TlshDigest& r = rows[id];
-      const uint32_t hd = tlsh_header_diff(q, r, include_length);
+      const uint32_t hd = ch + (r.checksum != q.checksum);
       if (hd > tau) {
         continue;
       }
@@ -356,6 +375,51 @@ std::vector<SFHASH_TlshMatch> tlsh_knn_ivf(
       }
       if (best.size() == k) {
         tau = best.top().distance;
+      }
+    }
+  };
+
+  for (size_t li = 0; li < 256; ++li) {
+    const uint32_t cl = order.l_cost[li];
+    if (cl > tau) {
+      break;
+    }
+    for (size_t qi = 0; qi < 256; ++qi) {
+      const uint32_t ch = cl + order.q_cost[qi];
+      if (ch > tau) {
+        break;
+      }
+      const uint32_t c = (static_cast<uint32_t>(order.l[li]) << 8) | order.q[qi];
+      const uint32_t fl = ivf.cell_lists[c], el = ivf.cell_lists[c + 1];
+      if (fl == el) {
+        continue;
+      }
+      if (stats) {
+        ++stats->cells;
+      }
+
+      if (el - fl == 1 && ivf.list_start[el] - ivf.list_start[fl] < MIN_BOUNDED_LIST) {
+        scan(ivf.list_start[fl], ivf.list_start[el], ch);
+        continue;
+      }
+
+      // body lower bound per list, through centroid and radius
+      lists.clear();
+      if (stats) {
+        stats->lists += el - fl;
+      }
+      for (uint32_t l = fl; l < el; ++l) {
+        const float b2 = list_bound(tlsh_embed_body_dist2(q, ivf.medoids[l]), ivf.radius2[l]);
+        if (ch + b2 <= static_cast<float>(tau)) {
+          lists.emplace_back(b2, l);
+        }
+      }
+      std::sort(lists.begin(), lists.end());
+      for (const auto& [b2, l]: lists) {
+        if (ch + b2 > static_cast<float>(tau)) {
+          break;
+        }
+        scan(ivf.list_start[l], ivf.list_start[l + 1], ch);
       }
     }
   }

@@ -9,6 +9,7 @@
 #include "tlsh_digest.h"
 #include "tlsh_embedding.h"
 #include "hashset/tlsh_ivf.h"
+#include "hashset/tlsh_cells.h"
 #include "hashset/tlsh_search.h"
 
 namespace {
@@ -40,10 +41,29 @@ TEST_CASE("tlsh_ivf_build_invariants") {
   REQUIRE(ivf.n == rows.size());
   REQUIRE(ivf.lists() > 1);
   REQUIRE(ivf.list_start.size() == ivf.lists() + 1);
-  REQUIRE(ivf.centroids.size() == ivf.lists() * TLSH_EMBED_DIMS);
+  REQUIRE(ivf.medoids.size() == ivf.lists());
+  REQUIRE(ivf.radius2.size() == ivf.lists());
+  REQUIRE(ivf.cell_lists.size() == TLSH_CELL_COUNT + 1);
   CHECK(ivf.list_start.front() == 0);
   CHECK(ivf.list_start.back() == rows.size());
   CHECK(ivf.ids.size() == rows.size());
+  CHECK(ivf.cell_lists.front() == 0);
+  CHECK(ivf.cell_lists.back() == ivf.lists());
+
+  // the lists of a cell hold exactly that cell's rows
+  const auto cells = make_tlsh_cell_index(rows.data(), rows.data() + rows.size());
+  for (uint32_t c = 0; c < TLSH_CELL_COUNT; ++c) {
+    CHECK(ivf.cell_lists[c] <= ivf.cell_lists[c + 1]);
+    const uint64_t rows_in_cell = cells[c + 1] - cells[c];
+    uint64_t rows_in_lists = 0;
+    for (uint32_t l = ivf.cell_lists[c]; l < ivf.cell_lists[c + 1]; ++l) {
+      rows_in_lists += ivf.list_start[l + 1] - ivf.list_start[l];
+      for (uint64_t i = ivf.list_start[l]; i < ivf.list_start[l + 1]; ++i) {
+        CHECK(tlsh_cell_id(rows[ivf.ids[i]]) == c);
+      }
+    }
+    CHECK(rows_in_lists == rows_in_cell);
+  }
 
   // every row appears exactly once
   std::vector<uint32_t> sorted_ids(ivf.ids);
@@ -55,17 +75,16 @@ TEST_CASE("tlsh_ivf_build_invariants") {
   for (size_t c = 0; c < ivf.lists(); ++c) {
     const auto lb = ivf.list_start[c], le = ivf.list_start[c + 1];
     REQUIRE(lb < le); // no empty lists
-    const float* cent = &ivf.centroids[c * TLSH_EMBED_DIMS];
-    const float L = cent[TLSH_EMBED_L_DIM];
+    const TlshDigest& med = ivf.medoids[c];
+    bool medoid_is_member = false;
     for (auto i = lb; i < le; ++i) {
       if (i > lb) {
         CHECK(ivf.ids[i - 1] < ivf.ids[i]); // ascending within a list
       }
-      const auto& d = rows[ivf.ids[i]];
-      CHECK(static_cast<float>(d.L) == L); // lists never span L
-      const float dist = std::sqrt(tlsh_embed_dist2_to_point(d, cent));
-      CHECK(dist <= ivf.radius[c]);
+      CHECK(tlsh_embed_body_dist2(med, rows[ivf.ids[i]]) <= ivf.radius2[c]);
+      medoid_is_member |= rows[ivf.ids[i]] == med;
     }
+    CHECK(medoid_is_member);
   }
 }
 
@@ -80,11 +99,11 @@ TEST_CASE("tlsh_ivf_serialization_round_trip") {
     reinterpret_cast<const uint8_t*>(buf.data()),
     reinterpret_cast<const uint8_t*>(buf.data() + buf.size())
   );
-  CHECK(v.dims == TLSH_EMBED_DIMS);
   CHECK(v.lists == ivf.lists());
   CHECK(v.n == ivf.n);
-  CHECK(std::equal(ivf.centroids.begin(), ivf.centroids.end(), v.centroids));
-  CHECK(std::equal(ivf.radius.begin(), ivf.radius.end(), v.radius));
+  CHECK(std::equal(ivf.cell_lists.begin(), ivf.cell_lists.end(), v.cell_lists));
+  CHECK(std::equal(ivf.medoids.begin(), ivf.medoids.end(), v.medoids));
+  CHECK(std::equal(ivf.radius2.begin(), ivf.radius2.end(), v.radius2));
   CHECK(std::equal(ivf.list_start.begin(), ivf.list_start.end(), v.list_start));
   CHECK(std::equal(ivf.ids.begin(), ivf.ids.end(), v.ids));
 
@@ -105,7 +124,7 @@ TEST_CASE("tlsh_ivf_knn_matches_brute_force") {
 
   for (const auto& q: queries) {
     for (size_t k: {1, 5, 20}) {
-      for (uint32_t T: {10u, 30u, 60u, 100u, 144u}) {
+      for (uint32_t T: {10u, 30u, 60u, 100u, 144u, 400u}) {
         for (bool incl: {true, false}) {
           const auto brute = tlsh_knn_brute(rows.data(), rows.data() + rows.size(), q, k, T, incl);
           const auto fast = tlsh_knn_ivf(view, rows.data(), q, k, T, incl);
@@ -116,20 +135,17 @@ TEST_CASE("tlsh_ivf_knn_matches_brute_force") {
   }
 }
 
-TEST_CASE("tlsh_ivf_knn_clamps_max_distance_with_length") {
+TEST_CASE("tlsh_ivf_knn_is_exact_beyond_144") {
   const auto rows = sorted_corpus(4, 3000);
   const auto ivf = build_tlsh_ivf(rows.data(), rows.data() + rows.size(), 64);
   const auto view = make_tlsh_ivf_view(ivf);
 
   const auto q = perturb_tlsh_corpus(6, rows, 1, 0.2).front();
   const auto fast = tlsh_knn_ivf(view, rows.data(), q, 1000, 100000, true);
-  for (const auto& m: fast) {
-    CHECK(m.distance <= TLSH_EMBED_MAX_BOUNDED_DIFF);
-  }
-  const auto brute = tlsh_knn_brute(rows.data(), rows.data() + rows.size(), q, 1000, TLSH_EMBED_MAX_BOUNDED_DIFF, true);
+  const auto brute = tlsh_knn_brute(rows.data(), rows.data() + rows.size(), q, 1000, 100000, true);
+  CHECK(fast.size() == 1000);
   CHECK(same_matches(brute, fast));
 
-  // without the length there is no cap
   const auto fast_x = tlsh_knn_ivf(view, rows.data(), q, 1000, 100000, false);
   const auto brute_x = tlsh_knn_brute(rows.data(), rows.data() + rows.size(), q, 1000, 100000, false);
   CHECK(same_matches(brute_x, fast_x));

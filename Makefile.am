@@ -47,6 +47,7 @@ src_lib_libhasherint_la_SOURCES = \
 	src/lib/hashset/record_iterator.cpp \
 	src/lib/hashset/tlsh_cell_search.cpp \
 	src/lib/hashset/tlsh_cells.cpp \
+	src/lib/hashset/tlsh_header_order.cpp \
 	src/lib/hashset/tlsh_ivf.cpp \
 	src/lib/hashset/tlsh_search.cpp \
 	src/lib/hashset/util.cpp \
@@ -160,6 +161,7 @@ test_test_SOURCES = \
 	test/test_tlsh.cpp \
 	test/test_tlsh_cell_search.cpp \
 	test/test_tlsh_embedding.cpp \
+	test/test_tlsh_header_order.cpp \
 	test/test_tlsh_ivf.cpp \
 	test/test_tlsh_corpus.cpp \
 	test/test_util.cpp \

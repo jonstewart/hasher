@@ -3,10 +3,12 @@
  *
  *   TLSH_BENCH_N=10000,100000 ./test/bench_tlsh
  *
- * Compares brute-force k-nearest-neighbour search over the reference
- * implementation (Tlsh::totalDiff) with libhasher's popcount kernel
- * (tlsh_diff), and TlshHasher with the reference hasher. Catch2 prints the
- * per-benchmark statistics; a summary table in ns/query and ns/row follows.
+ * Compares k-nearest-neighbour search strategies over a sorted corpus (as an
+ * hset stores it): brute force with the reference implementation
+ * (Tlsh::totalDiff), brute force with libhasher's popcount kernel, the cell
+ * index (header-cost pruning), and the IVF index over the lower-bound
+ * embedding; plus TlshHasher against the reference hasher. Catch2 prints the
+ * per-benchmark statistics; a summary table in ns/query follows.
  */
 
 #include <catch2/catch_test_macros.hpp>
@@ -33,10 +35,16 @@
 #include "tlsh_corpus.h"
 #include "tlsh_digest.h"
 #include "tlsh_hasher.h"
+#include "hashset/tlsh_cell_search.h"
+#include "hashset/tlsh_cells.h"
+#include "hashset/tlsh_ivf.h"
+#include "hashset/tlsh_search.h"
 
 namespace {
 
 constexpr size_t K = 10;
+constexpr uint32_t MAX_DISTANCE = 144;
+constexpr size_t IVF_LIST_SIZE = 128;
 constexpr size_t NUM_QUERIES = 20;
 constexpr uint64_t CORPUS_SEED = 0x7a5b;
 constexpr uint64_t QUERY_SEED = 0x51e;
@@ -90,18 +98,6 @@ std::vector<Hit> knn(size_t n, size_t k, Dist dist) {
   }
   std::reverse(out.begin(), out.end());
   return out;
-}
-
-std::vector<Hit> knn_reference(const std::vector<std::unique_ptr<Tlsh>>& corpus, const Tlsh& q) {
-  return knn(corpus.size(), K, [&](uint32_t i) {
-    return static_cast<uint32_t>(q.totalDiff(corpus[i].get(), true));
-  });
-}
-
-std::vector<Hit> knn_kernel(const std::vector<TlshDigest>& corpus, const TlshDigest& q) {
-  return knn(corpus.size(), K, [&](uint32_t i) {
-    return tlsh_diff(q, corpus[i], true);
-  });
 }
 
 // Tlsh's copy constructor is shallow; never copy one.
@@ -160,28 +156,48 @@ double min_ns(F f, size_t reps) {
 
 struct Row {
   size_t n;
-  double ref_ns_query;
-  double kern_ns_query;
+  double ref_ns;
+  double brute_ns;
+  double cells_ns;
+  double ivf_ns;
+  double ivf_build_ms;
+  size_t ivf_lists;
 };
 
 void print_summary(const std::vector<Row>& rows) {
-  std::cout << "\nkNN summary (k=" << K << ", " << NUM_QUERIES << " queries, min of repeated passes)\n"
+  std::cout << "\nkNN summary (k=" << K << ", max_distance=" << MAX_DISTANCE
+            << ", " << NUM_QUERIES << " queries, min of repeated passes; ns/query)\n"
             << std::setw(10) << "N"
-            << std::setw(22) << "reference ns/query"
-            << std::setw(20) << "reference ns/row"
-            << std::setw(20) << "kernel ns/query"
-            << std::setw(18) << "kernel ns/row"
-            << std::setw(10) << "speedup" << '\n';
+            << std::setw(16) << "reference"
+            << std::setw(16) << "brute kernel"
+            << std::setw(16) << "cell index"
+            << std::setw(16) << "ivf embed"
+            << std::setw(12) << "brute/ivf"
+            << std::setw(12) << "ref/ivf"
+            << std::setw(14) << "ivf build ms"
+            << std::setw(10) << "lists" << '\n';
   for (const auto& r: rows) {
-    std::cout << std::fixed << std::setprecision(1)
+    std::cout << std::fixed << std::setprecision(0)
               << std::setw(10) << r.n
-              << std::setw(22) << r.ref_ns_query
-              << std::setw(20) << std::setprecision(2) << r.ref_ns_query / r.n
-              << std::setw(20) << std::setprecision(1) << r.kern_ns_query
-              << std::setw(18) << std::setprecision(2) << r.kern_ns_query / r.n
-              << std::setw(9) << std::setprecision(1) << r.ref_ns_query / r.kern_ns_query << "x\n";
+              << std::setw(16) << r.ref_ns
+              << std::setw(16) << r.brute_ns
+              << std::setw(16) << r.cells_ns
+              << std::setw(16) << r.ivf_ns
+              << std::setw(11) << std::setprecision(1) << r.brute_ns / r.ivf_ns << 'x'
+              << std::setw(11) << r.ref_ns / r.ivf_ns << 'x'
+              << std::setw(14) << r.ivf_build_ms
+              << std::setw(10) << r.ivf_lists << '\n';
   }
   std::cout << std::endl;
+}
+
+std::vector<Hit> to_hits(const std::vector<SFHASH_TlshMatch>& m) {
+  std::vector<Hit> h;
+  h.reserve(m.size());
+  for (const auto& x: m) {
+    h.emplace_back(x.distance, static_cast<uint32_t>(x.index));
+  }
+  return h;
 }
 
 } // namespace
@@ -192,22 +208,56 @@ TEST_CASE("tlsh_knn") {
   for (const size_t n: bench_sizes()) {
     const std::string tag = " N=" + std::to_string(n);
 
-    const std::vector<TlshDigest> corpus = make_tlsh_corpus(CORPUS_SEED, n);
+    std::vector<TlshDigest> corpus = make_tlsh_corpus(CORPUS_SEED, n);
     REQUIRE(corpus.size() == n);
+    std::sort(corpus.begin(), corpus.end()); // hset row order
     const std::vector<TlshDigest> queries = make_queries(corpus);
 
     const std::vector<std::unique_ptr<Tlsh>> ref_corpus = to_reference(corpus);
     const std::vector<std::unique_ptr<Tlsh>> ref_queries = to_reference(queries);
 
-    auto run_ref = [&](size_t qi) { return knn_reference(ref_corpus, *ref_queries[qi]); };
-    auto run_kern = [&](size_t qi) { return knn_kernel(corpus, queries[qi]); };
+    const auto cells = make_tlsh_cell_index(corpus.data(), corpus.data() + corpus.size());
 
-    // the kernel must agree with the reference exactly, for every query
+    const auto t0 = std::chrono::steady_clock::now();
+    const TlshIvf ivf = build_tlsh_ivf(corpus.data(), corpus.data() + corpus.size(), IVF_LIST_SIZE);
+    const auto t1 = std::chrono::steady_clock::now();
+    const double ivf_build_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+    const TlshIvfView view = make_tlsh_ivf_view(ivf);
+
+    const TlshDigest* beg = corpus.data();
+    const TlshDigest* end = beg + corpus.size();
+
+    auto run_ref = [&](size_t qi) {
+      return knn(corpus.size(), K, [&](uint32_t i) {
+        return static_cast<uint32_t>(ref_queries[qi]->totalDiff(ref_corpus[i].get(), true));
+      });
+    };
+    auto run_brute = [&](size_t qi) {
+      return to_hits(tlsh_knn_brute(beg, end, queries[qi], K, MAX_DISTANCE, true));
+    };
+    auto run_cells = [&](size_t qi) {
+      return to_hits(tlsh_knn_cells(beg, cells.data(), queries[qi], K, MAX_DISTANCE, true));
+    };
+    auto run_ivf = [&](size_t qi) {
+      return to_hits(tlsh_knn_ivf(view, beg, queries[qi], K, MAX_DISTANCE, true));
+    };
+
+    // every strategy must agree with the reference exactly, for every query
     const auto expected = run_all(run_ref, NUM_QUERIES);
-    const auto actual = run_all(run_kern, NUM_QUERIES);
+    const auto brute = run_all(run_brute, NUM_QUERIES);
+    const auto cell = run_all(run_cells, NUM_QUERIES);
+    const auto fast = run_all(run_ivf, NUM_QUERIES);
     for (size_t qi = 0; qi < NUM_QUERIES; ++qi) {
-      CHECK(expected[qi].size() == K);
-      CHECK(expected[qi] == actual[qi]);
+      // the reference baseline has no max_distance; trim it the same way
+      std::vector<Hit> exp;
+      for (const auto& h: expected[qi]) {
+        if (h.first <= MAX_DISTANCE) {
+          exp.push_back(h);
+        }
+      }
+      CHECK(exp == brute[qi]);
+      CHECK(exp == cell[qi]);
+      CHECK(exp == fast[qi]);
     }
 
     BENCHMARK("knn_reference_totalDiff" + tag) {
@@ -215,14 +265,38 @@ TEST_CASE("tlsh_knn") {
     };
 
     BENCHMARK("knn_brute_tlsh_diff" + tag) {
-      return run_all(run_kern, NUM_QUERIES);
+      return run_all(run_brute, NUM_QUERIES);
     };
+
+    BENCHMARK("knn_cell_index" + tag) {
+      return run_all(run_cells, NUM_QUERIES);
+    };
+
+    BENCHMARK("knn_ivf_embedding" + tag) {
+      return run_all(run_ivf, NUM_QUERIES);
+    };
+
+    {
+      TlshKnnStats cs, is;
+      for (size_t qi = 0; qi < NUM_QUERIES; ++qi) {
+        tlsh_knn_cells(beg, cells.data(), queries[qi], K, MAX_DISTANCE, true, &cs);
+        tlsh_knn_ivf(view, beg, queries[qi], K, MAX_DISTANCE, true, &is);
+      }
+      std::cout << "N=" << n << " per query: cell index visits " << cs.cells / NUM_QUERIES
+                << " cells, " << cs.rows / NUM_QUERIES << " rows; ivf visits "
+                << is.cells / NUM_QUERIES << " cells, bounds " << is.lists / NUM_QUERIES
+                << " lists, scans " << is.rows / NUM_QUERIES << " rows\n";
+    }
 
     const size_t reps = n >= 1000000 ? 2 : 5;
     rows.push_back({
       n,
       min_ns([&]() { return run_all(run_ref, NUM_QUERIES).size(); }, reps) / NUM_QUERIES,
-      min_ns([&]() { return run_all(run_kern, NUM_QUERIES).size(); }, reps) / NUM_QUERIES
+      min_ns([&]() { return run_all(run_brute, NUM_QUERIES).size(); }, reps) / NUM_QUERIES,
+      min_ns([&]() { return run_all(run_cells, NUM_QUERIES).size(); }, reps) / NUM_QUERIES,
+      min_ns([&]() { return run_all(run_ivf, NUM_QUERIES).size(); }, reps * 4) / NUM_QUERIES,
+      ivf_build_ms,
+      ivf.lists()
     });
   }
 

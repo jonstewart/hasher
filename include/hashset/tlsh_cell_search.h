@@ -6,6 +6,7 @@
 
 #include "hasher/hashset.h"
 #include "tlsh_digest.h"
+#include "hashset/tlsh_search.h"
 
 /*
  * Exact k nearest neighbours using the cell index (HINT 0x7400): cells are
@@ -20,5 +21,6 @@ std::vector<SFHASH_TlshMatch> tlsh_knn_cells(
   const TlshDigest& q,
   size_t k,
   uint32_t max_distance,
-  bool include_length
+  bool include_length,
+  TlshKnnStats* stats = nullptr
 );

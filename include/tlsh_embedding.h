@@ -53,3 +53,32 @@ float tlsh_embed_dist2(const TlshDigest& a, const TlshDigest& b, bool include_le
 // Euclidean distance between a digest's embedding and an arbitrary point
 // (e.g. a centroid), computed without materializing the digest's embedding.
 float tlsh_embed_dist2_to_point(const TlshDigest& d, const float* p, bool include_length = true);
+
+/*
+ * Body-only embedding (dims 0..255 of phi). Its squared distance is a lower
+ * bound on the TLSH body cost for every pair, with no distance cap.
+ */
+constexpr size_t TLSH_EMBED_BODY_DIMS = 256;
+
+void tlsh_embed_body(const TlshDigest& d, float* out);
+
+// squared Euclidean distance between a digest's body embedding and a point
+float tlsh_embed_body_dist2_to_point(const TlshDigest& d, const float* p);
+
+/*
+ * Squared Euclidean distance between the body embeddings of two digests.
+ * Per bucket 1, 1, 1 (adjacent codes), 2, 2 (two apart), 4 ((0, 3)):
+ * popcount(X ^ Y) + popcount(Y) + 4 popcount(X & Y & S), an integer.
+ */
+inline uint32_t tlsh_embed_body_dist2(const TlshDigest& a, const TlshDigest& b) {
+  uint32_t d = 0;
+  for (size_t i = 0; i < 16; i += 8) {
+    const uint64_t lo_a = load_u64(a.lo + i);
+    const uint64_t hi_a = load_u64(a.hi + i);
+    const uint64_t x = lo_a ^ load_u64(b.lo + i);
+    const uint64_t y = hi_a ^ load_u64(b.hi + i);
+    const uint64_t s = ~(lo_a ^ hi_a);
+    d += std::popcount(x ^ y) + std::popcount(y) + 4 * std::popcount(x & y & s);
+  }
+  return d;
+}
