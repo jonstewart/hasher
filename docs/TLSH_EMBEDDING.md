@@ -193,12 +193,27 @@ Apple M-series core with a synthetic family corpus (k = 10, T = 144):
 
 | rows      | reference brute | kernel brute | cell index | IVF (this section) | IVF build |
 |-----------|-----------------|--------------|------------|--------------------|-----------|
-| 10,000    | 95 us           | 7.2 us       | 3.4 us     | 4.9 us             | 2.5 ms    |
-| 100,000   | 943 us          | 57 us        | 7.0 us     | 8.8 us             | 120 ms    |
-| 1,000,000 | 9.5 ms          | 553 us       | 16 us      | 8.0 us             | 1.5 s     |
+| 10,000    | 95 us           | 7.0 us       | 3.4 us     | 4.5 us             | 2 ms      |
+| 100,000   | 941 us          | 57 us        | 6.8 us     | 8.9 us             | 17 ms     |
+| 1,000,000 | 9.5 ms          | 566 us       | 16 us      | 8.3 us             | 1.4 s     |
 
 Per query. "Reference brute" is `Tlsh::totalDiff` over every row; "kernel
-brute" is the popcount kernel over every row (0.55 ns/row).
+brute" is the popcount kernel over every row (about 0.55 ns/row). At 1M rows
+the IVF scans about 4,800 rows per query against 18,900 for the cell index
+and 1,000,000 for brute force. The Criterion suite (`rust/tlsh-bench`, see its
+README) measures the same strategies through the C API over an hset file and
+reports the index at 17 us/query at 1M rows against 560 us (kernel brute) and
+3.0 ms (one `sfhash_tlsh_diff` FFI call per row).
+
+The optimization rounds, in order of payoff: grouping IVF lists by header
+cell instead of by L (exact header pruning, linear build); medoid digests
+with integer radii instead of float centroids (list bound = one kernel call);
+the NEON body kernel with per-query planes (3x on the scan); list size 32;
+parallel per-cell build; contiguous scans for single-list cells; a single
+compare per scanned row and prefetch for indirect list scans. Beyond this the
+query is dominated by scanning a few thousand rows at ~0.5 ns each plus a few
+hundred list bounds; the remaining lever is tighter lists at the cost of
+build time and index size.
 
 ## 6. Using the vectors from Python
 
