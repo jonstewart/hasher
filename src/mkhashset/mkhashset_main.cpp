@@ -22,14 +22,24 @@ empty column) marks a file with no TLSH digest:
 for i in $(find -type f) ; do echo $(md5sum $i | cut -f1 -d' ') $(tlsh -f $i | cut -f1) ; done >md5_tlsh.txt
 mkhashset 'Some test hashes' 'md5 and tlsh' md5 tlsh true true md5_tlsh.txt md5_tlsh.hset
 
+TLSH hashsets get the embedding vectors (TVEC) and the kNN index (TIVF) by
+default. Set HSET_TLSH_OPTIONS to a bitwise OR of SFHASH_HSET_TLSH_VECTORS (1)
+and SFHASH_HSET_TLSH_INDEX (2) to choose; 0 writes neither:
+
+HSET_TLSH_OPTIONS=0 mkhashset 'Some test hashes' 'md5 and tlsh' md5 tlsh true true md5_tlsh.txt md5_tlsh.hset
+
 */
 
+#include <cstdlib>
 #include <cstring>
 #include <exception>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <string>
 #include <vector>
+
+#include <boost/lexical_cast.hpp>
 
 #include "util.h"
 #include "hasher/hashset.h"
@@ -68,7 +78,18 @@ int main(int argc, char** argv) {
     const std::filesystem::path tmpdir = ".";
     std::ifstream in(infile);
 
-    write_hset(in, htypes, conv, argv[1], argv[2], outfile, tmpdir, with_records, with_hashsets);
+    // optional TLSH sections, both by default
+    uint32_t tlsh_options = SFHASH_HSET_TLSH_VECTORS | SFHASH_HSET_TLSH_INDEX;
+    if (const char* opts = std::getenv("HSET_TLSH_OPTIONS")) {
+      try {
+        tlsh_options = boost::lexical_cast<uint32_t>(opts);
+      }
+      catch (const boost::bad_lexical_cast&) {
+        THROW("HSET_TLSH_OPTIONS is not a nonnegative integer: '" << opts << "'");
+      }
+    }
+
+    write_hset(in, htypes, conv, argv[1], argv[2], outfile, tmpdir, with_records, with_hashsets, tlsh_options);
   }
   catch (const std::exception& e) {
     std::cerr << "Error: " << e.what() << std::endl;

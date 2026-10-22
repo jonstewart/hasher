@@ -12,6 +12,7 @@
 #include "rwutil.h"
 #include "hasher/hashset.h"
 #include "hashset/hset_structs.h"
+#include "hashset/tlsh_ivf.h"
 
 struct SFHASH_HashsetBuildCtx {
   TableOfContents ftoc;
@@ -37,6 +38,13 @@ struct SFHASH_HashsetBuildCtx {
   std::vector<std::ofstream> tmp_hashes_out;
 
   size_t field_pos;
+
+  // which optional TLSH sections to write, SFHASH_HSET_TLSH_* bits
+  uint32_t tlsh_options = SFHASH_HSET_TLSH_VECTORS | SFHASH_HSET_TLSH_INDEX;
+
+  // one per field: the TIVF index of a TLSH field that gets one, built from
+  // the sorted rows before the layout is computed; empty otherwise
+  std::vector<TlshIvf> tlsh_ivfs;
 };
 
 size_t write_hashset(
@@ -65,7 +73,8 @@ void write_hset(
   const std::filesystem::path& outfile,
   const std::filesystem::path& tmpdir,
   bool with_records,
-  bool with_hashsets
+  bool with_hashsets,
+  uint32_t tlsh_options = SFHASH_HSET_TLSH_VECTORS | SFHASH_HSET_TLSH_INDEX
 );
 
 std::vector<

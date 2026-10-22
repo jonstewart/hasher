@@ -91,7 +91,10 @@ averages about 0.78 of the TLSH distance (see `test/test_tlsh_embedding.cpp`).
 
 ## 2. Section TVEC (vectors)
 
-Optional, one per TLSH hash set, following that set's `HDAT`/`RIDX`. Payload:
+Optional, one per TLSH hash set, following that set's `HDAT`/`RIDX`. Like
+every section it is an hset chunk: a 4-byte type `"TVEC"` (0x54564543), a
+little-endian u64 payload length, then the payload below. It may only follow
+a TLSH hash set; readers reject it elsewhere. Payload:
 
 | offset | type | field    | meaning                                  |
 |--------|------|----------|------------------------------------------|
@@ -106,17 +109,23 @@ Optional, one per TLSH hash set, following that set's `HDAT`/`RIDX`. Payload:
 | 32     | f32  | data     | n × dims, row-major, row r is phi(HDAT row r) |
 
 The chunk is positioned so that `data` begins on a 4096-byte boundary in the
-file; `offset(TVEC chunk) + 12 + 32` is page aligned. A consumer can therefore
-memory-map the file and hand `numpy.memmap(path, np.float32, offset=..., shape=(n, 264))`
+file; `offset(TVEC chunk) + 12 + 32` is page aligned, with zero padding
+inserted before the chunk as needed. A consumer can therefore memory-map the
+file and hand `numpy.memmap(path, np.float32, offset=..., shape=(n, 264))`
 or a `float*` straight to faiss, hnswlib, scikit-learn, HDBSCAN, UMAP, etc.
-`utils/hsvectors.py` shows this.
+In C, `sfhash_hashset_tlsh_vectors` returns the pointer.
+
+The writer emits `TVEC` by default for TLSH fields; see
+`sfhash_hashset_builder_set_tlsh_options` (`SFHASH_HSET_TLSH_VECTORS`).
 
 ## 3. Section TIVF (inverted-file index)
 
 Optional, following `TVEC` (or `HDAT`/`RIDX` when no vectors are stored; the
-index does not need the vectors, it embeds digests on the fly). Lists never
-span L values: rows are grouped by L, and each group is split by k-means over
-the embedding into about `ceil(group_size / target_list_size)` lists.
+index does not need the vectors, it embeds digests on the fly). The chunk type
+is `"TIVF"` (0x54495646), framed like `TVEC`, and likewise only valid after a
+TLSH hash set. Lists never span L values: rows are grouped by L, and each
+group is split by k-means over the embedding into about
+`ceil(group_size / target_list_size)` lists (the writer uses a target of 128).
 
 | offset | type       | field       | meaning                                      |
 |--------|------------|-------------|----------------------------------------------|
@@ -125,13 +134,22 @@ the embedding into about `ceil(group_size / target_list_size)` lists.
 | 4      | u32        | dims        | 264                                          |
 | 8      | u32        | lists       | C                                            |
 | 12     | u32        | reserved    | 0                                            |
-| 16     | u64        | n           | row count                                    |
+| 16     | u64        | n           | row count, equals the HDAT hash count        |
 | 24     | u64        | reserved    | 0                                            |
 | 32     | f32[C×dims]| centroids   | one embedding-space point per list           |
 |        | f32[C]     | radius      | max Euclidean distance from centroid to a member |
-|        | f32[C]     | radius_xlen | same, over dims except 256                   |
 |        | u64[C+1]   | list_start  | CSR offsets into ids                         |
 |        | u32[n]     | ids         | HDAT row indexes, ascending within each list |
+
+There is a single radius array: because a list never spans L values, a
+member's distance to the centroid is the same with or without dim 256, so
+the radius serves both the with-length and the without-length search. Only
+the header, the lengths and the list offsets are validated at load time.
+
+The writer emits `TIVF` by default for TLSH fields
+(`SFHASH_HSET_TLSH_INDEX`). `sfhash_hashset_tlsh_knn` uses it when present
+and falls back to brute force otherwise; `sfhash_hashset_tlsh_knn_strategies`
+reports which is available and `sfhash_hashset_tlsh_knn_with` picks one.
 
 ## 4. Indexed kNN (exact for diff <= 144)
 
@@ -146,5 +164,6 @@ Given query digest q, k, max_distance T ≤ 144:
    `||v - phi(r)||^2 <= diff(q, r)` when `diff(q, r) <= 144`; so every row with
    `diff < tau <= 145` lives in a list with `b_c < tau`.
 
-The same procedure with `include_length = false` uses `radius_xlen` and the
-distance over dims except 256, and is exact for every T.
+The same procedure with `include_length = false` uses the distance over dims
+except 256 (and the same radius, see above), and is exact for every T. With
+the length included, a T above 144 is clamped to 144 by the indexed search.

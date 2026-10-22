@@ -10,16 +10,21 @@
 #include "throw.h"
 #include "hashset/hset_structs.h"
 #include "hashset/lookupstrategy.h"
+#include "hashset/tlsh_ivf.h"
 
 struct Holder {
   FileHeader fhdr;
+  // one entry per hashset section; the TLSH vectors and index are empty
+  // unless the section has TVEC/TIVF chunks (TLSH hashsets only)
   std::vector<
     std::tuple<
       HashsetHeader,
       HashsetHint,
       ConstHashsetData,
       std::unique_ptr<LookupStrategy>,
-      ConstRecordIndex
+      ConstRecordIndex,
+      ConstTlshVectors,
+      TlshIvfView
     >
   > hsets;
   RecordHeader rhdr;
@@ -40,6 +45,8 @@ struct State {
     HHDR,
     HINT,
     HDAT,
+    RIDX,
+    TVEC,
     DONE
   };
 };
@@ -135,7 +142,15 @@ State::Type handle_rhdr(const Chunk& ch, Holder& h);
 
 State::Type handle_ftoc(const Chunk& ch, Holder& h);
 
+State::Type handle_hint(const Chunk& ch, Holder& h);
+
 State::Type handle_hdat(const Chunk& ch, Holder& h);
+
+State::Type handle_ridx(const Chunk& ch, Holder& h);
+
+State::Type handle_tvec(const Chunk& ch, Holder& h);
+
+State::Type handle_tivf(const Chunk& ch, Holder& h);
 
 State::Type handle_rdat(const Chunk& ch, Holder& h);
 
@@ -227,9 +242,24 @@ Holder decode_chunks(ChunkIterator ch, ChunkIterator ch_end) {
         }
         break;
 
+      // HDAT [RIDX] [TVEC] [TIVF], then the next section
       case State::HDAT:
         if (ch->type == Chunk::RIDX) {
           state = handle_ridx(*ch++, h);
+          break;
+        }
+        [[fallthrough]];
+
+      case State::RIDX:
+        if (ch->type == Chunk::TVEC) {
+          state = handle_tvec(*ch++, h);
+          break;
+        }
+        [[fallthrough]];
+
+      case State::TVEC:
+        if (ch->type == Chunk::TIVF) {
+          state = handle_tivf(*ch++, h);
         }
         else {
           state = State::SBRK;

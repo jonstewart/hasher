@@ -12,6 +12,9 @@
 struct binary_fuse8_s;
 using binary_fuse8_t = binary_fuse8_s;
 
+struct TlshDigest;
+struct TlshIvf;
+
 template <auto func, typename... Args>
 size_t length_chunk(Args&&... args)
 {
@@ -166,6 +169,43 @@ size_t write_ridx(
   const RecordIndex& ridx,
   char* out
 );
+
+//
+// TVEC: the embedding vectors of a TLSH hashset, see docs/TLSH_EMBEDDING.md
+//
+
+// the float data of a TVEC chunk starts on a boundary of this many bytes
+constexpr uint64_t TVEC_DATA_ALIGNMENT = 4096;
+
+// padding to insert before a TVEC chunk at pos so that its float data
+// (pos + 12-byte chunk header + 32-byte payload header) is aligned
+size_t length_tvec_alignment_padding(uint64_t pos);
+
+size_t length_tvec_data(uint64_t hash_count);
+
+size_t length_tvec(uint64_t hash_count);
+
+// rows [beg, end) are the sorted HDAT rows
+size_t write_tvec_data(
+  const TlshDigest* beg,
+  const TlshDigest* end,
+  char* out
+);
+
+size_t write_tvec(
+  const TlshDigest* beg,
+  const TlshDigest* end,
+  char* out
+);
+
+//
+// TIVF: the inverted-file index of a TLSH hashset, see hashset/tlsh_ivf.h
+// for the payload functions
+//
+
+size_t length_tivf(uint32_t lists, uint64_t hash_count);
+
+size_t write_tivf(const TlshIvf& ivf, char* out);
 
 size_t length_rhdr_data(
   const std::vector<RecordFieldDescriptor>& fields

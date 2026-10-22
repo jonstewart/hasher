@@ -1,6 +1,7 @@
 #pragma once
 
 #include <array>
+#include <cstddef>
 #include <cstdint>
 #include <iosfwd>
 #include <string>
@@ -134,6 +135,29 @@ struct ConstRecordIndex {
   }
 };
 
+/*
+ * TVEC payload: a 32-byte header followed by n x dims float32 values,
+ * row-major, row r being the embedding of HDAT row r. See
+ * docs/TLSH_EMBEDDING.md section 2.
+ */
+constexpr size_t TVEC_HEADER_LENGTH = 32;
+constexpr uint32_t TVEC_DTYPE_FLOAT32 = 1;
+
+// the float data of a TVEC section, pointing into mapped memory; empty when
+// the hashset has no vectors
+struct ConstTlshVectors {
+  uint32_t dims = 0;
+  uint64_t n = 0;
+  const float* data = nullptr;
+
+  bool empty() const { return !data; }
+
+// C++20: bool operator==(const ConstTlshVectors&) const = default;
+  bool operator==(const ConstTlshVectors& o) const {
+    return dims == o.dims && n == o.n && data == o.data;
+  }
+};
+
 struct RecordFieldDescriptor {
   /*
   * This is a workaround for clang <= 15. Once 16 is out
@@ -203,6 +227,8 @@ struct Chunk {
     HINT = 0x48494E54,
     FLTR = 0x464C5452,
     RIDX = 0x52494458,
+    TVEC = 0x54564543,
+    TIVF = 0x54495646,
     FEND = 0x46454E44
   };
 

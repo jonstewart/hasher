@@ -6,6 +6,9 @@
 #include "util.h"
 #include "hasher/common.h"
 #include "hashset/tlsh_cells.h"
+#include "hashset/tlsh_ivf.h"
+#include "tlsh_digest.h"
+#include "tlsh_embedding.h"
 
 #include <cstring>
 #include <numeric>
@@ -354,6 +357,71 @@ size_t write_ridx(
     out,
     "RIDX",
     ridx
+  );
+}
+
+size_t length_tvec_alignment_padding(uint64_t pos) {
+  return length_alignment_padding(pos + 12 + TVEC_HEADER_LENGTH, TVEC_DATA_ALIGNMENT);
+}
+
+size_t length_tvec_data(uint64_t hash_count) {
+  return TVEC_HEADER_LENGTH + hash_count * TLSH_EMBED_DIMS * sizeof(float);
+}
+
+size_t length_tvec(uint64_t hash_count) {
+  return length_chunk<length_tvec_data>(hash_count);
+}
+
+size_t write_tvec_data(
+  const TlshDigest* beg,
+  const TlshDigest* end,
+  char* out)
+{
+  const char* obeg = out;
+
+  out += write_le<uint16_t>(1, out);                              // version
+  out += write_byte(1, 0, out);                                   // variant
+  out += write_byte(1, 0, out);                                   // flags
+  out += write_le<uint32_t>(TLSH_EMBED_DIMS, out);                // dims
+  out += write_le<uint64_t>(end - beg, out);                      // n
+  out += write_le<uint32_t>(TVEC_DTYPE_FLOAT32, out);             // dtype
+  out += write_le<uint32_t>(0, out);                              // reserved
+  out += write_le<uint64_t>(0, out);                              // reserved
+
+  // embed via a local row so that out need not be float-aligned
+  float row[TLSH_EMBED_DIMS];
+  for (const TlshDigest* d = beg; d != end; ++d) {
+    tlsh_embed(*d, row);
+    out += write_bytes(row, sizeof(row), out);
+  }
+
+  return out - obeg;
+}
+
+size_t write_tvec(
+  const TlshDigest* beg,
+  const TlshDigest* end,
+  char* out)
+{
+  return write_chunk(
+    write_tvec_data,
+    out,
+    "TVEC",
+    beg,
+    end
+  );
+}
+
+size_t length_tivf(uint32_t lists, uint64_t hash_count) {
+  return length_chunk<length_tivf_data>(lists, hash_count);
+}
+
+size_t write_tivf(const TlshIvf& ivf, char* out) {
+  return write_chunk(
+    write_tivf_data,
+    out,
+    "TIVF",
+    ivf
   );
 }
 

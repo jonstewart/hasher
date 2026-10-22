@@ -2,6 +2,7 @@
 
 #include "throw.h"
 #include "rwutil.h"
+#include "tlsh_embedding.h"
 
 Chunk decode_chunk(const uint8_t* beg, const uint8_t*& cur, const uint8_t* end) {
   const uint32_t type = read_be<uint32_t>(beg, cur, end);
@@ -90,6 +91,45 @@ ConstRecordIndex parse_ridx(const Chunk& ch) {
 
 ConstHashsetData parse_hdat(const Chunk& ch) {
   return { ch.dbeg, ch.dend };
+}
+
+ConstTlshVectors parse_tvec(const Chunk& ch) {
+  const uint8_t* cur = ch.dbeg;
+
+  const uint16_t version = read_le<uint16_t>(ch.dbeg, cur, ch.dend);
+  THROW_IF(version != 1, "unsupported TVEC version " << version);
+
+  const uint8_t variant = read_le<uint8_t>(ch.dbeg, cur, ch.dend);
+  THROW_IF(variant != 0, "unsupported TVEC variant " << static_cast<unsigned>(variant));
+
+  read_le<uint8_t>(ch.dbeg, cur, ch.dend); // flags
+
+  ConstTlshVectors tv;
+  tv.dims = read_le<uint32_t>(ch.dbeg, cur, ch.dend);
+  THROW_IF(tv.dims != TLSH_EMBED_DIMS, "unsupported TVEC dims " << tv.dims);
+
+  tv.n = read_le<uint64_t>(ch.dbeg, cur, ch.dend);
+
+  const uint32_t dtype = read_le<uint32_t>(ch.dbeg, cur, ch.dend);
+  THROW_IF(dtype != TVEC_DTYPE_FLOAT32, "unsupported TVEC dtype " << dtype);
+
+  read_le<uint32_t>(ch.dbeg, cur, ch.dend); // reserved
+  read_le<uint64_t>(ch.dbeg, cur, ch.dend); // reserved
+
+  const uint64_t row_len = static_cast<uint64_t>(tv.dims) * sizeof(float);
+  const uint64_t avail = ch.dend - cur;
+  THROW_IF(
+    avail % row_len != 0 || avail / row_len != tv.n,
+    "TVEC has " << avail << " bytes of vector data, "
+    "expected " << tv.n << " rows of " << row_len
+  );
+
+  tv.data = reinterpret_cast<const float*>(cur);
+  return tv;
+}
+
+TlshIvfView parse_tivf(const Chunk& ch) {
+  return parse_tivf_data(ch.dbeg, ch.dend);
 }
 
 ConstRecordData parse_rdat(const Chunk& ch) {
