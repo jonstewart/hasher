@@ -160,6 +160,7 @@ test_test_SOURCES = \
 	test/test_hset_encoder.cpp \
 	test/test_hset_encoder_chunks.cpp \
 	test/test_hset_merge.cpp \
+	test/test_hset_merge_incremental.cpp \
 	test/test_hset_ops.cpp \
 	test/test_hset_round_trip.cpp \
 	test/test_hset_tlsh.cpp \

@@ -837,12 +837,14 @@ TEST_CASE("hashset_builder_setop_open_overlong_desc") {
   }
 }
 
-TEST_CASE("hashset_builder_setop_open_field_mismatch") {
+TEST_CASE("hashset_builder_setop_open_widens_fields") {
+  // inputs with different fields are merged over the union of the fields
+  // (left's, then right's extras); the open reports the output's fields
   SFHASH_Hashset l;
-  l.holder.rhdr = RecordHeader{ 17, 1, { {SFHASH_MD5, "MD5", 16} } };
+  l.holder.rhdr = RecordHeader{ 17, 0, { {SFHASH_MD5, "MD5", 16} } };
 
   SFHASH_Hashset r;
-  r.holder.rhdr = RecordHeader{ 17, 1, { {SFHASH_SHA_1, "SHA-1", 20} } };
+  r.holder.rhdr = RecordHeader{ 21, 0, { {SFHASH_SHA_1, "SHA-1", 20} } };
 
   SFHASH_Error* err = nullptr;
 
@@ -850,6 +852,11 @@ TEST_CASE("hashset_builder_setop_open_field_mismatch") {
     std::make_pair(sfhash_hashset_builder_union_open, "union"),
     std::make_pair(sfhash_hashset_builder_intersect_open, "intersection"),
     std::make_pair(sfhash_hashset_builder_subtract_open, "difference")
+  };
+
+  const std::vector<RecordFieldDescriptor> exp_fields = {
+    { SFHASH_MD5, "MD5", 16 },
+    { SFHASH_SHA_1, "SHA-1", 20 }
   };
 
   for (const auto& [func, name]: tests) {
@@ -869,11 +876,35 @@ TEST_CASE("hashset_builder_setop_open_field_mismatch") {
         sfhash_hashset_builder_destroy
       );
 
-      CHECK(!hctx);
-      REQUIRE(err);
-
-      sfhash_free_error(err);
-      err = nullptr;
+      CHECK(!err);
+      if (err) {
+        FAIL(err->message);
+      }
+      REQUIRE(hctx);
+      CHECK(hctx->fhdr.name == "123");
+      CHECK(hctx->fhdr.desc == "abc");
+      CHECK(hctx->rhdr.fields == exp_fields);
+      CHECK(hctx->rhdr.record_length == 38);
     }
   }
+}
+
+TEST_CASE("hashset_builder_setop_open_field_length_mismatch") {
+  // the same type with different lengths cannot be merged
+  SFHASH_Hashset l;
+  l.holder.rhdr = RecordHeader{ 17, 0, { {SFHASH_MD5, "MD5", 16} } };
+
+  SFHASH_Hashset r;
+  r.holder.rhdr = RecordHeader{ 21, 0, { {SFHASH_MD5, "MD5", 20} } };
+
+  SFHASH_Error* err = nullptr;
+
+  const auto hctx = make_unique_del(
+    sfhash_hashset_builder_union_open(&l, &r, "123", "abc", true, true, "test/bogus.hset", "test", &err),
+    sfhash_hashset_builder_destroy
+  );
+
+  CHECK(!hctx);
+  REQUIRE(err);
+  sfhash_free_error(err);
 }

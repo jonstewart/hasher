@@ -143,7 +143,7 @@ Loaded build_input(const std::string& path, size_t beg, size_t end, bool with_re
 Loaded merge(const Loaded& l, const Loaded& r, uint32_t op, const std::string& path, uint32_t opts) {
   SFHASH_Error* err = nullptr;
   const uint64_t size = sfhash_hashset_merge(
-    l.get(), r.get(), op, "merged", "merge test output", path.c_str(), opts, &err
+    l.get(), r.get(), op, "merged", "merge test output", path.c_str(), opts, SFHASH_HSET_COALESCE_DEFAULT, &err
   );
   if (err) {
     FAIL(err->message);
@@ -330,7 +330,14 @@ std::vector<SFHASH_TlshMatch> knn_with(const SFHASH_Hashset* hset, size_t tidx, 
   return out;
 }
 
-void check_tlsh_section(const Loaded& o, size_t tidx, bool want_vec, bool want_idx) {
+// whether the inputs' TLSH sections both have an index, so that the output
+// index is merged (and coalesced) rather than built from scratch
+bool has_index(const Loaded& x) {
+  const int tidx = sfhash_hashset_index_for_type(x.get(), SFHASH_TLSH);
+  return tidx < 0 || !std::get<TlshIvfView>(x.get()->holder.hsets[tidx]).empty();
+}
+
+void check_tlsh_section(const Loaded& o, size_t tidx, bool want_vec, bool want_idx, bool merged_index) {
   const SFHASH_Hashset* hset = o.get();
   const auto& hs = hset->holder.hsets[tidx];
   const uint64_t n = std::get<HashsetHeader>(hs).hash_count;
@@ -392,6 +399,7 @@ void check_tlsh_section(const Loaded& o, size_t tidx, bool want_vec, bool want_i
       for (uint32_t l = ivf.cell_lists[c]; l < ivf.cell_lists[c + 1]; ++l) {
         const uint64_t lb = ivf.list_start[l], le = ivf.list_start[l + 1];
         REQUIRE(lb < le);
+        uint32_t tight = 0;
         for (uint64_t i = lb; i < le; ++i) {
           if (i > lb) {
             REQUIRE(ivf.ids[i - 1] < ivf.ids[i]);
@@ -399,8 +407,17 @@ void check_tlsh_section(const Loaded& o, size_t tidx, bool want_vec, bool want_i
           REQUIRE(ivf.ids[i] < n);
           REQUIRE(tlsh_cell_id(rows[ivf.ids[i]]) == c);
           REQUIRE(tlsh_embed_body_dist2(ivf.medoids[l], rows[ivf.ids[i]]) <= ivf.radius2[l]);
+          tight = std::max(tight, tlsh_embed_body_dist2(ivf.medoids[l], rows[ivf.ids[i]]));
         }
+        // radii are exact: a fresh build computes them, a merge recomputes
+        // the radius of a list that lost members and of a coalesced pair
+        CHECK(ivf.radius2[l] == tight);
       }
+    }
+    // a merged index is coalesced; a fresh k-means build need not satisfy
+    // the invariant (its list sizes are whatever the clustering gives)
+    if (merged_index) {
+      CHECK(tlsh_ivf_check_invariant(ivf, TLSH_IVF_DEFAULT_COALESCE));
     }
 
     // search: index == brute == index over a from-scratch rebuild
@@ -500,7 +517,7 @@ void check_output(const Loaded& o, const Loaded& l, const Loaded& r, uint32_t op
   // TLSH derived structures
   const int tidx = sfhash_hashset_index_for_type(hset, SFHASH_TLSH);
   if (tidx >= 0) {
-    check_tlsh_section(o, tidx, want_vec, want_idx);
+    check_tlsh_section(o, tidx, want_vec, want_idx, has_index(l) && has_index(r));
   }
   else {
     CHECK(count_type(o.toc, Chunk::TVEC) == 0);
@@ -602,7 +619,7 @@ TEST_CASE("merge_tlsh_ivf_remaps_and_drops") {
     kept.push_back(rows[i]);
   }
 
-  const TlshIvf m = merge_tlsh_ivf(view, map.data(), TlshIvfView(), nullptr, kept.size());
+  const TlshIvf m = merge_tlsh_ivf(view, map.data(), TlshIvfView(), nullptr, kept.data(), kept.size());
   CHECK(m.n == kept.size());
   CHECK(m.ids.size() == kept.size());
   CHECK(m.lists() <= ivf.lists());
@@ -631,7 +648,7 @@ TEST_CASE("merge_tlsh_ivf_remaps_and_drops") {
 
   // wrong maps are rejected: a row count that disagrees with the map, and a
   // map that is not increasing within a list
-  CHECK_THROWS(merge_tlsh_ivf(view, map.data(), TlshIvfView(), nullptr, kept.size() + 1));
+  CHECK_THROWS(merge_tlsh_ivf(view, map.data(), TlshIvfView(), nullptr, kept.data(), kept.size() + 1));
   for (size_t l = 0; l < ivf.lists(); ++l) {
     std::vector<uint32_t> kept_members;
     for (uint64_t i = ivf.list_start[l]; i < ivf.list_start[l + 1]; ++i) {
@@ -642,7 +659,7 @@ TEST_CASE("merge_tlsh_ivf_remaps_and_drops") {
     if (kept_members.size() >= 2) {
       std::vector<uint32_t> bad(map);
       std::swap(bad[kept_members[0]], bad[kept_members[1]]);
-      CHECK_THROWS(merge_tlsh_ivf(view, bad.data(), TlshIvfView(), nullptr, kept.size()));
+      CHECK_THROWS(merge_tlsh_ivf(view, bad.data(), TlshIvfView(), nullptr, kept.data(), kept.size()));
       break;
     }
   }
@@ -759,13 +776,13 @@ TEST_CASE("hset_merge_errors") {
   SFHASH_Error* err = nullptr;
 
   // unknown op
-  CHECK(sfhash_hashset_merge(a.get(), b.get(), 7, "x", "y", "test/merge_err_out.hset", INHERIT, &err) == 0);
+  CHECK(sfhash_hashset_merge(a.get(), b.get(), 7, "x", "y", "test/merge_err_out.hset", INHERIT, SFHASH_HSET_COALESCE_DEFAULT, &err) == 0);
   REQUIRE(err);
   sfhash_free_error(err);
   err = nullptr;
 
   // null operand
-  CHECK(sfhash_hashset_merge(a.get(), nullptr, SFHASH_HSET_OP_UNION, "x", "y", "test/merge_err_out.hset", INHERIT, &err) == 0);
+  CHECK(sfhash_hashset_merge(a.get(), nullptr, SFHASH_HSET_OP_UNION, "x", "y", "test/merge_err_out.hset", INHERIT, SFHASH_HSET_COALESCE_DEFAULT, &err) == 0);
   REQUIRE(err);
   sfhash_free_error(err);
   err = nullptr;
@@ -773,7 +790,7 @@ TEST_CASE("hset_merge_errors") {
   // records-only against a file with hash sections
   const Loaded ro = build_input("test/merge_err_ro.hset", corpus(), 0, 100, { SFHASH_MD5, SFHASH_TLSH }, true, false, BOTH);
   CHECK(ro.get()->holder.hsets.empty());
-  CHECK(sfhash_hashset_merge(a.get(), ro.get(), SFHASH_HSET_OP_UNION, "x", "y", "test/merge_err_out.hset", INHERIT, &err) == 0);
+  CHECK(sfhash_hashset_merge(a.get(), ro.get(), SFHASH_HSET_OP_UNION, "x", "y", "test/merge_err_out.hset", INHERIT, SFHASH_HSET_COALESCE_DEFAULT, &err) == 0);
   REQUIRE(err);
   sfhash_free_error(err);
   err = nullptr;
@@ -804,7 +821,7 @@ TEST_CASE("hset_merge_timing") {
   SFHASH_Error* err = nullptr;
   const uint64_t size = sfhash_hashset_merge(
     a.get(), b.get(), SFHASH_HSET_OP_UNION, "big", "big union",
-    "test/merge_big_out.hset", INHERIT, &err
+    "test/merge_big_out.hset", INHERIT, SFHASH_HSET_COALESCE_DEFAULT, &err
   );
   const auto t1 = clock::now();
   if (err) {
@@ -839,7 +856,7 @@ TEST_CASE("hset_merge_timing") {
   const auto t4 = clock::now();
   REQUIRE(sfhash_hashset_merge(
     a.get(), b.get(), SFHASH_HSET_OP_UNION, "big", "big union",
-    "test/merge_big_out_idx.hset", SFHASH_HSET_TLSH_INDEX, &err
+    "test/merge_big_out_idx.hset", SFHASH_HSET_TLSH_INDEX, SFHASH_HSET_COALESCE_DEFAULT, &err
   ) > 0);
   const auto t5 = clock::now();
   REQUIRE(!err);
@@ -864,4 +881,137 @@ TEST_CASE("hset_merge_timing") {
             << " ms, from-scratch build " << ms(t3 - t2) << " ms (" << o.buf.size() / (1024 * 1024) << " MiB file)"
             << "\n  TIVF only:        merge " << ms(t5 - t4)
             << " ms, from-scratch build " << ms(t6 - t5) << " ms" << std::endl;
+}
+
+namespace {
+
+using SetopOpen = SFHASH_HashsetBuildCtx* (*)(
+  const SFHASH_Hashset*, const SFHASH_Hashset*, const char*, const char*,
+  bool, bool, const char*, const char*, SFHASH_Error**
+);
+
+const std::pair<SetopOpen, uint32_t> SETOPS[] = {
+  { sfhash_hashset_builder_union_open, SFHASH_HSET_OP_UNION },
+  { sfhash_hashset_builder_intersect_open, SFHASH_HSET_OP_INTERSECT },
+  { sfhash_hashset_builder_subtract_open, SFHASH_HSET_OP_DIFFERENCE }
+};
+
+// the builder-shaped set operation: open, optional setup, write, load
+Loaded setop(SetopOpen open, const Loaded& l, const Loaded& r, bool write_records, bool write_hashsets, const std::string& path, uint32_t tlsh_options) {
+  SFHASH_Error* err = nullptr;
+  auto bctx = make_unique_del(
+    open(l.get(), r.get(), "merged", "builder set operation", write_records, write_hashsets, path.c_str(), "test", &err),
+    sfhash_hashset_builder_destroy
+  );
+  if (err) {
+    FAIL(err->message);
+  }
+  REQUIRE(bctx);
+  sfhash_hashset_builder_set_tlsh_options(bctx.get(), tlsh_options);
+  const uint64_t size = sfhash_hashset_builder_write(bctx.get(), &err);
+  if (err) {
+    FAIL(err->message);
+  }
+  REQUIRE(size > 0);
+  Loaded o = load_file(path);
+  REQUIRE(o.buf.size() == size);
+  return o;
+}
+
+} // namespace
+
+TEST_CASE("hset_builder_setops_are_merges") {
+  // the builder-shaped set operations write what sfhash_hashset_merge
+  // writes: same rows, records and derived structures
+  for (const bool with_records: { true, false }) {
+    const std::string tag = with_records ? "rec" : "ho";
+    const Loaded a = build_input("test/setop_a_" + tag + ".hset", 0, 6000, with_records, BOTH);
+    const Loaded b = build_input("test/setop_b_" + tag + ".hset", 3000, 9000, with_records, BOTH);
+
+    for (const auto& [open, op]: SETOPS) {
+      const Loaded o = setop(open, a, b, true, true, "test/setop_out_" + tag + ".hset", INHERIT);
+      check_output(o, a, b, op, true, true);
+
+      const Loaded m = merge(a, b, op, "test/setop_merge_" + tag + ".hset", INHERIT);
+      for (const auto t: { SFHASH_MD5, SFHASH_TLSH }) {
+        CHECK(rows_of(o.get(), t) == rows_of(m.get(), t));
+      }
+      CHECK(o.get()->holder.rhdr.fields == m.get()->holder.rhdr.fields);
+      CHECK(o.get()->holder.rhdr.record_count == m.get()->holder.rhdr.record_count);
+      // the files differ only in the FHDR timestamp and description
+      CHECK(o.buf.size() == m.buf.size());
+      const auto& ohs = o.get()->holder.hsets;
+      const auto& mhs = m.get()->holder.hsets;
+      REQUIRE(ohs.size() == mhs.size());
+      for (size_t i = 0; i < ohs.size(); ++i) {
+        const auto& oi = std::get<TlshIvfView>(ohs[i]);
+        const auto& mi = std::get<TlshIvfView>(mhs[i]);
+        CHECK(oi.lists == mi.lists);
+        if (!oi.empty() && !mi.empty()) {
+          CHECK(std::memcmp(oi.radius2, mi.radius2, oi.lists * sizeof(uint32_t)) == 0);
+          CHECK(std::memcmp(oi.ids, mi.ids, oi.n * sizeof(uint32_t)) == 0);
+        }
+      }
+    }
+  }
+}
+
+TEST_CASE("hset_builder_setops_write_flags") {
+  const Loaded a = build_input("test/setop_fl_a.hset", 0, 6000, true, BOTH);
+  const Loaded b = build_input("test/setop_fl_b.hset", 3000, 9000, true, BOTH);
+
+  for (const auto& [open, op]: SETOPS) {
+    // hashsets only: the operation is applied to the records, rows follow
+    // their records and are then written once each
+    {
+      const Loaded o = setop(open, a, b, false, true, "test/setop_fl_ho.hset", INHERIT);
+      CHECK(o.get()->holder.rhdr.fields.empty());
+      CHECK(count_type(o.toc, Chunk::RIDX) == 0);
+      const Loaded full = merge(a, b, op, "test/setop_fl_full.hset", INHERIT);
+      REQUIRE(o.get()->holder.hsets.size() == full.get()->holder.hsets.size());
+      for (const auto t: { SFHASH_MD5, SFHASH_TLSH }) {
+        CHECK(rows_of(o.get(), t) == unique_rows(rows_of(full.get(), t)));
+      }
+      const int tidx = sfhash_hashset_index_for_type(o.get(), SFHASH_TLSH);
+      REQUIRE(tidx >= 0);
+      check_tlsh_section(o, tidx, true, true, true);
+    }
+
+    // records only
+    {
+      const Loaded o = setop(open, a, b, true, false, "test/setop_fl_ro.hset", INHERIT);
+      CHECK(o.get()->holder.hsets.empty());
+      const Loaded full = merge(a, b, op, "test/setop_fl_full.hset", INHERIT);
+      CHECK(o.get()->holder.rhdr.fields == full.get()->holder.rhdr.fields);
+      CHECK(o.get()->holder.rhdr.record_count == full.get()->holder.rhdr.record_count);
+      CHECK(std::equal(o.get()->holder.rdat.beg, o.get()->holder.rdat.end, full.get()->holder.rdat.beg, full.get()->holder.rdat.end));
+    }
+  }
+
+  // the TLSH options apply as for the builder: the default writes both
+  // sections even when the inputs lack them
+  {
+    const Loaded na = build_input("test/setop_fl_na.hset", 0, 3000, true, NONE);
+    const Loaded nb = build_input("test/setop_fl_nb.hset", 1000, 4000, true, NONE);
+    const Loaded both = setop(sfhash_hashset_builder_union_open, na, nb, true, true, "test/setop_fl_both.hset", BOTH);
+    check_output(both, na, nb, SFHASH_HSET_OP_UNION, true, true);
+    const Loaded none = setop(sfhash_hashset_builder_union_open, na, nb, true, true, "test/setop_fl_none.hset", INHERIT);
+    check_output(none, na, nb, SFHASH_HSET_OP_UNION, false, false);
+  }
+
+  // adding to a set-operation context is an error at write
+  {
+    SFHASH_Error* err = nullptr;
+    auto bctx = make_unique_del(
+      sfhash_hashset_builder_union_open(a.get(), b.get(), "x", "y", true, true, "test/setop_fl_err.hset", "test", &err),
+      sfhash_hashset_builder_destroy
+    );
+    REQUIRE(bctx);
+    REQUIRE(!err);
+    const uint8_t hash[16] = {};
+    sfhash_hashset_builder_add_hash(bctx.get(), hash, sizeof(hash));
+    CHECK(sfhash_hashset_builder_write(bctx.get(), &err) == 0);
+    REQUIRE(err);
+    sfhash_free_error(err);
+  }
 }
