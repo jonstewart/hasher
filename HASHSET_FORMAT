@@ -144,8 +144,14 @@ or difference (left minus right) of two hset files by merging, not by
 rebuilding: every HDAT is the two-pointer merge of the inputs' sorted rows,
 and each derived structure is carried through that merge by the row map
 (old row -> new row, or dropped) in O(n) with no sort, no re-embedding and
-no re-clustering. The builder-based sfhash_hashset_builder_*_open functions
-remain and rebuild everything from the record tables.
+no re-clustering. The builder-shaped sfhash_hashset_builder_union_open,
+_intersect_open and _subtract_open are the same operation behind the
+builder's open / write / destroy sequence: the context remembers the two
+inputs and the operation, sfhash_hashset_builder_write performs the merge
+(records when both inputs have them and write_records is set, hash
+sections when the inputs have them and write_hashsets is set), and
+sfhash_hashset_builder_set_tlsh_options / _set_coalesce_threshold apply to
+it. Nothing can be added to such a context.
 
 Hash sections. The output has a section for every hash type present in
 either input (left's types in left's order, then right's extras), with the
@@ -163,27 +169,45 @@ them), and RIDX is remapped through the record map. When only one input
 has records, or neither, the output is a hashsets-only file: no RHDR, RDAT
 or RIDX, and equal rows (within or across the inputs) are written once. A
 records-only input (RDAT but no hash sections) can only be merged with
-another records-only input, giving a records-only output.
+another records-only input, giving a records-only output. When both inputs
+have records but the record table is not written (write_records false),
+the operation is still applied to the records and the rows follow them;
+the hashsets-only output then has each row once.
 
 Cell index (HINT 0x7400) is recomputed from the merged rows as a prefix
 sum.
 
 TVEC rows are copied from the input that contributed the row; a row from
 an input without vectors is embedded with tlsh_embed. TIVF lists are
-carried through merge_tlsh_ivf: per cell, the left input's lists followed
-by the right's, ids remapped, dropped ids removed, lists that become empty
-omitted, medoids and radii unchanged. The members of an output list are a
-subset of the input list's, so the stored radius remains a valid bound and
-the indexed search stays exact. If either input lacks a TIVF and the output
-wants one, build_tlsh_ivf clusters the merged rows from scratch instead.
+carried through merge_tlsh_ivf (docs/TLSH_EMBEDDING.md, section 3): per
+cell, the left input's lists followed by the right's, ids remapped,
+dropped ids removed, lists that become empty omitted; a list that lost
+members keeps its medoid and gets its radius recomputed exactly over the
+remaining members, the others keep medoid and radius unchanged. Then small
+lists are coalesced: while a cell has two lists of fewer than C / 2 rows
+each (C the coalescing threshold, default 64 = twice the target list size
+of a fresh build), the pair whose union has the smallest exact radius
+about one of the two medoids becomes one list (that medoid, that radius,
+the sorted union of the ids). On exit at most one list per cell has fewer
+than C / 2 rows, so a cell of m rows has at most 2m / C + 1 lists: with
+the default C the merged index has at most one list more per nonempty
+cell than a from-scratch build of the same rows, i.e. at most 48 bytes
+per nonempty cell (3 MiB over all 65536 cells) more TIVF, and the search
+evaluates at most one list bound more per visited cell, after any number
+of incremental merges. Every member stays within the stored radius of its
+medoid, so the indexed search stays exact. If either input lacks a TIVF
+and the output wants one, build_tlsh_ivf clusters the merged rows from
+scratch instead.
 
 Options. tlsh_options selects the optional TLSH sections of the output as
 for the builder (SFHASH_HSET_TLSH_VECTORS, SFHASH_HSET_TLSH_INDEX), or
 SFHASH_HSET_TLSH_INHERIT (hsetop's default) writes each section iff every
-input that has a TLSH section has it. Repeated merges only shrink lists
-(union appends lists, intersection and difference thin them), so after
-many merges a from-scratch build tightens the index; it never becomes
-incorrect.
+input that has a TLSH section has it. coalesce_threshold is C above
+(SFHASH_HSET_COALESCE_DEFAULT for the default, 0 to disable coalescing, in
+which case lists accumulate over merges without a bound; hsetop reads it
+from HSET_COALESCE). Pruning quality (rows scanned per query) has no
+formal bound and is measured in docs/TLSH_EMBEDDING.md section 5; a merged
+index never becomes incorrect.
 
 Layout is as for a built file: HDAT chunks start on a 4096-byte boundary,
 TVEC data is 4096-aligned, the FTOC lists exactly the chunks written, and

@@ -160,30 +160,93 @@ reports which is available and `sfhash_hashset_tlsh_knn_with` picks one.
 
 ### Merging indexes
 
-Set operations on whole files (`sfhash_hashset_merge`, the `hsetop` tool;
-see HASHSET_FORMAT "Set operations") do not rebuild the index. The rows of
-the two inputs are merged by a two-pointer pass that yields, per input, a map
-old row -> new row (or dropped), and `merge_tlsh_ivf` carries the lists
-through it: for each cell the left input's lists then the right's, ids
-remapped, dropped ids removed, lists that end up empty omitted, medoids and
-radii copied verbatim. That is correct because the search only needs every
-member of a list to lie within `radius2` of the medoid: the output list's
-members are a subset of the input list's, so the bound still holds (it is
-merely no longer tight), and the medoid need not itself be a member; the
-format allows any digest with that property. The whole index merge is
-O(lists + ids), with no embedding and no k-means, and the result searches
-exactly like a fresh index.
+Set operations on whole files (`sfhash_hashset_merge`, the builder-shaped
+`sfhash_hashset_builder_*_open`, the `hsetop` tool; see HASHSET_FORMAT "Set
+operations") do not rebuild the index. The rows of the two inputs are merged
+by a two-pointer pass that yields, per input, a map old row -> new row (or
+dropped), and `merge_tlsh_ivf` carries the lists through it in three steps
+per cell:
 
-What degrades is quality, not correctness. A union doubles the number of
-lists in a cell both inputs populate, and each list keeps its own medoid, so
-the per-cell bound evaluation costs more than for a fresh clustering of the
-same rows; intersections and differences thin lists, leaving radii looser
-than the surviving members warrant. After many merges, or when a merged
-index has far more than `cell_size / 32` lists per cell, rebuild it from the
-rows (`build_tlsh_ivf`, or merge with `SFHASH_HSET_TLSH_INDEX` set and an
-input without an index) to restore the target list sizes. When one input
-has no `TIVF` and the output wants one, the merge already builds it from
-scratch.
+1. *Concatenate.* The left input's lists then the right's, ids remapped,
+   dropped ids removed, lists that end up empty omitted. Medoids are kept. A
+   list that lost members (intersection, difference, or a duplicate row
+   collapsed by a union) gets its `radius2` recomputed exactly over the
+   remaining members; the others keep theirs. The medoid need not itself be
+   a member: the search only needs every member within `radius2` of it, and
+   the format allows any digest with that property.
+2. *Coalesce*, with threshold C (`coalesce_threshold`; the default is
+   2T = 64, where T = `TLSH_IVF_TARGET_LIST_SIZE` = 32 is the k-means target
+   of a fresh build). While the cell has two lists of fewer than C/2 members
+   each, the pair whose union has the smallest radius is replaced by one
+   list: its medoid is whichever of the two medoids gives the smaller
+   maximum distance over the union (both computed exactly with the kernel),
+   `radius2` that maximum, ids the sorted union (both ascending, a linear
+   merge). Only lists below C/2 are candidates, so any pair sums to below C,
+   and the loop stops when at most one such list is left. C = 0 disables
+   this step.
+3. *Emit* the cell's lists in order.
+
+Step 1 is O(lists + ids); step 2 costs, in a cell with s lists below C/2,
+s × (rows in those lists) kernel evaluations and O(s² log s) bookkeeping (a
+heap of candidate pairs with lazy invalidation), and in practice s is a
+handful. No embedding and no k-means are involved, and the result searches
+exactly like a fresh index. When one input has no `TIVF` and the output
+wants one, the merge builds it from scratch instead.
+
+### Incremental merge: bounds
+
+Notation: T is the target list size of a fresh `build_tlsh_ivf` (32), C the
+coalescing threshold, m the rows of a cell and L the lists of that cell in
+the merged index. "Fresh" means `build_tlsh_ivf` over the same rows.
+
+**Invariant.** After `merge_tlsh_ivf` with C > 0, at most one list per cell
+has fewer than C/2 members. *Proof.* Step 2 loops while two such lists
+exist, and a list leaves the candidate set exactly when a coalescing brings
+it to C/2 or more; it terminates because every iteration removes one list.
+The invariant is established by the merge for any inputs, whether or not
+they satisfy it (a fresh k-means build need not, its list sizes are whatever
+the clustering gives), so it holds for every merged index.
+`tlsh_ivf_check_invariant` tests it. ∎
+
+**Lists per cell.** Under the invariant all lists but at most one have at
+least C/2 members (C even; ⌊C/2⌋ in general), so (L − 1) · C/2 ≤ m, i.e.
+
+  L ≤ 2m/C + 1.
+
+A fresh build splits the cell into k = ⌈m/T⌉ clusters and emits the nonempty
+ones, so it has at most ⌈m/T⌉ lists; it may have fewer. With C = 2T the
+bound reads L ≤ m/T + 1 ≤ ⌈m/T⌉ + 1: **a merged index has at most one list
+more per nonempty cell than a fresh build over the same rows**, after any
+number of incremental merges, in any order. (Cells with no rows have no
+lists in either.) With C = T the bound is L ≤ 2m/T + 1, up to twice the
+lists of a fresh build plus one; with C = 0 there is no bound, lists only
+accumulate.
+
+**Storage.** A `TIVF` holds 36 bytes of medoid, 4 of `radius2` and 8 of
+`list_start` per list, 48 bytes; everything else (header, `cell_lists`,
+`ids`) depends only on n. With C = 2T, therefore,
+
+  bytes(merged) − bytes(fresh) ≤ 48 B × (nonempty cells) ≤ 48 B × 65536 = 3 MiB,
+
+independent of n and of the number of merges.
+
+**Query cost.** The search (section 4) evaluates one list bound, a single
+kernel evaluation `emb_body2(q, medoid)`, per list of every visited cell and
+then scans the lists that pass. The cells visited depend only on q, tau and
+the rows, so with C = 2T the merged index costs **at most one bound
+evaluation more per visited cell** than a fresh index over the same rows.
+The rows scanned have no formal bound: a coalesced list has the radius of a
+pair that k-means might have kept apart, so its bound can be looser than a
+fresh list's and more of its rows may be scanned. This is what the
+incremental-merge measurements of section 5 quantify.
+
+**Exactness.** Unaffected. Every member of every list lies within `radius2`
+of its medoid (recomputed exactly for shrunk and coalesced lists, unchanged
+for the rest), which is all section 4 needs; the indexed search over a
+merged index returns exactly what brute force does, for any max_distance,
+with or without the length. (The radii of a merged index are in fact tight:
+a fresh build computes them exactly, and every list a merge changes gets an
+exact recomputation.)
 
 ## 4. Indexed kNN (exact for every distance)
 
