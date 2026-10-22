@@ -41,9 +41,11 @@
 /stamp-h1
 /test/bench_hex
 /test/bench_hsd
+/test/bench_tlsh
 /test/test
 /test-suite.log
 /test/*.log
 /test/*.trs
 /test/*.hset
 .DS_Store
+/rust/tlsh-bench/target/
