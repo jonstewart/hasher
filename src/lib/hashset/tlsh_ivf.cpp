@@ -426,11 +426,7 @@ std::vector<SFHASH_TlshMatch> tlsh_knn_ivf(
     const TlshDigest* r = rows + first;
     const TlshDigest* re = r + count;
     for (; r != re; ++r) {
-      const uint32_t hd = ch + (r->checksum != q.checksum);
-      if (hd > tau) {
-        continue;
-      }
-      const uint32_t d = hd + qb.body(*r);
+      const uint32_t d = ch + (r->checksum != q.checksum) + qb.body(*r);
       if (d <= tau) {
         consider(d, static_cast<uint32_t>(r - rows));
       }
@@ -442,14 +438,14 @@ std::vector<SFHASH_TlshMatch> tlsh_knn_ivf(
     if (stats) {
       stats->rows += le - lb;
     }
+    constexpr uint64_t PF = 8; // rows ahead to prefetch
     for (uint64_t i = lb; i < le; ++i) {
+      if (i + PF < le) {
+        __builtin_prefetch(rows + ivf.ids[i + PF]);
+      }
       const uint32_t id = ivf.ids[i];
       const TlshDigest& r = rows[id];
-      const uint32_t hd = ch + (r.checksum != q.checksum);
-      if (hd > tau) {
-        continue;
-      }
-      const uint32_t d = hd + qb.body(r);
+      const uint32_t d = ch + (r.checksum != q.checksum) + qb.body(r);
       if (d <= tau) {
         consider(d, id);
       }

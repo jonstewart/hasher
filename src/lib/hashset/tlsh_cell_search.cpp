@@ -59,11 +59,7 @@ std::vector<SFHASH_TlshMatch> tlsh_knn_cells(
       }
       for (uint64_t i = lb; i < le; ++i) {
         const TlshDigest& r = rows[i];
-        const uint32_t hd = ch + (r.checksum != q.checksum);
-        if (hd > tau) {
-          continue;
-        }
-        const uint32_t d = hd + qb.body(r);
+        const uint32_t d = ch + (r.checksum != q.checksum) + qb.body(r);
         if (d > tau) {
           continue;
         }
