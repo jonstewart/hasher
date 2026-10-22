@@ -50,6 +50,10 @@ size_t write_hashset(
 
 void size_to_u64(uint8_t* dst, const char* src, size_t dlen);
 
+// decodes a hex TLSH string (70 hex chars, optional "T1" prefix); throws on
+// invalid input
+void tlsh_hex_to_digest(uint8_t* dst, const char* src, size_t dlen);
+
 void check_strlen(const char* s, const char* sname);
 
 void write_hset(

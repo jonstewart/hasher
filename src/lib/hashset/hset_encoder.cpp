@@ -18,6 +18,7 @@
 #include <set>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include <boost/lexical_cast.hpp>
@@ -33,7 +34,9 @@ namespace bip = boost::interprocess;
 #include "util.h"
 #include "hashset/hset_encoder_chunks.h"
 #include "hashset/record_iterator.h"
+#include "hashset/tlsh_cells.h"
 #include "hashset/util.h"
+#include "tlsh_digest.h"
 #include "hasher/hasher.h"
 #include "hasher/hashset.h"
 #include "util/istream_line_range.h"
@@ -56,12 +59,22 @@ const std::map<
   { SFHASH_SHA_3_384, { RecordFieldDescriptor{SFHASH_SHA_3_384, "sha3_384", 48 }, from_hex } },
   { SFHASH_SHA_3_512, { RecordFieldDescriptor{SFHASH_SHA_3_512, "sha3_512", 64 }, from_hex } },
   { SFHASH_BLAKE3,    { RecordFieldDescriptor{SFHASH_BLAKE3, "blake3", 32 }, from_hex } },
-  { SFHASH_SIZE,      { RecordFieldDescriptor{SFHASH_SIZE, "sizes", 8 }, size_to_u64 } }
+  { SFHASH_SIZE,      { RecordFieldDescriptor{SFHASH_SIZE, "sizes", 8 }, size_to_u64 } },
+  { SFHASH_TLSH,      { RecordFieldDescriptor{SFHASH_TLSH, "tlsh", 36 }, tlsh_hex_to_digest } }
 };
 
 void size_to_u64(uint8_t* dst, const char* src, size_t /* dlen */) {
   THROW_IF(std::strchr(src, '-'), src << " is not nonnegative");
   *reinterpret_cast<uint64_t*>(dst) = boost::lexical_cast<uint64_t>(src);
+}
+
+void tlsh_hex_to_digest(uint8_t* dst, const char* src, size_t /* dlen */) {
+  // src is a column in a line, so it ends at a space or NUL
+  TlshDigest& d = *reinterpret_cast<TlshDigest*>(dst);
+  THROW_IF(
+    !tlsh_from_hex(src, d),
+    std::string_view(src, std::strcspn(src, " ")) << " is not a TLSH digest"
+  );
 }
 
 // TODO: unused?
@@ -144,7 +157,7 @@ size_t length_hset(
     len += length_hhnn(hi);
 
     if (hi.type != SFHASH_SIZE) {
-      len += length_hint();
+      len += length_hint(hi.type);
     }
 
     len += length_alignment_padding(len, 4096);
@@ -197,7 +210,7 @@ size_t length_hset_hashsets_only(
     len += length_hhnn(fields[i]);
 
     if (fields[i].type != SFHASH_SIZE) {
-      len += length_hint();
+      len += length_hint(fields[i].type);
     }
 
     len += length_alignment_padding(len, 4096);
@@ -282,7 +295,15 @@ void write_chunks(
     case Chunk::Type::HINT:
       {
         const size_t i = off2hbidx.at(choff);
-        write_hint(make_block_bounds<8>(std::get<1>(hb[i]), std::get<2>(hb[i])), out);
+        if (rhdr.fields[i].type == SFHASH_TLSH) {
+          // cell index over the sorted rows
+          const auto* tbeg = reinterpret_cast<const TlshDigest*>(std::get<1>(hb[i])->rec.data());
+          const auto* tend = reinterpret_cast<const TlshDigest*>(std::get<2>(hb[i])->rec.data());
+          write_tlsh_hint(make_tlsh_cell_index(tbeg, tend), out);
+        }
+        else {
+          write_hint(make_block_bounds<8>(std::get<1>(hb[i]), std::get<2>(hb[i])), out);
+        }
       }
       break;
 
@@ -355,7 +376,8 @@ void scatter_records_to_hashset(
   for (auto i = rbeg; i != rend; ++i) {
     size_t roff = 1;
     for (auto& [hlen, hbeg, hi, ibeg, ii]: hb) {
-      if (*i->rec.data() == 0x01) {
+      // the presence byte of this field precedes its value
+      if (i->rec.data()[roff - 1] == 0x01) {
         // write the hash to its HDAT section
         std::memcpy(hi->rec.data(), i->rec.data() + roff, hlen);
         ++hi;
@@ -391,8 +413,10 @@ void scatter_records_to_hashset(
 std::vector<std::string_view> split(std::string_view s, char delim) {
   std::vector<std::string_view> splits;
 
+  // a trailing delimiter yields a final empty column, so that an absent
+  // last field ("<md5> ") is distinguishable from a missing column
   auto i = s.begin();
-  do {
+  while (true) {
     auto j = std::find(i, s.end(), delim);
     /*
     * This is a workaround for clang <= 14. Once 15 is out
@@ -403,8 +427,11 @@ std::vector<std::string_view> split(std::string_view s, char delim) {
 // C++20: #else
 // C++20: splits.emplace_back(i, j);
 // C++20: #endif
-    i = j != s.end() ? j + 1 : j;
-  } while (i != s.end());
+    if (j == s.end()) {
+      break;
+    }
+    i = j + 1;
+  }
 
   return splits;
 }
@@ -460,7 +487,8 @@ void write_hset(
     THROW_IF(cols.size() < htypes.size(), "too few columns at line " << lineno);
 
     for (size_t i = 0; i < cols.size(); ++i) {
-      if (cols[i].empty()) {
+      // a null TLSH digest has no row, so treat it like an absent field
+      if (cols[i].empty() || (htypes[i] == SFHASH_TLSH && cols[i] == "TNULL")) {
         rec.clear();
       }
       else {
@@ -565,9 +593,14 @@ SFHASH_HashsetBuildCtx* hashset_builder_open(
   off += length_magic();
   off += length_hset_hash();
 
-  // FTOC
+  // FTOC; reserve room for the chunks this mode will write, matching the
+  // length_hset* function used by hashset_builder_write
+  const size_t chunk_count = write_records ?
+    (write_hashsets ? count_chunks(rhdr.fields) : 5) :
+    count_chunks_hashsets_only(rhdr.fields);
+
   ftoc.entries.emplace_back(off, Chunk::Type::FTOC);
-  off += length_ftoc(count_chunks(rhdr.fields));
+  off += length_ftoc(chunk_count);
 
   // FHDR
   ftoc.entries.emplace_back(off, Chunk::Type::FHDR);
@@ -675,6 +708,7 @@ void sfhash_hashset_builder_add_hash(
 // TODO: check length?
 
   auto& field_pos = bctx->field_pos;
+  auto& rhdr = bctx->rhdr;
 
   if (bctx->with_records) {
     auto& out = bctx->out;
@@ -683,8 +717,9 @@ void sfhash_hashset_builder_add_hash(
       out.write(static_cast<const char*>(record), length);
     }
     else {
-      std::vector<char> buf(length, 0);
-      out.write(buf.data(), length);
+      // absent field: presence byte and value are all zero
+      const std::vector<char> buf(1 + rhdr.fields[field_pos].length, 0);
+      out.write(buf.data(), buf.size());
     }
   }
   else { // with_hashsets
@@ -694,8 +729,6 @@ void sfhash_hashset_builder_add_hash(
       ++std::get<HashsetHeader>(bctx->hsets[field_pos]).hash_count;
     }
   }
-
-  auto& rhdr = bctx->rhdr;
 
   // advance the field position
   ++field_pos;
@@ -783,7 +816,7 @@ uint64_t hashset_builder_write(SFHASH_HashsetBuildCtx* bctx) {
         if (field.type != SFHASH_SIZE) {
           ftoc.entries.emplace_back(off, Chunk::Type::HINT);
           off2hbidx[off] = hbidx;
-          off += length_hint();
+          off += length_hint(field.type);
         }
 
         // HDAT
@@ -892,7 +925,7 @@ uint64_t hashset_builder_write(SFHASH_HashsetBuildCtx* bctx) {
       if (field.type != SFHASH_SIZE) {
         ftoc.entries.emplace_back(off, Chunk::Type::HINT);
         off2hbidx[off] = i;
-        off += length_hint();
+        off += length_hint(field.type);
       }
 
       // HDAT
@@ -982,7 +1015,8 @@ const std::map<
   { SFHASH_SHA_3_384, { from_hex, 48 } },
   { SFHASH_SHA_3_512, { from_hex, 64 } },
   { SFHASH_BLAKE3,    { from_hex, 32 } },
-  { SFHASH_SIZE,      { size_to_u64, 8 } }
+  { SFHASH_SIZE,      { size_to_u64, 8 } },
+  { SFHASH_TLSH,      { tlsh_hex_to_digest, 36 } }
 };
 
 std::vector<

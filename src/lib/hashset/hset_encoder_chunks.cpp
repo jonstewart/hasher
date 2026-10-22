@@ -2,7 +2,10 @@
 
 #include <bit>
 #include "rwutil.h"
+#include "throw.h"
 #include "util.h"
+#include "hasher/common.h"
+#include "hashset/tlsh_cells.h"
 
 #include <cstring>
 #include <numeric>
@@ -151,13 +154,17 @@ size_t write_hhnn(
   );
 }
 
-size_t length_hint_data() {
+size_t length_hint_data(uint32_t hash_type) {
+  if (hash_type == SFHASH_TLSH) {
+    return 2 + // hint type
+           (TLSH_CELL_COUNT + 1) * 8; // cell offsets
+  }
   return 2 + // hint type
          256 * 8 * 2; // bounds for 8-bit buckets
 }
 
-size_t length_hint() {
-  return length_chunk<length_hint_data>();
+size_t length_hint(uint32_t hash_type) {
+  return length_chunk<length_hint_data>(hash_type);
 }
 
 size_t write_hint_data(
@@ -198,6 +205,38 @@ size_t write_hint(
     out,
     "HINT",
     block_bounds
+  );
+}
+
+size_t write_tlsh_hint_data(
+  const std::vector<uint64_t>& cells,
+  char* out)
+{
+  THROW_IF(
+    cells.size() != TLSH_CELL_COUNT + 1,
+    "TLSH cell index has " << cells.size() << " entries, expected " << (TLSH_CELL_COUNT + 1)
+  );
+
+  const char* beg = out;
+
+  out += write_be<uint16_t>(TLSH_CELL_HINT_TYPE, out);
+
+  for (const uint64_t c: cells) {
+    out += write_le<uint64_t>(c, out);
+  }
+
+  return out - beg;
+}
+
+size_t write_tlsh_hint(
+  const std::vector<uint64_t>& cells,
+  char* out)
+{
+  return write_chunk(
+    write_tlsh_hint_data,
+    out,
+    "HINT",
+    cells
   );
 }
 

@@ -104,9 +104,11 @@ size_t write_hhnn(
   char* out
 );
 
-size_t length_hint_data();
+// hash_type is the SFHASH_HashAlgorithm of the hashset; TLSH hashsets get a
+// cell index hint, everything else gets block bounds
+size_t length_hint_data(uint32_t hash_type);
 
-size_t length_hint();
+size_t length_hint(uint32_t hash_type);
 
 size_t write_hint_data(
   const std::vector<std::pair<int64_t, int64_t>>& block_bounds,
@@ -115,6 +117,17 @@ size_t write_hint_data(
 
 size_t write_hint(
   const std::vector<std::pair<int64_t, int64_t>>& block_bounds,
+  char* out
+);
+
+// cells has TLSH_CELL_COUNT + 1 entries, see hashset/tlsh_cells.h
+size_t write_tlsh_hint_data(
+  const std::vector<uint64_t>& cells,
+  char* out
+);
+
+size_t write_tlsh_hint(
+  const std::vector<uint64_t>& cells,
   char* out
 );
 

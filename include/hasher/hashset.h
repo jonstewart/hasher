@@ -3,6 +3,7 @@
 
 #include <stdbool.h>
 #include <stddef.h>
+#include <stdint.h>
 #include <sys/types.h>
 
 #include <hasher/common.h>
@@ -89,6 +90,44 @@ void sfhash_hashset_lookup_bulk(
   const void* hashes,
   size_t hashes_length,
   bool* results
+);
+
+/*
+ * Returns a pointer to the idx-th hash (row) of the hashset with index tidx.
+ * Rows are sorted bytewise; idx must be less than sfhash_hashset_count.
+ */
+const void* sfhash_hashset_hash(
+  const SFHASH_Hashset* hset,
+  size_t tidx,
+  size_t idx
+);
+
+/*
+ * A TLSH nearest-neighbour match. index is a row index usable with
+ * sfhash_hashset_hash and sfhash_hashset_record_for_hash.
+ */
+struct SFHASH_TlshMatch {
+  uint64_t index;
+  uint32_t distance;
+};
+
+/*
+ * Brute-force k nearest neighbours by TLSH distance (see sfhash_tlsh_diff).
+ *
+ * Writes to out the rows with distance <= max_distance, nearest first, ties
+ * by ascending index, at most k of them. out must have room for k matches.
+ *
+ * Returns the number of matches written, or 0 if tidx is not a TLSH
+ * hashset, digest is null, or digest is the null digest.
+ */
+size_t sfhash_hashset_tlsh_knn(
+  const SFHASH_Hashset* hset,
+  size_t tidx,
+  const void* digest,
+  size_t k,
+  uint32_t max_distance,
+  bool include_length,
+  SFHASH_TlshMatch* out
 );
 
 struct SFHASH_HashsetRecordRange {

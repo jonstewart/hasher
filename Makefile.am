@@ -44,6 +44,8 @@ src_lib_libhasherint_la_SOURCES = \
 	src/lib/hashset/hset_ops.cpp \
 	src/lib/hashset/hset_structs.cpp \
 	src/lib/hashset/record_iterator.cpp \
+	src/lib/hashset/tlsh_cells.cpp \
+	src/lib/hashset/tlsh_search.cpp \
 	src/lib/hashset/util.cpp \
 	src/lib/hex/hex.cpp \
 	src/lib/hex/hex_avx2.cpp \
@@ -149,6 +151,7 @@ test_test_SOURCES = \
 	test/test_hset_encoder_chunks.cpp \
 	test/test_hset_ops.cpp \
 	test/test_hset_round_trip.cpp \
+	test/test_hset_tlsh.cpp \
 	test/test_record_iterator.cpp \
 	test/test_parser.cpp \
 	test/test_tlsh.cpp \

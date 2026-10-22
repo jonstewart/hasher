@@ -23,6 +23,8 @@ auto hashset_dispatcher(size_t hash_length, Args&&... args)
     return Func<28>()(std::forward<Args>(args)...);
   case 32:
     return Func<32>()(std::forward<Args>(args)...);
+  case 36:
+    return Func<36>()(std::forward<Args>(args)...);
   case 48:
     return Func<48>()(std::forward<Args>(args)...);
   case 64:

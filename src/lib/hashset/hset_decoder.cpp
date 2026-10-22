@@ -7,7 +7,10 @@
 #include "hashset/lookupstrategy.h"
 #include "hashset/radius_ls.h"
 #include "hashset/range_ls.h"
+#include "hashset/tlsh_cells.h"
+#include "hashset/tlsh_ls.h"
 #include "hashset/util.h"
+#include "tlsh_digest.h"
 
 #include <algorithm>
 #include <cstring>
@@ -107,7 +110,21 @@ std::unique_ptr<LookupStrategy> make_lookup_strategy(
   const HashsetHint& hnt,
   const ConstHashsetData& hsd)
 {
-  if (hnt.hint_type == 0x6208) {
+  if (hnt.hint_type == TLSH_CELL_HINT_TYPE) {
+    THROW_IF(
+      hsh.hash_length != sizeof(TlshDigest),
+      "TLSH cell index hint on a hashset with hash length " << hsh.hash_length
+    );
+    THROW_IF(
+      static_cast<const uint8_t*>(hnt.end) - static_cast<const uint8_t*>(hnt.beg) !=
+        static_cast<ptrdiff_t>((TLSH_CELL_COUNT + 1) * sizeof(uint64_t)),
+      "bad TLSH cell index hint length"
+    );
+    return std::unique_ptr<LookupStrategy>(
+      new TlshLookupStrategy(hsd.beg, hsd.end, hnt.beg)
+    );
+  }
+  else if (hnt.hint_type == 0x6208) {
     return std::unique_ptr<LookupStrategy>(
       hashset_dispatcher<MakeBlockLookupStrategy8>(
         hsh.hash_length, hsd.beg, hsd.end,
@@ -268,7 +285,7 @@ State::Type handle_hint(const Chunk& ch, Holder& h) {
   hnt = parse_hint(ch);
 
   THROW_IF(
-    hnt.hint_type != 0x6208,
+    hnt.hint_type != 0x6208 && hnt.hint_type != TLSH_CELL_HINT_TYPE,
     "bad hint type " << std::hex << std::setw(4) << std::setfill('0') << hnt.hint_type
   );
 

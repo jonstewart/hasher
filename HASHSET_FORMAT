@@ -17,3 +17,53 @@ All numbers little endian
 
 hoff hashes, sorted, starting at hashes offset
 soff sizes: uint64_t, same order as hashes, starting at sizes offset
+
+
+TLSH hashsets
+=============
+
+Hash type SFHASH_TLSH (1 << 15), field name "tlsh", hash length 36.
+
+Rows
+----
+
+Each HDAT row is the 36-byte canonical TLSH digest described in
+include/hasher/tlsh.h:
+
+   0 L          log-scaled input length
+   1 Q          (Q1 << 4) | Q2
+   2 plane_hi   16 bytes; bit i = bit 1 of bucket code i
+  18 plane_lo   16 bytes; bit i = bit 0 of bucket code i
+  34 checksum
+  35 reserved   always 0
+
+The layout is chosen so that the bytewise sort applied to every HDAT is the
+canonical TLSH order (L, Q1, Q2, body, checksum). Rows are sorted but not
+unique: when records are written, two records with the same digest and
+different other fields produce two identical rows, each mapped to its own
+record by the RIDX entry at the same index. (A hashsets-only file has no
+RIDX and its rows are deduplicated, like every other hash type.)
+
+The null digest ("TNULL", all 36 bytes zero) never appears as a row. In the
+text input a TLSH column of "TNULL" is treated like an empty column: the
+record is written with the field marked absent and contributes no row.
+
+HINT type 0x7400: cell index
+----------------------------
+
+A TLSH hashset's HINT chunk has hint type 0x7400 (big-endian uint16, like
+the 0x6208 block hint) followed by
+
+  uint64_t offset[65537]   little-endian
+
+The cell of a digest is its first two bytes, c = (L << 8) | Q, so a cell is
+a contiguous run of rows in the sorted HDAT. The rows of cell c are
+[offset[c], offset[c+1]); offset[0] == 0, offset[65536] == hash count, and
+offset is non-decreasing (an empty cell has offset[c] == offset[c+1]).
+
+The hint data starts 12 bytes into the chunk and the offsets 14 bytes in,
+so readers must not assume the offset array is 8-byte aligned.
+
+A lookup binary-searches the digest's cell. Nearest-neighbour search
+(sfhash_hashset_tlsh_knn) currently scans all rows; the cell index is the
+basis for bounding that search by L and Q distance in future.

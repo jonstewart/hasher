@@ -249,4 +249,10 @@ Holder decode_chunks(ChunkIterator ch, ChunkIterator ch_end) {
   return h;
 }
 
+std::unique_ptr<LookupStrategy> make_lookup_strategy(
+  const HashsetHeader& hsh,
+  const HashsetHint& hnt,
+  const ConstHashsetData& hsd
+);
+
 Holder decode_hset(const uint8_t* beg, const uint8_t* end);

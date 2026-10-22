@@ -146,8 +146,8 @@ TEST_CASE("write_hhnn_data") {
 }
 
 TEST_CASE("length_hint") {
-  CHECK(length_hint_data() == 4098);
-  CHECK(length_hint() == 4110);
+  CHECK(length_hint_data(SFHASH_SHA_1) == 4098);
+  CHECK(length_hint(SFHASH_SHA_1) == 4110);
 }
 
 TEST_CASE("write_hint_data") {

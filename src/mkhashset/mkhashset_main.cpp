@@ -15,6 +15,13 @@ Make a hashset and sizeset from the NSRL:
 
 for i in NSRLFile.*.txt.gz ; do zcat $i | ./nsrldump.py ; done | mkhashset 'NSRL' 'The NSRL!' sha1 >nsrl.hset
 
+Make a hashset with md5 and TLSH columns. TLSH digests are the usual
+70-character hex strings, with or without the "T1" prefix; "TNULL" (or an
+empty column) marks a file with no TLSH digest:
+
+for i in $(find -type f) ; do echo $(md5sum $i | cut -f1 -d' ') $(tlsh -f $i | cut -f1) ; done >md5_tlsh.txt
+mkhashset 'Some test hashes' 'md5 and tlsh' md5 tlsh true true md5_tlsh.txt md5_tlsh.hset
+
 */
 
 #include <cstring>
