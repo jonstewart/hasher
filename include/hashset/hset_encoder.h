@@ -9,10 +9,51 @@
 #include <utility>
 #include <vector>
 
+#include <algorithm>
+#include <ctime>
+#include <limits>
+
 #include "rwutil.h"
 #include "hasher/hashset.h"
 #include "hashset/hset_structs.h"
+#include "hashset/record_iterator.h"
 #include "hashset/tlsh_ivf.h"
+#include "hashset/util.h"
+
+// TIVF lists hold about this many rows each
+constexpr size_t TLSH_IVF_TARGET_LIST_SIZE = 32;
+
+// ISO-8601 UTC timestamp for the FHDR
+std::string make_timestamp(std::time_t tt = std::time(nullptr));
+
+// the 0x6208 HINT data: per leading-byte block, the extreme offsets of the
+// rows from their expected positions
+template <size_t BlockBits>
+std::vector<std::pair<int64_t, int64_t>> make_block_bounds(
+  RecordIterator beg,
+  RecordIterator end)
+{
+  std::vector<std::pair<int64_t, int64_t>> block_bounds(
+    1 << BlockBits,
+    {
+      std::numeric_limits<int64_t>::max(),
+      std::numeric_limits<int64_t>::min()
+    }
+  );
+
+  const auto count = end - beg;
+
+  for (auto i = beg; i != end; ++i) {
+    const size_t e = expected_index(reinterpret_cast<const uint8_t*>(i->rec.data()), count);
+    const int64_t delta = static_cast<int64_t>(i - beg) - static_cast<int64_t>(e);
+
+    const size_t bi = static_cast<uint8_t>(i->rec[0]) >> (8 - BlockBits);
+    block_bounds[bi].first = std::min(block_bounds[bi].first, delta);
+    block_bounds[bi].second = std::max(block_bounds[bi].second, delta);
+  }
+
+  return block_bounds;
+}
 
 struct SFHASH_HashsetBuildCtx {
   TableOfContents ftoc;

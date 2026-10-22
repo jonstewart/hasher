@@ -299,6 +299,67 @@ constexpr uint16_t TIVF_VERSION = 3;
 
 } // namespace
 
+TlshIvf merge_tlsh_ivf(
+  const TlshIvfView& a,
+  const uint32_t* a_map,
+  const TlshIvfView& b,
+  const uint32_t* b_map,
+  uint64_t n_out)
+{
+  THROW_IF(n_out > std::numeric_limits<uint32_t>::max(), "too many rows for a TIVF index");
+  THROW_IF(!a.empty() && !a_map, "missing row map for the left index");
+  THROW_IF(!b.empty() && !b_map, "missing row map for the right index");
+
+  TlshIvf out;
+  out.n = n_out;
+  out.cell_lists.assign(TLSH_CELL_COUNT + 1, 0);
+  out.list_start.push_back(0);
+  out.ids.reserve(n_out);
+
+  // appends the lists of cell c of one input, remapped
+  const auto append_cell = [&out](const TlshIvfView& v, const uint32_t* map, uint32_t c) {
+    if (v.empty()) {
+      return;
+    }
+    for (uint32_t l = v.cell_lists[c]; l < v.cell_lists[c + 1]; ++l) {
+      const size_t before = out.ids.size();
+      uint32_t prev = 0;
+      for (uint64_t i = v.list_start[l]; i < v.list_start[l + 1]; ++i) {
+        const uint32_t id = map[v.ids[i]];
+        if (id == TLSH_IVF_DROPPED) {
+          continue;
+        }
+        THROW_IF(
+          out.ids.size() > before && id <= prev,
+          "row map is not increasing within a TIVF list"
+        );
+        out.ids.push_back(id);
+        prev = id;
+      }
+      if (out.ids.size() == before) {
+        continue; // every member was dropped
+      }
+      out.medoids.push_back(v.medoids[l]);
+      out.radius2.push_back(v.radius2[l]);
+      out.list_start.push_back(out.ids.size());
+    }
+  };
+
+  for (uint32_t c = 0; c < TLSH_CELL_COUNT; ++c) {
+    out.cell_lists[c] = static_cast<uint32_t>(out.lists());
+    append_cell(a, a_map, c);
+    append_cell(b, b_map, c);
+  }
+  out.cell_lists[TLSH_CELL_COUNT] = static_cast<uint32_t>(out.lists());
+
+  THROW_IF(
+    out.ids.size() != n_out,
+    "merged TIVF index has " << out.ids.size() << " ids, expected " << n_out
+  );
+
+  return out;
+}
+
 size_t length_tivf_data(uint32_t lists, uint64_t n) {
   return TIVF_HEADER +
          (TLSH_CELL_COUNT + 1) * sizeof(uint32_t) +

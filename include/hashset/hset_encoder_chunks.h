@@ -185,6 +185,9 @@ size_t length_tvec_data(uint64_t hash_count);
 
 size_t length_tvec(uint64_t hash_count);
 
+// the 32-byte TVEC payload header for n rows
+size_t write_tvec_header(uint64_t n, char* out);
+
 // rows [beg, end) are the sorted HDAT rows
 size_t write_tvec_data(
   const TlshDigest* beg,

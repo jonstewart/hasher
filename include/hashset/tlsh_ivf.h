@@ -60,6 +60,35 @@ struct TlshIvfView {
 
 TlshIvfView make_tlsh_ivf_view(const TlshIvf& ivf);
 
+/*
+ * The id of a row that a merge drops, in the row maps below.
+ */
+constexpr uint32_t TLSH_IVF_DROPPED = UINT32_MAX;
+
+/*
+ * Merges two indexes over hash sets that have been merged into one of n_out
+ * rows, in O(lists + ids) and without re-clustering. a_map[i] (b_map[j]) is
+ * the output row of input row i of a (j of b), or TLSH_IVF_DROPPED when the
+ * merge dropped it; maps must be increasing over the kept rows of each side,
+ * which the sorted two-pointer merge of the rows guarantees.
+ *
+ * For each cell the output lists are a's lists followed by b's, ids
+ * remapped, dropped ids removed and lists that become empty omitted.
+ * Medoids and radii are kept verbatim: the members of an output list are a
+ * subset of the input list's, so every member is still within radius2 of
+ * the medoid, which is all the search needs; the medoid itself need not be
+ * a member. Lists only shrink, so after many merges a from-scratch
+ * build_tlsh_ivf gives tighter lists; this function never makes the search
+ * inexact. Either view may be empty (a side with no rows).
+ */
+TlshIvf merge_tlsh_ivf(
+  const TlshIvfView& a,
+  const uint32_t* a_map,
+  const TlshIvfView& b,
+  const uint32_t* b_map,
+  uint64_t n_out
+);
+
 size_t length_tivf_data(uint32_t lists, uint64_t n);
 
 size_t write_tivf_data(const TlshIvf& ivf, char* out);

@@ -36,6 +36,7 @@
 /python/hasher.egg-info
 /src/fuzzy/fuzzy
 /src/hasher/hasher
+/src/hsetop/hsetop
 /src/lib/hasher.pc
 /src/mkhashset/mkhashset
 /stamp-h1

@@ -234,7 +234,10 @@ SFHASH_HashsetBuildCtx* sfhash_hashset_builder_open(
  */
 enum {
   SFHASH_HSET_TLSH_VECTORS = 1,
-  SFHASH_HSET_TLSH_INDEX = 2
+  SFHASH_HSET_TLSH_INDEX = 2,
+  /* sfhash_hashset_merge only: write each optional section iff every input
+   * that has a TLSH hashset has it; the other bits are ignored */
+  SFHASH_HSET_TLSH_INHERIT = 4
 };
 
 /*
@@ -299,6 +302,44 @@ SFHASH_HashsetBuildCtx* sfhash_hashset_builder_subtract_open(
   bool write_hashsets,
   const char* output_file,
   const char* temp_dir,
+  SFHASH_Error** err
+);
+
+/*
+ * Set operations on whole hashsets by merging.
+ */
+enum {
+  SFHASH_HSET_OP_UNION = 1,
+  SFHASH_HSET_OP_INTERSECT = 2,
+  SFHASH_HSET_OP_DIFFERENCE = 3
+};
+
+/*
+ * Merge-based set operation over two loaded hashsets; writes the result to
+ * output_file. op is one of the SFHASH_HSET_OP_* values (DIFFERENCE is
+ * l minus r).
+ *
+ * Every hash section of the output is produced by merging the two inputs'
+ * sorted sections; TLSH cell indexes, vectors and kNN indexes are carried
+ * through the merge rather than rebuilt (see HASHSET_FORMAT, "Set
+ * operations"). The output has a record table only when both inputs have
+ * one; otherwise it is a hashsets-only file and rows are deduplicated. An
+ * input with hash sections cannot be merged with a records-only input.
+ *
+ * tlsh_options is a bitwise OR of SFHASH_HSET_TLSH_* values selecting the
+ * optional TLSH sections, or SFHASH_HSET_TLSH_INHERIT to keep what the
+ * inputs have.
+ *
+ * Returns the size of the output file, or 0 on error (err set).
+ */
+uint64_t sfhash_hashset_merge(
+  const SFHASH_Hashset* l,
+  const SFHASH_Hashset* r,
+  uint32_t op,
+  const char* name,
+  const char* desc,
+  const char* output_file,
+  uint32_t tlsh_options,
   SFHASH_Error** err
 );
 

@@ -85,38 +85,6 @@ size_t write_to(char* out, const void* buf, size_t len) {
   return len;
 }
 
-template <size_t BlockBits>
-std::vector<std::pair<int64_t, int64_t>> make_block_bounds(
-  RecordIterator beg,
-  RecordIterator end)
-{
-  std::vector<std::pair<int64_t, int64_t>> block_bounds(
-    1 << BlockBits,
-    {
-      std::numeric_limits<int64_t>::max(),
-      std::numeric_limits<int64_t>::min()
-    }
-  );
-
-  const auto count = end - beg;
-
-  for (auto i = beg; i != end; ++i) {
-    const size_t e = expected_index(reinterpret_cast<const uint8_t*>(i->rec.data()), count);
-    const int64_t delta = static_cast<int64_t>(i - beg) - static_cast<int64_t>(e);
-
-    const size_t bi = static_cast<uint8_t>(i->rec[0]) >> (8 - BlockBits);
-    block_bounds[bi].first = std::min(block_bounds[bi].first, delta);
-    block_bounds[bi].second = std::max(block_bounds[bi].second, delta);
-  }
-
-  return block_bounds;
-}
-
-
-
-// TIVF lists hold about this many rows each
-constexpr size_t TLSH_IVF_TARGET_LIST_SIZE = 32;
-
 bool wants_tvec(const RecordFieldDescriptor& field, uint32_t tlsh_options) {
   return field.type == SFHASH_TLSH && (tlsh_options & SFHASH_HSET_TLSH_VECTORS);
 }
@@ -344,7 +312,7 @@ size_t length_hset_hashsets_only(
   return len;
 }
 
-std::string make_timestamp(std::time_t tt = std::time(nullptr)) {
+std::string make_timestamp(std::time_t tt) {
   // set the timestamp
   const auto tm = std::gmtime(&tt);
 

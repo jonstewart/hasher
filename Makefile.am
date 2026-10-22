@@ -42,6 +42,7 @@ src_lib_libhasherint_la_SOURCES = \
 	src/lib/hashset/hset_decoder_chunks.cpp \
 	src/lib/hashset/hset_encoder.cpp \
 	src/lib/hashset/hset_encoder_chunks.cpp \
+	src/lib/hashset/hset_merge.cpp \
 	src/lib/hashset/hset_ops.cpp \
 	src/lib/hashset/hset_structs.cpp \
 	src/lib/hashset/record_iterator.cpp \
@@ -131,7 +132,12 @@ src_mkhashset_mkhashset_SOURCES = \
 
 src_mkhashset_mkhashset_LDADD = $(HASHER_LIB) $(PROJECT_LIBS)
 
-bin_PROGRAMS = src/fuzzy/fuzzy src/hasher/hasher src/mkhashset/mkhashset
+src_hsetop_hsetop_SOURCES = \
+	src/hsetop/hsetop_main.cpp
+
+src_hsetop_hsetop_LDADD = $(HASHER_LIB) $(PROJECT_LIBS)
+
+bin_PROGRAMS = src/fuzzy/fuzzy src/hasher/hasher src/mkhashset/mkhashset src/hsetop/hsetop
 
 check_PROGRAMS = test/test test/bench_hex test/bench_hsd test/bench_tlsh
 

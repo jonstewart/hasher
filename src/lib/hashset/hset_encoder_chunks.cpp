@@ -372,6 +372,21 @@ size_t length_tvec(uint64_t hash_count) {
   return length_chunk<length_tvec_data>(hash_count);
 }
 
+size_t write_tvec_header(uint64_t n, char* out) {
+  const char* obeg = out;
+
+  out += write_le<uint16_t>(1, out);                              // version
+  out += write_byte(1, 0, out);                                   // variant
+  out += write_byte(1, 0, out);                                   // flags
+  out += write_le<uint32_t>(TLSH_EMBED_DIMS, out);                // dims
+  out += write_le<uint64_t>(n, out);                              // n
+  out += write_le<uint32_t>(TVEC_DTYPE_FLOAT32, out);             // dtype
+  out += write_le<uint32_t>(0, out);                              // reserved
+  out += write_le<uint64_t>(0, out);                              // reserved
+
+  return out - obeg;
+}
+
 size_t write_tvec_data(
   const TlshDigest* beg,
   const TlshDigest* end,
@@ -379,14 +394,7 @@ size_t write_tvec_data(
 {
   const char* obeg = out;
 
-  out += write_le<uint16_t>(1, out);                              // version
-  out += write_byte(1, 0, out);                                   // variant
-  out += write_byte(1, 0, out);                                   // flags
-  out += write_le<uint32_t>(TLSH_EMBED_DIMS, out);                // dims
-  out += write_le<uint64_t>(end - beg, out);                      // n
-  out += write_le<uint32_t>(TVEC_DTYPE_FLOAT32, out);             // dtype
-  out += write_le<uint32_t>(0, out);                              // reserved
-  out += write_le<uint64_t>(0, out);                              // reserved
+  out += write_tvec_header(end - beg, out);
 
   // embed via a local row so that out need not be float-aligned
   float row[TLSH_EMBED_DIMS];
