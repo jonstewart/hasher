@@ -14,10 +14,17 @@
 //!                    sfhash_hashset_tlsh_knn (default) over an hset file of
 //!                    N rows; k=10, max_distance=144, include_length=true,
 //!                    20 queries per iteration; throughput is rows x queries
+//!   hset_incremental_merge
+//!                    one incremental union of an 18,000-row batch into a
+//!                    1,000,000-row master (sfhash_hashset_merge, the TIVF
+//!                    index carried through and coalesced) against one
+//!                    from-scratch build of the same 1,018,000 rows, then
+//!                    kNN (20 queries, as hset_knn) on each result;
+//!                    TLSH_BENCH_COALESCE overrides the coalescing threshold
 //!
-//! The hset files for hset_knn are written once per N into a fresh directory
-//! under the system temp dir (build time is printed, not benchmarked) and
-//! removed when the group finishes.
+//! The hset files are written once into a fresh directory under the system
+//! temp dir (build time is printed, not benchmarked) and removed when the
+//! group finishes.
 
 use std::fs;
 use std::path::PathBuf;
@@ -25,8 +32,9 @@ use std::time::{Duration, Instant};
 
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, SamplingMode, Throughput};
 use tlsh_bench::{
-    build_tlsh_hset, knn_brute, knn_brute_with, make_corpus, make_hashed_corpus, perturb, random_digest, tlsh_hash,
-    Hashset, SplitMix64, TlshDigest, TlshMatch, HSET_TLSH_INDEX, TLSH_KNN_BRUTE, TLSH_KNN_INDEX,
+    build_tlsh_hset, knn_brute, knn_brute_with, make_corpus, make_hashed_corpus, merge_hsets, perturb, perturb_corpus,
+    random_digest, tlsh_hash, Hashset, SplitMix64, TlshDigest, TlshMatch, HSET_COALESCE_DEFAULT, HSET_OP_UNION,
+    HSET_TLSH_INDEX, TLSH_KNN_BRUTE, TLSH_KNN_INDEX,
 };
 
 const K: usize = 10;
@@ -247,12 +255,123 @@ fn hset_knn(c: &mut Criterion) {
     group.finish();
 }
 
+const MERGE_MASTER: usize = 1_000_000;
+const MERGE_BATCH: usize = 18_000;
+
+/// `TLSH_BENCH_COALESCE`: the coalescing threshold of the incremental union,
+/// or the library default.
+fn coalesce_from_env() -> u32 {
+    match std::env::var("TLSH_BENCH_COALESCE") {
+        Ok(s) if !s.trim().is_empty() => {
+            s.trim().parse().unwrap_or_else(|_| panic!("TLSH_BENCH_COALESCE: bad threshold {s:?}"))
+        }
+        _ => HSET_COALESCE_DEFAULT,
+    }
+}
+
+fn hset_incremental_merge(c: &mut Criterion) {
+    let dir = ScratchDir::new();
+    let coalesce = coalesce_from_env();
+
+    // the master and a batch of half new families, half near-duplicates of
+    // master rows; TIVF index only, no TVEC (kNN does not read it and its
+    // 1 KiB per row would dominate both the merge and the build)
+    let t0 = Instant::now();
+    let master = make_hashed_corpus(CORPUS_SEED, MERGE_MASTER);
+    let mut batch = make_hashed_corpus(CORPUS_SEED + 1, MERGE_BATCH / 2);
+    batch.extend(perturb_corpus(CORPUS_SEED + 2, &master, MERGE_BATCH - batch.len(), 0.03));
+    let queries = queries_for(&master);
+    let t_corpus = t0.elapsed();
+
+    let master_path = dir.0.join("master.hset");
+    let batch_path = dir.0.join("batch.hset");
+    let t1 = Instant::now();
+    let master_bytes = build_tlsh_hset(&master_path, &master, HSET_TLSH_INDEX).expect("build master");
+    build_tlsh_hset(&batch_path, &batch, HSET_TLSH_INDEX).expect("build batch");
+    let t_build = t1.elapsed();
+    let hmaster = Hashset::open(&master_path).expect("load master");
+    let hbatch = Hashset::open(&batch_path).expect("load batch");
+    let tidx = hmaster.tlsh_index().expect("TLSH hash set");
+
+    // what a from-scratch build of the final set starts from
+    let mut all = hmaster.tlsh_rows(tidx);
+    all.extend(hbatch.tlsh_rows(hbatch.tlsh_index().expect("TLSH hash set")));
+
+    eprintln!(
+        "hset_incremental_merge: corpus {:.2}s, master build {:.2}s ({:.1} MiB, {} rows), batch {} rows, coalesce {}",
+        t_corpus.as_secs_f64(),
+        t_build.as_secs_f64(),
+        master_bytes as f64 / (1024.0 * 1024.0),
+        hmaster.count(tidx),
+        hbatch.count(tidx),
+        if coalesce == HSET_COALESCE_DEFAULT { "default".to_string() } else { coalesce.to_string() }
+    );
+
+    let mut group = c.benchmark_group("hset_incremental_merge");
+    group.sample_size(10);
+    group.sampling_mode(SamplingMode::Flat);
+
+    let merged_path = dir.0.join("merged.hset");
+    let rebuilt_path = dir.0.join("rebuilt.hset");
+
+    group.bench_function("incremental_union", |bench| {
+        bench.iter(|| {
+            merge_hsets(black_box(&hmaster), black_box(&hbatch), HSET_OP_UNION, &merged_path, HSET_TLSH_INDEX, coalesce)
+                .expect("merge")
+        })
+    });
+    group.bench_function("rebuild_union", |bench| {
+        bench.iter(|| build_tlsh_hset(&rebuilt_path, black_box(&all), HSET_TLSH_INDEX).expect("rebuild"))
+    });
+
+    // the two results: same rows, same answers, then the query time on each
+    let merged = Hashset::open(&merged_path).expect("load merged");
+    let rebuilt = Hashset::open(&rebuilt_path).expect("load rebuilt");
+    let mi = merged.tlsh_index().expect("TLSH hash set");
+    let ri = rebuilt.tlsh_index().expect("TLSH hash set");
+    assert_eq!(merged.count(mi), rebuilt.count(ri));
+    for q in &queries {
+        assert_eq!(
+            merged.tlsh_knn(mi, q, K, MAX_DISTANCE, INCLUDE_LENGTH, Some(TLSH_KNN_INDEX)),
+            rebuilt.tlsh_knn(ri, q, K, MAX_DISTANCE, INCLUDE_LENGTH, Some(TLSH_KNN_INDEX))
+        );
+    }
+    eprintln!(
+        "hset_incremental_merge: merged {:.1} MiB, rebuilt {:.1} MiB, {} rows",
+        merged.file_len() as f64 / (1024.0 * 1024.0),
+        rebuilt.file_len() as f64 / (1024.0 * 1024.0),
+        merged.count(mi)
+    );
+
+    let mut out: Vec<TlshMatch> = Vec::with_capacity(K);
+    for (name, hset, tidx) in [("knn_merged", &merged, mi), ("knn_rebuilt", &rebuilt, ri)] {
+        group.bench_function(name, |bench| {
+            bench.iter(|| {
+                let mut found = 0usize;
+                for q in &queries {
+                    found += black_box(hset).tlsh_knn_into(
+                        tidx,
+                        black_box(q),
+                        K,
+                        MAX_DISTANCE,
+                        INCLUDE_LENGTH,
+                        Some(TLSH_KNN_INDEX),
+                        &mut out,
+                    );
+                }
+                found
+            })
+        });
+    }
+    group.finish();
+}
+
 criterion_group!(kernel, tlsh_diff_pair, knn_brute_ffi, tlsh_hash_4mib);
 criterion_group! {
     name = hset;
     config = Criterion::default()
         .warm_up_time(Duration::from_secs(1))
         .measurement_time(Duration::from_secs(3));
-    targets = hset_knn
+    targets = hset_knn, hset_incremental_merge
 }
 criterion_main!(kernel, hset);

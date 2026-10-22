@@ -32,6 +32,21 @@ pub const TLSH_KNN_INDEX: u32 = 2;
 pub const HSET_TLSH_VECTORS: u32 = 1;
 /// `SFHASH_HSET_TLSH_INDEX`: write the TIVF kNN index.
 pub const HSET_TLSH_INDEX: u32 = 2;
+/// `SFHASH_HSET_TLSH_INHERIT` (`sfhash_hashset_merge` only): write each
+/// optional TLSH section iff every input that has a TLSH hash set has it.
+pub const HSET_TLSH_INHERIT: u32 = 4;
+
+/// `SFHASH_HSET_OP_UNION`
+pub const HSET_OP_UNION: u32 = 1;
+/// `SFHASH_HSET_OP_INTERSECT`
+pub const HSET_OP_INTERSECT: u32 = 2;
+/// `SFHASH_HSET_OP_DIFFERENCE` (left minus right)
+pub const HSET_OP_DIFFERENCE: u32 = 3;
+
+/// `SFHASH_HSET_COALESCE_DEFAULT`: the library's default coalescing
+/// threshold for a merged TIVF index (twice the target list size, 64); 0
+/// disables coalescing.
+pub const HSET_COALESCE_DEFAULT: u32 = 0xFFFF_FFFF;
 
 /// Mirror of `struct SFHASH_HashValues`. Keep in sync with
 /// `include/hasher/hasher.h`; `tests::hash_values_layout` checks the size.
@@ -153,6 +168,18 @@ pub mod ffi {
         pub fn sfhash_hashset_builder_add_hash(bctx: *mut RawBuildCtx, hash: *const c_void, length: usize);
         pub fn sfhash_hashset_builder_write(bctx: *mut RawBuildCtx, err: *mut *mut RawError) -> u64;
         pub fn sfhash_hashset_builder_destroy(bctx: *mut RawBuildCtx);
+
+        pub fn sfhash_hashset_merge(
+            l: *const RawHashset,
+            r: *const RawHashset,
+            op: u32,
+            name: *const c_char,
+            desc: *const c_char,
+            output_file: *const c_char,
+            tlsh_options: u32,
+            coalesce_threshold: u32,
+            err: *mut *mut RawError,
+        ) -> u64;
     }
 }
 
@@ -748,6 +775,45 @@ pub fn build_tlsh_hset(
     Ok(written)
 }
 
+/// `sfhash_hashset_merge`: writes the union, intersection or difference
+/// (`HSET_OP_*`) of two loaded hash sets to `path` by merging their sorted
+/// sections, the TLSH cell index and kNN index carried through the merge
+/// (and the index's small lists coalesced with threshold
+/// `coalesce_threshold`, `HSET_COALESCE_DEFAULT` for the default) rather than
+/// rebuilt. `tlsh_options` is an OR of `HSET_TLSH_*` or `HSET_TLSH_INHERIT`.
+/// Returns the size of the file written.
+pub fn merge_hsets(
+    l: &Hashset,
+    r: &Hashset,
+    op: u32,
+    path: impl AsRef<Path>,
+    tlsh_options: u32,
+    coalesce_threshold: u32,
+) -> Result<u64, HashsetError> {
+    let name = c_string("tlsh-bench", "name")?;
+    let desc = c_string("merged TLSH corpus", "description")?;
+    let out_c = path_c_string(path.as_ref(), "output path")?;
+
+    let mut err: *mut RawError = ptr::null_mut();
+    let written = unsafe {
+        ffi::sfhash_hashset_merge(
+            l.raw,
+            r.raw,
+            op,
+            name.as_ptr(),
+            desc.as_ptr(),
+            out_c.as_ptr(),
+            tlsh_options,
+            coalesce_threshold,
+            &mut err,
+        )
+    };
+    if !err.is_null() {
+        return Err(take_error(err, "sfhash_hashset_merge failed"));
+    }
+    Ok(written)
+}
+
 /// Brute-force kNN with the hash set API's contract: rows with
 /// `diff <= max_distance`, nearest first, ties by ascending index, at most
 /// k, as `(index, distance)`. Null rows (diff -1) never match.
@@ -1188,6 +1254,58 @@ mod tests {
         assert_eq!(&vec[..TLSH_EMBEDDING_DIMS], &rows[0].embed()[..]);
         let last = rows.len() - 1;
         assert_eq!(&vec[last * TLSH_EMBEDDING_DIMS..], &rows[last].embed()[..]);
+    }
+
+    #[test]
+    fn hset_merge_union_matches_rebuild() {
+        // a union by merging has the rows of a build over both inputs and
+        // its carried, coalesced index searches exactly
+        let a = make_corpus(51, 3000);
+        let b = make_corpus(52, 1500);
+        let dir = TempDir::new("merge");
+        build_tlsh_hset(dir.0.join("a.hset"), &a, HSET_TLSH_INDEX).unwrap();
+        build_tlsh_hset(dir.0.join("b.hset"), &b, HSET_TLSH_INDEX).unwrap();
+        let ha = Hashset::open(dir.0.join("a.hset")).unwrap();
+        let hb = Hashset::open(dir.0.join("b.hset")).unwrap();
+
+        for coalesce in [HSET_COALESCE_DEFAULT, 0, 32] {
+            let out = dir.0.join("u.hset");
+            let written = merge_hsets(&ha, &hb, HSET_OP_UNION, &out, HSET_TLSH_INHERIT, coalesce).unwrap();
+            assert_eq!(written, fs::metadata(&out).unwrap().len());
+            let u = Hashset::open(&out).unwrap();
+            let tidx = u.tlsh_index().unwrap();
+            let mut all = a.clone();
+            all.extend_from_slice(&b);
+            let rows = u.tlsh_rows(tidx);
+            assert_eq!(rows, unique_sorted(&all));
+            assert_eq!(u.tlsh_knn_strategies(tidx), TLSH_KNN_BRUTE | TLSH_KNN_INDEX);
+            assert!(u.tlsh_vectors(tidx).is_none());
+
+            let mut rng = SplitMix64::new(53);
+            for _ in 0..20 {
+                let pick = rng.below(all.len() as u64) as usize;
+                let q = perturb(&mut rng, &all[pick], 0.05);
+                for incl in [true, false] {
+                    let want = knn_brute_with(&rows, &q, 10, 144, incl);
+                    assert_eq!(u.tlsh_knn(tidx, &q, 10, 144, incl, Some(TLSH_KNN_INDEX)), want);
+                }
+            }
+        }
+
+        // difference and intersection
+        let d = dir.0.join("d.hset");
+        merge_hsets(&ha, &hb, HSET_OP_DIFFERENCE, &d, HSET_TLSH_INHERIT, HSET_COALESCE_DEFAULT).unwrap();
+        let hd = Hashset::open(&d).unwrap();
+        let bset = unique_sorted(&b);
+        let want: Vec<TlshDigest> = unique_sorted(&a).into_iter().filter(|x| bset.binary_search(x).is_err()).collect();
+        assert_eq!(hd.tlsh_rows(hd.tlsh_index().unwrap()), want);
+
+        let i = dir.0.join("i.hset");
+        merge_hsets(&ha, &ha, HSET_OP_INTERSECT, &i, HSET_TLSH_INHERIT, HSET_COALESCE_DEFAULT).unwrap();
+        let hi = Hashset::open(&i).unwrap();
+        assert_eq!(hi.tlsh_rows(hi.tlsh_index().unwrap()), unique_sorted(&a));
+
+        assert!(merge_hsets(&ha, &hb, 9, dir.0.join("x.hset"), HSET_TLSH_INHERIT, HSET_COALESCE_DEFAULT).is_err());
     }
 
     #[test]

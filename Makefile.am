@@ -139,7 +139,7 @@ src_hsetop_hsetop_LDADD = $(HASHER_LIB) $(PROJECT_LIBS)
 
 bin_PROGRAMS = src/fuzzy/fuzzy src/hasher/hasher src/mkhashset/mkhashset src/hsetop/hsetop
 
-check_PROGRAMS = test/test test/bench_hex test/bench_hsd test/bench_tlsh
+check_PROGRAMS = test/test test/bench_hex test/bench_hsd test/bench_tlsh test/bench_hset_merge
 
 TESTS = \
 	test/test \
@@ -198,6 +198,14 @@ test_bench_tlsh_SOURCES = \
 
 test_bench_tlsh_CPPFLAGS = $(AM_CPPFLAGS) $(CATCH2_CFLAGS)
 test_bench_tlsh_LDADD = $(HASHER_LIB) $(TEST_LIBS) $(CATCH2_LIBS)
+
+test_bench_hset_merge_SOURCES = \
+	test/bench_hset_merge.cpp \
+	test/helper.cpp \
+	test/tlsh_corpus.cpp
+
+test_bench_hset_merge_CPPFLAGS = $(AM_CPPFLAGS) $(CATCH2_CFLAGS)
+test_bench_hset_merge_LDADD = $(HASHER_LIB) $(TEST_LIBS) $(CATCH2_LIBS)
 
 FORMAT_COMMAND := tools/git-clang-format -f --style=file
 

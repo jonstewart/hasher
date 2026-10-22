@@ -43,6 +43,7 @@
 /test/bench_hex
 /test/bench_hsd
 /test/bench_tlsh
+/test/bench_hset_merge
 /test/test
 /test-suite.log
 /test/*.log
