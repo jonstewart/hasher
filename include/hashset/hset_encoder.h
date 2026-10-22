@@ -20,9 +20,6 @@
 #include "hashset/tlsh_ivf.h"
 #include "hashset/util.h"
 
-// TIVF lists hold about this many rows each
-constexpr size_t TLSH_IVF_TARGET_LIST_SIZE = 32;
-
 // ISO-8601 UTC timestamp for the FHDR
 std::string make_timestamp(std::time_t tt = std::time(nullptr));
 
@@ -86,6 +83,19 @@ struct SFHASH_HashsetBuildCtx {
   // one per field: the TIVF index of a TLSH field that gets one, built from
   // the sorted rows before the layout is computed; empty otherwise
   std::vector<TlshIvf> tlsh_ivfs;
+
+  // the k-means target list size of those indexes (not settable through the
+  // C API; benchmarks vary it)
+  size_t tlsh_ivf_target_list_size = TLSH_IVF_TARGET_LIST_SIZE;
+
+  // set by the set-operation opens (sfhash_hashset_builder_union_open and
+  // friends): write then performs write_merged_hset of these two inputs
+  // instead of encoding added records or hashes
+  const SFHASH_Hashset* merge_left = nullptr;
+  const SFHASH_Hashset* merge_right = nullptr;
+  uint32_t merge_op = 0;
+  uint32_t coalesce_threshold = TLSH_IVF_DEFAULT_COALESCE;
+  bool merge_input_added = false; // add_record/add_hash was called on a set-operation context
 };
 
 size_t write_hashset(

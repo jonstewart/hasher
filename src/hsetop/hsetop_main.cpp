@@ -18,6 +18,17 @@ Set HSET_TLSH_OPTIONS to a bitwise OR of SFHASH_HSET_TLSH_VECTORS (1) and
 SFHASH_HSET_TLSH_INDEX (2) to choose explicitly (0 writes neither); a
 section an input lacks is then computed for the output.
 
+A merged TIVF index coalesces small lists per header cell so that repeated
+incremental merges stay within one list per cell of a from-scratch build
+(docs/TLSH_EMBEDDING.md, "Incremental merge"). HSET_COALESCE sets the
+threshold C (lists of fewer than C / 2 rows are coalesced); 0 disables
+coalescing and the default is 64.
+
+The same operations are available through the library's
+sfhash_hashset_builder_union_open / _intersect_open / _subtract_open, which
+build the same merged file through the builder's open / write / destroy
+sequence.
+
 Examples:
 
 hsetop union 'NSRL + malware' 'everything we know' nsrl.hset malware.hset all.hset
@@ -112,6 +123,16 @@ int main(int argc, char** argv) {
       }
     }
 
+    uint32_t coalesce = SFHASH_HSET_COALESCE_DEFAULT;
+    if (const char* c = std::getenv("HSET_COALESCE")) {
+      try {
+        coalesce = boost::lexical_cast<uint32_t>(c);
+      }
+      catch (const boost::bad_lexical_cast&) {
+        THROW("HSET_COALESCE is not a nonnegative integer: '" << c << "'");
+      }
+    }
+
     const Mapped lm(argv[4]);
     const Mapped rm(argv[5]);
     const HsetPtr l = load(lm, argv[4]);
@@ -119,7 +140,7 @@ int main(int argc, char** argv) {
 
     SFHASH_Error* err = nullptr;
     const uint64_t size = sfhash_hashset_merge(
-      l.get(), r.get(), op, argv[2], argv[3], argv[6], tlsh_options, &err
+      l.get(), r.get(), op, argv[2], argv[3], argv[6], tlsh_options, coalesce, &err
     );
     if (err) {
       const std::string msg = err->message;

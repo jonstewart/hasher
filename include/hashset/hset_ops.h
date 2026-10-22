@@ -1,40 +1,20 @@
 #pragma once
 
-#include "error.h"
-#include "throw.h"
-#include "hasher/hashset.h"
-#include "hashset/hset_decoder.h"
-
-#include <cstddef>
-#include <vector>
+#include <cstdint>
 #include <utility>
+#include <vector>
 
-template <class Fields, class Types>
-void collect_hash_types(const Fields& fields, Types& types) {
-  for (const auto& rfd: fields) {
-    types.emplace(
-      static_cast<SFHASH_HashAlgorithm>(rfd.type),
-      rfd.length
-    );
-  }
-}
+#include "hasher/hashset.h"
+#include "hashset/hset_structs.h"
 
-template <class OFields>
-void make_output_records(const uint8_t* ibeg, const uint8_t* iend, size_t irlen, const OFields& ofields, std::vector<std::vector<uint8_t>>& out) {
-  for (const uint8_t* ir = ibeg; ir < iend; ir += irlen) {
-    std::vector<uint8_t> orec;
-    for (const auto& [i, hlen]: ofields) {
-      if (i == -1) {
-        orec.insert(orec.end(), 1 + hlen, 0);
-      }
-      else {
-        const uint8_t* f = static_cast<const uint8_t*>(sfhash_hashset_record_field(reinterpret_cast<const SFHASH_HashsetRecord*>(ir), i));
-        orec.insert(orec.end(), f, f + 1 + hlen);
-      }
-    }
-    out.push_back(std::move(orec));
-  }
-}
+/*
+ * Record-level set operations of two record tables, as merge_records
+ * computes them (HASHSET_FORMAT "Set operations"): the output records
+ * widened to the left fields followed by the right fields the left lacks,
+ * sorted and unique, with the output field types. These are the
+ * sfhash_hashset_builder_*_open operations on the record tables alone;
+ * they exist for tests, the library merges whole files.
+ */
 
 std::pair<
   std::vector<std::vector<uint8_t>>,

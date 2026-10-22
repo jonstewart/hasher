@@ -33,6 +33,7 @@ namespace bip = boost::interprocess;
 #include "rwutil.h"
 #include "util.h"
 #include "hashset/hset_encoder_chunks.h"
+#include "hashset/hset_merge.h"
 #include "hashset/record_iterator.h"
 #include "hashset/tlsh_cells.h"
 #include "hashset/tlsh_ivf.h"
@@ -178,6 +179,7 @@ void count_hashes_and_build_indexes(
   RecordIterator rbeg,
   RecordIterator rend,
   uint32_t tlsh_options,
+  size_t target_list_size,
   std::vector<uint64_t>& hash_counts,
   std::vector<TlshIvf>& ivfs)
 {
@@ -208,7 +210,7 @@ void count_hashes_and_build_indexes(
     if (wants_tivf(rhdr.fields[f], tlsh_options)) {
       auto& rows = tlsh_rows[f];
       std::sort(rows.begin(), rows.end());
-      ivfs[f] = build_tlsh_ivf(rows.data(), rows.data() + rows.size(), TLSH_IVF_TARGET_LIST_SIZE);
+      ivfs[f] = build_tlsh_ivf(rows.data(), rows.data() + rows.size(), target_list_size);
       rows.clear();
       rows.shrink_to_fit();
     }
@@ -799,6 +801,12 @@ void sfhash_hashset_builder_add_record(
   SFHASH_HashsetBuildCtx* bctx,
   const void* record)
 {
+  if (bctx->merge_left) {
+    // a set-operation context takes no input; write reports it
+    bctx->merge_input_added = true;
+    return;
+  }
+
   auto& rhdr = bctx->rhdr;
   auto& field_pos = bctx->field_pos;
 
@@ -822,6 +830,11 @@ void sfhash_hashset_builder_add_hash(
   size_t length)
 {
 // TODO: check length?
+
+  if (bctx->merge_left) {
+    bctx->merge_input_added = true;
+    return;
+  }
 
   auto& field_pos = bctx->field_pos;
   auto& rhdr = bctx->rhdr;
@@ -857,6 +870,23 @@ void sfhash_hashset_builder_add_hash(
 uint64_t hashset_builder_write(SFHASH_HashsetBuildCtx* bctx) {
   const auto& outfile = bctx->outfile;
 
+  if (bctx->merge_left) {
+    // a set-operation context: the output is the merge of the two inputs
+    THROW_IF(
+      bctx->merge_input_added,
+      "records or hashes were added to a set-operation build context"
+    );
+    MergeOptions options;
+    options.tlsh_options = bctx->tlsh_options;
+    options.coalesce_threshold = bctx->coalesce_threshold;
+    options.write_records = bctx->with_records;
+    options.write_hashsets = bctx->with_hashsets;
+    return write_merged_hset(
+      *bctx->merge_left, *bctx->merge_right, make_merge_op(bctx->merge_op),
+      bctx->fhdr.name, bctx->fhdr.desc, outfile, options
+    );
+  }
+
   auto& ftoc = bctx->ftoc;
   const auto& fhdr = bctx->fhdr;
   auto& rhdr = bctx->rhdr;
@@ -890,7 +920,8 @@ uint64_t hashset_builder_write(SFHASH_HashsetBuildCtx* bctx) {
 
       if (bctx->with_hashsets) {
         count_hashes_and_build_indexes(
-          rhdr, rbeg, rend, bctx->tlsh_options, hash_counts, bctx->tlsh_ivfs
+          rhdr, rbeg, rend, bctx->tlsh_options, bctx->tlsh_ivf_target_list_size,
+          hash_counts, bctx->tlsh_ivfs
         );
       }
     }
@@ -1029,7 +1060,7 @@ uint64_t hashset_builder_write(SFHASH_HashsetBuildCtx* bctx) {
         // are copied verbatim into the HDAT below
         if (wants_tivf(rhdr.fields[i], bctx->tlsh_options)) {
           const auto* tbeg = reinterpret_cast<const TlshDigest*>(out);
-          bctx->tlsh_ivfs[i] = build_tlsh_ivf(tbeg, tbeg + hhdr.hash_count, TLSH_IVF_TARGET_LIST_SIZE);
+          bctx->tlsh_ivfs[i] = build_tlsh_ivf(tbeg, tbeg + hhdr.hash_count, bctx->tlsh_ivf_target_list_size);
         }
       }
 

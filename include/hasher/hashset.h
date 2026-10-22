@@ -269,6 +269,22 @@ uint64_t sfhash_hashset_builder_write(
 
 void sfhash_hashset_builder_destroy(SFHASH_HashsetBuildCtx* bctx);
 
+/*
+ * Set operations in the builder's shape: *_open returns a build context
+ * for the union, intersection or difference (l minus r) of two loaded
+ * hashsets, sfhash_hashset_builder_write writes the result to output_file
+ * and sfhash_hashset_builder_destroy frees the context. The result is the
+ * merge of the inputs exactly as sfhash_hashset_merge computes it (see
+ * HASHSET_FORMAT, "Set operations"): records are written when both inputs
+ * have record tables and write_records is set, hash sections when the
+ * inputs have them and write_hashsets is set. The optional TLSH sections
+ * default to both (sfhash_hashset_builder_set_tlsh_options changes that,
+ * SFHASH_HSET_TLSH_INHERIT included) and the index coalescing threshold to
+ * SFHASH_HSET_COALESCE_DEFAULT (sfhash_hashset_builder_set_coalesce_threshold).
+ * Nothing can be added to such a context: write fails if
+ * sfhash_hashset_builder_add_record or _add_hash was called on it. temp_dir
+ * is accepted for compatibility and unused.
+ */
 SFHASH_HashsetBuildCtx* sfhash_hashset_builder_union_open(
   const SFHASH_Hashset* l,
   const SFHASH_Hashset* r,
@@ -306,12 +322,35 @@ SFHASH_HashsetBuildCtx* sfhash_hashset_builder_subtract_open(
 );
 
 /*
+ * The coalescing threshold (see SFHASH_HSET_COALESCE_DEFAULT below) of the
+ * TLSH kNN index written by a set-operation build context. Call after *_open
+ * and before *_write.
+ */
+void sfhash_hashset_builder_set_coalesce_threshold(
+  SFHASH_HashsetBuildCtx* bctx,
+  uint32_t coalesce_threshold
+);
+
+/*
  * Set operations on whole hashsets by merging.
  */
 enum {
   SFHASH_HSET_OP_UNION = 1,
   SFHASH_HSET_OP_INTERSECT = 2,
   SFHASH_HSET_OP_DIFFERENCE = 3
+};
+
+/*
+ * The coalescing threshold of a merged TLSH kNN index (C in
+ * docs/TLSH_EMBEDDING.md section 3): per header cell, lists with fewer than
+ * C / 2 rows are coalesced pairwise until at most one remains, which keeps
+ * the index within one list per nonempty cell of a from-scratch build over
+ * any number of incremental merges. 0 disables coalescing (lists are only
+ * concatenated); SFHASH_HSET_COALESCE_DEFAULT selects the library default,
+ * twice the target list size of a fresh build (64).
+ */
+enum {
+  SFHASH_HSET_COALESCE_DEFAULT = 0xFFFFFFFF
 };
 
 /*
@@ -328,7 +367,7 @@ enum {
  *
  * tlsh_options is a bitwise OR of SFHASH_HSET_TLSH_* values selecting the
  * optional TLSH sections, or SFHASH_HSET_TLSH_INHERIT to keep what the
- * inputs have.
+ * inputs have. coalesce_threshold is described above.
  *
  * Returns the size of the output file, or 0 on error (err set).
  */
@@ -340,6 +379,7 @@ uint64_t sfhash_hashset_merge(
   const char* desc,
   const char* output_file,
   uint32_t tlsh_options,
+  uint32_t coalesce_threshold,
   SFHASH_Error** err
 );
 

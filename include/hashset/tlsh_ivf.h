@@ -9,6 +9,14 @@
 #include "tlsh_embedding.h"
 #include "hashset/tlsh_search.h"
 
+// TIVF lists hold about this many rows each: the k-means target of
+// build_tlsh_ivf (T in docs/TLSH_EMBEDDING.md)
+constexpr size_t TLSH_IVF_TARGET_LIST_SIZE = 32;
+
+// default coalescing threshold of merge_tlsh_ivf (C in the docs): two lists
+// of a cell are coalesced while both have fewer than C / 2 members
+constexpr uint32_t TLSH_IVF_DEFAULT_COALESCE = 2 * TLSH_IVF_TARGET_LIST_SIZE;
+
 /*
  * Inverted-file index over the body embedding of a sorted TLSH hash set.
  * See docs/TLSH_EMBEDDING.md section 3.
@@ -40,7 +48,7 @@ struct TlshIvf {
 TlshIvf build_tlsh_ivf(
   const TlshDigest* beg,
   const TlshDigest* end,
-  size_t target_list_size = 32,
+  size_t target_list_size = TLSH_IVF_TARGET_LIST_SIZE,
   uint64_t seed = 0x7175657279,
   unsigned threads = 0
 );
@@ -67,27 +75,44 @@ constexpr uint32_t TLSH_IVF_DROPPED = UINT32_MAX;
 
 /*
  * Merges two indexes over hash sets that have been merged into one of n_out
- * rows, in O(lists + ids) and without re-clustering. a_map[i] (b_map[j]) is
- * the output row of input row i of a (j of b), or TLSH_IVF_DROPPED when the
- * merge dropped it; maps must be increasing over the kept rows of each side,
- * which the sorted two-pointer merge of the rows guarantees.
+ * rows (rows, in output order), in O(lists + ids) plus the coalescing below,
+ * and without re-clustering. a_map[i] (b_map[j]) is the output row of input
+ * row i of a (j of b), or TLSH_IVF_DROPPED when the merge dropped it; maps
+ * must be increasing over the kept rows of each side, which the sorted
+ * two-pointer merge of the rows guarantees.
  *
  * For each cell the output lists are a's lists followed by b's, ids
- * remapped, dropped ids removed and lists that become empty omitted.
- * Medoids and radii are kept verbatim: the members of an output list are a
- * subset of the input list's, so every member is still within radius2 of
- * the medoid, which is all the search needs; the medoid itself need not be
- * a member. Lists only shrink, so after many merges a from-scratch
- * build_tlsh_ivf gives tighter lists; this function never makes the search
- * inexact. Either view may be empty (a side with no rows).
+ * remapped, dropped ids removed and lists that become empty omitted. A list
+ * that lost members keeps its medoid and gets its radius2 recomputed exactly
+ * over the remaining members; other lists keep medoid and radius2 verbatim
+ * (the medoid need not be a member of its list, the search only needs every
+ * member within radius2 of it).
+ *
+ * Then, with coalesce_threshold C > 0, lists of a cell are coalesced so that
+ * plain concatenation cannot pile up small lists over repeated merges: while
+ * the cell has two lists of fewer than C / 2 members each (so the pair sums
+ * to less than C), the pair whose union has the smallest radius is replaced
+ * by one list whose medoid is whichever of the two medoids gives that
+ * radius (computed exactly with the kernel), radius2 that maximum, and ids
+ * the sorted union. On exit at most one list per cell has fewer than C / 2
+ * members (tlsh_ivf_check_invariant), which bounds the lists of a cell of m
+ * rows by 2m / C + 1; see docs/TLSH_EMBEDDING.md section 3. C == 0 disables
+ * coalescing. Either view may be empty (a side with no rows).
  */
 TlshIvf merge_tlsh_ivf(
   const TlshIvfView& a,
   const uint32_t* a_map,
   const TlshIvfView& b,
   const uint32_t* b_map,
-  uint64_t n_out
+  const TlshDigest* rows,
+  uint64_t n_out,
+  uint32_t coalesce_threshold = TLSH_IVF_DEFAULT_COALESCE
 );
+
+// The coalescing invariant of merge_tlsh_ivf: at most one list per cell has
+// fewer than coalesce_threshold / 2 members. Trivially true for a threshold
+// of 0.
+bool tlsh_ivf_check_invariant(const TlshIvfView& v, uint32_t coalesce_threshold);
 
 size_t length_tivf_data(uint32_t lists, uint64_t n);
 

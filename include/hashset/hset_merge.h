@@ -44,7 +44,9 @@ constexpr uint64_t MERGE_RECORD_DROPPED = UINT64_MAX;
  * With record maps the rows belong to records (lridx[i] is the record of
  * left row i, lrecmap that record's fate) and the operation has already
  * been applied to the records: a row is emitted iff its record was, and
- * equal rows are not collapsed. On ties left rows precede right rows.
+ * equal rows are not collapsed unless collapse_equal is set (for a
+ * hashsets-only output of a record-level operation, where equal rows are
+ * written once). On ties left rows precede right rows.
  */
 uint64_t merge_rows(
   MergeOp op,
@@ -58,7 +60,8 @@ uint64_t merge_rows(
   const uint64_t* rridx,
   const uint64_t* rrecmap,
   std::vector<uint32_t>& lmap,
-  std::vector<uint32_t>& rmap
+  std::vector<uint32_t>& rmap,
+  bool collapse_equal = false
 );
 
 struct RecordMerge {
@@ -69,12 +72,19 @@ struct RecordMerge {
   uint64_t record_count() const { return record_length ? rdat.size() / record_length : 0; }
 };
 
+// The output fields of merging two record tables: the left fields followed
+// by the right fields the left lacks. Throws if a field has different
+// lengths on the two sides.
+std::vector<RecordFieldDescriptor> merged_record_fields(
+  const RecordHeader& lrhdr,
+  const RecordHeader& rrhdr
+);
+
 /*
- * Merges two record tables. The output fields are the left fields followed
- * by the right fields the left lacks; records are widened to them (absent
- * fields are zero) and merged in sorted order, identical records collapsing
- * to one. For INTERSECT and DIFFERENCE only left records are emitted, so
- * rmap is all MERGE_RECORD_DROPPED.
+ * Merges two record tables. The output fields are merged_record_fields;
+ * records are widened to them (absent fields are zero) and merged in sorted
+ * order, identical records collapsing to one. For INTERSECT and DIFFERENCE
+ * only left records are emitted, so rmap is all MERGE_RECORD_DROPPED.
  */
 RecordMerge merge_records(
   MergeOp op,
@@ -85,11 +95,28 @@ RecordMerge merge_records(
 );
 
 /*
- * Writes the merge of l and r to outfile and returns its size. tlsh_options
- * is a bitwise OR of SFHASH_HSET_TLSH_* values; with SFHASH_HSET_TLSH_INHERIT
- * each optional TLSH section is written iff every input side that has a
- * TLSH section has it.
+ * Options of write_merged_hset.
+ *
+ * tlsh_options is a bitwise OR of SFHASH_HSET_TLSH_* values; with
+ * SFHASH_HSET_TLSH_INHERIT each optional TLSH section is written iff every
+ * input side that has a TLSH section has it.
+ *
+ * coalesce_threshold is C of merge_tlsh_ivf (0 disables coalescing).
+ *
+ * The output has a record table iff both inputs have one and write_records
+ * is set; hash sections iff the inputs have them and write_hashsets is set.
+ * When both inputs have records the operation is applied to the records
+ * (rows follow their records) whether or not the table is written; without
+ * it the rows are then deduplicated like any hashsets-only file.
  */
+struct MergeOptions {
+  uint32_t tlsh_options = SFHASH_HSET_TLSH_INHERIT;
+  uint32_t coalesce_threshold = TLSH_IVF_DEFAULT_COALESCE;
+  bool write_records = true;
+  bool write_hashsets = true;
+};
+
+// Writes the merge of l and r to outfile and returns its size.
 uint64_t write_merged_hset(
   const SFHASH_Hashset& l,
   const SFHASH_Hashset& r,
@@ -97,5 +124,5 @@ uint64_t write_merged_hset(
   const std::string& name,
   const std::string& desc,
   const std::filesystem::path& outfile,
-  uint32_t tlsh_options
+  const MergeOptions& options
 );

@@ -9,7 +9,10 @@
 #include <queue>
 #include <random>
 #include <atomic>
+#include <functional>
+#include <iterator>
 #include <thread>
+#include <tuple>
 
 #include "rwutil.h"
 #include "throw.h"
@@ -299,16 +302,163 @@ constexpr uint16_t TIVF_VERSION = 3;
 
 } // namespace
 
+namespace {
+
+// a list of one cell while it is merged
+struct MergeList {
+  TlshDigest medoid;
+  uint32_t radius2;
+  std::vector<uint32_t> ids; // output rows, ascending
+};
+
+// exact squared body-embedding radius about m over the rows ids
+uint32_t radius_about(const TlshDigest& m, const std::vector<uint32_t>& ids, const TlshDigest* rows) {
+  const TlshBodyQuery q(m);
+  uint32_t r = 0;
+  for (const uint32_t id: ids) {
+    r = std::max(r, q.emb_body(rows[id]));
+  }
+  return r;
+}
+
+/*
+ * Coalesces the lists of one cell in place (see merge_tlsh_ivf): while two
+ * lists have fewer than half members each, the pair whose union has the
+ * smallest exact radius about one of the two medoids becomes one list.
+ * Pairs are ranked through a heap with lazy invalidation, so a cell with s
+ * small lists costs O(s^2 log s) plus s * (rows in small lists) kernel
+ * evaluations. Emptied lists are removed; the order of the rest is kept.
+ */
+void coalesce_cell(std::vector<MergeList>& lists, const TlshDigest* rows, uint32_t half) {
+  std::vector<size_t> small; // indexes into lists
+  for (size_t i = 0; i < lists.size(); ++i) {
+    if (lists[i].ids.size() < half) {
+      small.push_back(i);
+    }
+  }
+  const size_t s = small.size();
+  if (s < 2) {
+    return;
+  }
+
+  // dist[i * s + j]: max squared distance from the medoid of small list i
+  // over the members of small list j; exact, including the diagonal
+  std::vector<uint32_t> dist(s * s);
+  for (size_t i = 0; i < s; ++i) {
+    const TlshBodyQuery q(lists[small[i]].medoid);
+    for (size_t j = 0; j < s; ++j) {
+      uint32_t r = 0;
+      for (const uint32_t id: lists[small[j]].ids) {
+        r = std::max(r, q.emb_body(rows[id]));
+      }
+      dist[i * s + j] = r;
+    }
+  }
+
+  // candidate pair: (radius of the union, i, j, versions of i and j when
+  // pushed); the smallest radius first, ties by (i, j)
+  struct Cand {
+    uint32_t radius2;
+    uint32_t i, j;
+    uint32_t vi, vj;
+    bool operator>(const Cand& o) const {
+      return std::tie(radius2, i, j) > std::tie(o.radius2, o.i, o.j);
+    }
+  };
+  std::priority_queue<Cand, std::vector<Cand>, std::greater<Cand>> heap;
+
+  std::vector<uint32_t> version(s, 0);
+  std::vector<bool> alive(s, true); // still a small list
+  size_t alive_count = s;
+
+  // radius of the union of i and j about the medoid of i
+  const auto about = [&](size_t i, size_t j) {
+    return std::max(dist[i * s + i], dist[i * s + j]);
+  };
+  const auto push = [&](size_t i, size_t j) {
+    heap.push({
+      std::min(about(i, j), about(j, i)),
+      static_cast<uint32_t>(i), static_cast<uint32_t>(j),
+      version[i], version[j]
+    });
+  };
+
+  for (size_t i = 0; i < s; ++i) {
+    for (size_t j = i + 1; j < s; ++j) {
+      push(i, j);
+    }
+  }
+
+  while (alive_count >= 2 && !heap.empty()) {
+    const Cand c = heap.top();
+    heap.pop();
+    if (!alive[c.i] || !alive[c.j] || version[c.i] != c.vi || version[c.j] != c.vj) {
+      continue; // stale
+    }
+    const size_t i = c.i, j = c.j;
+    MergeList& a = lists[small[i]];
+    MergeList& b = lists[small[j]];
+
+    // the medoid giving the smaller radius; a's on ties
+    const bool keep_a = about(i, j) <= about(j, i);
+
+    std::vector<uint32_t> u;
+    u.reserve(a.ids.size() + b.ids.size());
+    std::merge(a.ids.begin(), a.ids.end(), b.ids.begin(), b.ids.end(), std::back_inserter(u));
+    a.ids = std::move(u);
+    if (!keep_a) {
+      a.medoid = b.medoid;
+    }
+    a.radius2 = c.radius2;
+    b.ids.clear();
+    b.ids.shrink_to_fit();
+
+    // distances from the merged list's medoid, and to its members
+    for (size_t k = 0; k < s; ++k) {
+      if (!keep_a) {
+        dist[i * s + k] = dist[j * s + k];
+      }
+      dist[k * s + i] = std::max(dist[k * s + i], dist[k * s + j]);
+    }
+    dist[i * s + i] = c.radius2;
+
+    alive[j] = false;
+    --alive_count;
+    ++version[i];
+    if (a.ids.size() >= half) {
+      alive[i] = false;
+      --alive_count;
+    }
+    else {
+      for (size_t k = 0; k < s; ++k) {
+        if (k != i && alive[k]) {
+          push(std::min(i, k), std::max(i, k));
+        }
+      }
+    }
+  }
+
+  lists.erase(
+    std::remove_if(lists.begin(), lists.end(), [](const MergeList& l) { return l.ids.empty(); }),
+    lists.end()
+  );
+}
+
+} // namespace
+
 TlshIvf merge_tlsh_ivf(
   const TlshIvfView& a,
   const uint32_t* a_map,
   const TlshIvfView& b,
   const uint32_t* b_map,
-  uint64_t n_out)
+  const TlshDigest* rows,
+  uint64_t n_out,
+  uint32_t coalesce_threshold)
 {
   THROW_IF(n_out > std::numeric_limits<uint32_t>::max(), "too many rows for a TIVF index");
   THROW_IF(!a.empty() && !a_map, "missing row map for the left index");
   THROW_IF(!b.empty() && !b_map, "missing row map for the right index");
+  THROW_IF(n_out && !rows, "missing rows for the merged index");
 
   TlshIvf out;
   out.n = n_out;
@@ -316,39 +466,55 @@ TlshIvf merge_tlsh_ivf(
   out.list_start.push_back(0);
   out.ids.reserve(n_out);
 
-  // appends the lists of cell c of one input, remapped
-  const auto append_cell = [&out](const TlshIvfView& v, const uint32_t* map, uint32_t c) {
+  const uint32_t half = coalesce_threshold / 2;
+
+  std::vector<MergeList> cell;
+
+  // appends the lists of cell c of one input to cell, remapped; a list that
+  // lost members gets its radius recomputed
+  const auto gather = [&](const TlshIvfView& v, const uint32_t* map, uint32_t c) {
     if (v.empty()) {
       return;
     }
     for (uint32_t l = v.cell_lists[c]; l < v.cell_lists[c + 1]; ++l) {
-      const size_t before = out.ids.size();
-      uint32_t prev = 0;
+      MergeList m{ v.medoids[l], v.radius2[l], {} };
+      bool shrunk = false;
       for (uint64_t i = v.list_start[l]; i < v.list_start[l + 1]; ++i) {
         const uint32_t id = map[v.ids[i]];
         if (id == TLSH_IVF_DROPPED) {
+          shrunk = true;
           continue;
         }
         THROW_IF(
-          out.ids.size() > before && id <= prev,
+          !m.ids.empty() && id <= m.ids.back(),
           "row map is not increasing within a TIVF list"
         );
-        out.ids.push_back(id);
-        prev = id;
+        m.ids.push_back(id);
       }
-      if (out.ids.size() == before) {
+      if (m.ids.empty()) {
         continue; // every member was dropped
       }
-      out.medoids.push_back(v.medoids[l]);
-      out.radius2.push_back(v.radius2[l]);
-      out.list_start.push_back(out.ids.size());
+      if (shrunk) {
+        m.radius2 = radius_about(m.medoid, m.ids, rows);
+      }
+      cell.push_back(std::move(m));
     }
   };
 
   for (uint32_t c = 0; c < TLSH_CELL_COUNT; ++c) {
     out.cell_lists[c] = static_cast<uint32_t>(out.lists());
-    append_cell(a, a_map, c);
-    append_cell(b, b_map, c);
+    cell.clear();
+    gather(a, a_map, c);
+    gather(b, b_map, c);
+    if (half > 0 && cell.size() > 1) {
+      coalesce_cell(cell, rows, half);
+    }
+    for (const MergeList& m: cell) {
+      out.medoids.push_back(m.medoid);
+      out.radius2.push_back(m.radius2);
+      out.ids.insert(out.ids.end(), m.ids.begin(), m.ids.end());
+      out.list_start.push_back(out.ids.size());
+    }
   }
   out.cell_lists[TLSH_CELL_COUNT] = static_cast<uint32_t>(out.lists());
 
@@ -358,6 +524,22 @@ TlshIvf merge_tlsh_ivf(
   );
 
   return out;
+}
+
+bool tlsh_ivf_check_invariant(const TlshIvfView& v, uint32_t coalesce_threshold) {
+  const uint64_t half = coalesce_threshold / 2;
+  if (v.empty() || half == 0) {
+    return true;
+  }
+  for (uint32_t c = 0; c < TLSH_CELL_COUNT; ++c) {
+    size_t small = 0;
+    for (uint32_t l = v.cell_lists[c]; l < v.cell_lists[c + 1]; ++l) {
+      if (v.list_start[l + 1] - v.list_start[l] < half && ++small > 1) {
+        return false;
+      }
+    }
+  }
+  return true;
 }
 
 size_t length_tivf_data(uint32_t lists, uint64_t n) {

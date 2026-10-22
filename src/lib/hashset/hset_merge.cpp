@@ -49,7 +49,8 @@ uint64_t merge_rows(
   const uint64_t* rridx,
   const uint64_t* rrecmap,
   std::vector<uint32_t>& lmap,
-  std::vector<uint32_t>& rmap)
+  std::vector<uint32_t>& rmap,
+  bool collapse_equal)
 {
   THROW_IF(len == 0, "zero-length rows");
   THROW_IF(ln && !lbeg, "left rows are missing");
@@ -71,6 +72,8 @@ uint64_t merge_rows(
     const auto lkept = [&](uint64_t k) { return lrecmap[lridx[k]] != MERGE_RECORD_DROPPED; };
     const auto rkept = [&](uint64_t k) { return rrecmap[rridx[k]] != MERGE_RECORD_DROPPED; };
 
+    const uint8_t* last = nullptr; // the previous emitted row
+
     while (true) {
       while (i < ln && !lkept(i)) {
         ++i;
@@ -89,6 +92,14 @@ uint64_t merge_rows(
       else {
         take_left = i < ln;
       }
+
+      const uint8_t* r = take_left ? row(lbeg, i) : row(rbeg, j);
+      if (collapse_equal && last && std::memcmp(r, last, len) == 0) {
+        // equal to the previous emitted row: dropped
+        take_left ? ++i : ++j;
+        continue;
+      }
+      last = r;
 
       if (take_left) {
         lmap[i++] = static_cast<uint32_t>(out++);
@@ -218,24 +229,19 @@ std::vector<uint64_t> sorted_order(const std::vector<uint8_t>& w, uint64_t olen)
 
 } // namespace
 
-RecordMerge merge_records(
-  MergeOp op,
+std::vector<RecordFieldDescriptor> merged_record_fields(
   const RecordHeader& lrhdr,
-  const ConstRecordData& lrdat,
-  const RecordHeader& rrhdr,
-  const ConstRecordData& rrdat)
+  const RecordHeader& rrhdr)
 {
-  RecordMerge rm;
-
-  // output fields: the left fields, then the right fields the left lacks
-  rm.fields = lrhdr.fields;
+  // the left fields, then the right fields the left lacks
+  std::vector<RecordFieldDescriptor> fields = lrhdr.fields;
   for (const auto& f: rrhdr.fields) {
     const auto i = std::find_if(
-      rm.fields.begin(), rm.fields.end(),
+      fields.begin(), fields.end(),
       [&f](const RecordFieldDescriptor& o) { return o.type == f.type; }
     );
-    if (i == rm.fields.end()) {
-      rm.fields.push_back(f);
+    if (i == fields.end()) {
+      fields.push_back(f);
     }
     else {
       THROW_IF(
@@ -244,6 +250,18 @@ RecordMerge merge_records(
       );
     }
   }
+  return fields;
+}
+
+RecordMerge merge_records(
+  MergeOp op,
+  const RecordHeader& lrhdr,
+  const ConstRecordData& lrdat,
+  const RecordHeader& rrhdr,
+  const ConstRecordData& rrdat)
+{
+  RecordMerge rm;
+  rm.fields = merged_record_fields(lrhdr, rrhdr);
   rm.record_length = record_length_of(rm.fields);
   const uint64_t olen = rm.record_length;
 
@@ -378,27 +396,33 @@ uint64_t write_merged_hset(
   const std::string& name,
   const std::string& desc,
   const std::filesystem::path& outfile,
-  uint32_t tlsh_options)
+  const MergeOptions& options)
 {
   const Holder& lh = l.holder;
   const Holder& rh = r.holder;
+  const uint32_t tlsh_options = options.tlsh_options;
 
   THROW_IF(name.size() > std::numeric_limits<uint16_t>::max(), "name is too long, maximum length is 65535 chars");
   THROW_IF(desc.size() > std::numeric_limits<uint16_t>::max(), "desc is too long, maximum length is 65535 chars");
 
-  const bool with_records = has_records(lh) && has_records(rh);
+  // the operation is applied to the records when both sides have them
+  const bool record_merge = has_records(lh) && has_records(rh);
   THROW_IF(
     lh.hsets.empty() != rh.hsets.empty(),
     "cannot merge a records-only hashset with one that has hash sections"
   );
-  const bool with_hashsets = !lh.hsets.empty();
-  THROW_IF(!with_records && !with_hashsets, "the inputs have neither records nor hash sections in common");
+  THROW_IF(!record_merge && lh.hsets.empty(), "the inputs have neither records nor hash sections in common");
+
+  // what the output gets
+  const bool with_records = record_merge && options.write_records;
+  const bool with_hashsets = !lh.hsets.empty() && options.write_hashsets;
+  THROW_IF(!with_records && !with_hashsets, "neither records nor hash sections are to be written");
 
   //
   // merge the records
   //
   RecordMerge rm;
-  if (with_records) {
+  if (record_merge) {
     rm = merge_records(op, lh.rhdr, lh.rdat, rh.rhdr, rh.rdat);
   }
 
@@ -406,7 +430,7 @@ uint64_t write_merged_hset(
   // merge the hash sections
   //
   std::vector<RecordFieldDescriptor> ofields;
-  if (with_records) {
+  if (record_merge) {
     ofields = rm.fields;
   }
   else {
@@ -435,13 +459,13 @@ uint64_t write_merged_hset(
             sname << " " << f.name << " hashset has hash length " << hhdr.hash_length << ", expected " << f.length
           );
           THROW_IF(
-            with_records && !ridx_of(side),
+            record_merge && !ridx_of(side),
             sname << " " << f.name << " hashset has no record index"
           );
         }
         else {
           THROW_IF(
-            with_records && has_field(*h, f.type),
+            record_merge && has_field(*h, f.type),
             sname << " has a " << f.name << " field but no " << f.name << " hashset"
           );
         }
@@ -452,11 +476,12 @@ uint64_t write_merged_hset(
         rows_of(s.ls), count_of(s.ls),
         rows_of(s.rs), count_of(s.rs),
         f.length,
-        with_records ? ridx_of(s.ls) : nullptr,
-        with_records ? rm.lmap.data() : nullptr,
-        with_records ? ridx_of(s.rs) : nullptr,
-        with_records ? rm.rmap.data() : nullptr,
-        s.lmap, s.rmap
+        record_merge ? ridx_of(s.ls) : nullptr,
+        record_merge ? rm.lmap.data() : nullptr,
+        record_merge ? ridx_of(s.rs) : nullptr,
+        record_merge ? rm.rmap.data() : nullptr,
+        s.lmap, s.rmap,
+        record_merge && !with_records // hashsets-only output: equal rows once
       );
 
       if (f.type == SFHASH_TLSH) {
@@ -471,22 +496,26 @@ uint64_t write_merged_hset(
         }
 
         if (s.tivf) {
+          // the merged rows, in output order
+          std::vector<TlshDigest> rows(s.n);
+          for_each_kept_row(s, [&](const HashsetTuple* side, uint64_t i, uint32_t k) {
+            std::memcpy(&rows[k], rows_of(side) + i * sizeof(TlshDigest), sizeof(TlshDigest));
+          });
+
           if ((!s.ls || has_tivf(s.ls)) && (!s.rs || has_tivf(s.rs))) {
-            // carry the lists through the merge
+            // carry the lists through the merge, coalescing small ones
             s.ivf = merge_tlsh_ivf(
               s.ls ? std::get<TlshIvfView>(*s.ls) : TlshIvfView(),
               s.lmap.data(),
               s.rs ? std::get<TlshIvfView>(*s.rs) : TlshIvfView(),
               s.rmap.data(),
-              s.n
+              rows.data(),
+              s.n,
+              options.coalesce_threshold
             );
           }
           else {
             // a side lacks an index: cluster the merged rows from scratch
-            std::vector<TlshDigest> rows(s.n);
-            for_each_kept_row(s, [&](const HashsetTuple* side, uint64_t i, uint32_t k) {
-              std::memcpy(&rows[k], rows_of(side) + i * sizeof(TlshDigest), sizeof(TlshDigest));
-            });
             s.ivf = build_tlsh_ivf(rows.data(), rows.data() + rows.size(), TLSH_IVF_TARGET_LIST_SIZE);
           }
         }
@@ -752,12 +781,17 @@ uint64_t sfhash_hashset_merge(
   const char* desc,
   const char* output_file,
   uint32_t tlsh_options,
+  uint32_t coalesce_threshold,
   SFHASH_Error** err)
 {
   try {
     THROW_IF(!l || !r, "null hashset operand");
     THROW_IF(!name || !desc || !output_file, "null name, desc or output_file");
-    return write_merged_hset(*l, *r, make_merge_op(op), name, desc, output_file, tlsh_options);
+    MergeOptions options;
+    options.tlsh_options = tlsh_options;
+    options.coalesce_threshold = coalesce_threshold == SFHASH_HSET_COALESCE_DEFAULT ?
+      TLSH_IVF_DEFAULT_COALESCE : coalesce_threshold;
+    return write_merged_hset(*l, *r, make_merge_op(op), name, desc, output_file, options);
   }
   catch (const std::exception& e) {
     fill_error(err, e.what());

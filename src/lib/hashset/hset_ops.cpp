@@ -1,144 +1,111 @@
+#include "hashset/hset_ops.h"
+
+#include <cstddef>
+#include <exception>
+#include <memory>
+#include <utility>
+#include <vector>
+
 #include "error.h"
+#include "throw.h"
 #include "util.h"
 #include "hasher/hashset.h"
 #include "hashset/hset.h"
 #include "hashset/hset_encoder.h"
-#include "hashset/hset_ops.h"
+#include "hashset/hset_merge.h"
 
-#include <algorithm>
-#include <iterator>
-#include <set>
+/*
+ * The builder-shaped set operations: sfhash_hashset_builder_{union,
+ * intersect, subtract}_open return a build context that remembers the two
+ * inputs and the operation; sfhash_hashset_builder_write then writes the
+ * merge of the inputs (write_merged_hset, see HASHSET_FORMAT "Set
+ * operations"), so the open/write/destroy sequence of the builder stays
+ * while nothing is rebuilt. sfhash_hashset_merge is the one-call form of
+ * the same thing.
+ */
 
-template <auto op>
+namespace {
+
 std::pair<
   std::vector<std::vector<uint8_t>>,
   std::vector<SFHASH_HashAlgorithm>
 > apply_op(
+  MergeOp op,
   const RecordHeader& lrhdr,
   const ConstRecordData& lrdat,
   const RecordHeader& rrhdr,
   const ConstRecordData& rrdat)
 {
-  // collect the hash types from the input hashsets
-  std::set<std::pair<SFHASH_HashAlgorithm, size_t>> ltypes, rtypes;
+  const RecordMerge rm = merge_records(op, lrhdr, lrdat, rrhdr, rrdat);
 
-  collect_hash_types(lrhdr.fields, ltypes);
-  collect_hash_types(rrhdr.fields, rtypes);
-
-  THROW_IF(
-    ltypes != rtypes,
-    "hash type mismatch between left and right operands"
-  );
-
-  std::vector<std::pair<SFHASH_HashAlgorithm, size_t>> otypes;
-
-  // output types is the union of the left and right input types
-  std::set_union(
-    ltypes.begin(), ltypes.end(),
-    rtypes.begin(), rtypes.end(),
-    std::back_inserter(otypes)
-  );
-
-  // create mapping from output fields to input fields
-  std::vector<std::pair<int, size_t>> lf, rf;
-  for (const auto& [a, hlen]: otypes) {
-    lf.emplace_back(hashset_record_field_index_for_type(lrhdr, a), hlen);
-    rf.emplace_back(hashset_record_field_index_for_type(rrhdr, a), hlen);
+  std::vector<std::vector<uint8_t>> records;
+  records.reserve(rm.record_count());
+  for (uint64_t i = 0; i < rm.record_count(); ++i) {
+    const uint8_t* beg = rm.rdat.data() + i * rm.record_length;
+    records.emplace_back(beg, beg + rm.record_length);
   }
 
-  std::vector<std::vector<uint8_t>> l_ex, r_ex;
+  std::vector<SFHASH_HashAlgorithm> types;
+  for (const auto& f: rm.fields) {
+    types.push_back(static_cast<SFHASH_HashAlgorithm>(f.type));
+  }
 
-  // rewrite left records to joint format
-  make_output_records(
-    lrdat.beg,
-    lrdat.end,
-    lrhdr.record_length,
-    lf,
-    l_ex
-  );
-
-  // rewrite right records to joint format
-  make_output_records(
-    rrdat.beg,
-    rrdat.end,
-    rrhdr.record_length,
-    rf,
-    r_ex
-  );
-
-  // ensure that the records to be unioned are sorted and unique
-  std::sort(l_ex.begin(), l_ex.end());
-  l_ex.erase(std::unique(l_ex.begin(), l_ex.end()), l_ex.end());
-
-  std::sort(r_ex.begin(), r_ex.end());
-  r_ex.erase(std::unique(r_ex.begin(), r_ex.end()), r_ex.end());
-
-  // apply the op to the records
-  std::vector<std::vector<uint8_t>> u;
-
-  op(
-    l_ex.begin(), l_ex.end(),
-    r_ex.begin(), r_ex.end(),
-    std::back_inserter(u)
-  );
-
-  // make the list of output types
-  std::vector<SFHASH_HashAlgorithm> htypes;
-  std::transform(
-    otypes.begin(), otypes.end(),
-    std::back_inserter(htypes),
-    [](const auto& h) {
-      return h.first;
-    }
-  );
-
-  return { std::move(u), std::move(htypes) };
+  return { std::move(records), std::move(types) };
 }
 
-template <auto op>
 SFHASH_HashsetBuildCtx* setop_open(
   const SFHASH_Hashset* l,
   const SFHASH_Hashset* r,
+  uint32_t op,
   const char* result_hashset_name,
   const char* result_hashset_desc,
   bool write_records,
   bool write_hashsets,
-  const char* temp_dir,
   const char* output_file,
   SFHASH_Error** err)
 {
   try {
+    THROW_IF(!l || !r, "null hashset operand");
     check_strlen(result_hashset_name, "result_hashset_name");
     check_strlen(result_hashset_desc, "result_hashset_desc");
-
-    const auto [u, htypes] = op(
-      l->holder.rhdr,
-      l->holder.rdat,
-      r->holder.rhdr,
-      r->holder.rdat
+    THROW_IF(!output_file, "null output_file");
+    THROW_IF(
+      !write_records && !write_hashsets,
+      "at least one of records and hashsets must be written"
     );
 
     auto bctx = make_unique_del(
-      sfhash_hashset_builder_open(
-        result_hashset_name,
-        result_hashset_desc,
-        htypes.data(),
-        htypes.size(),
+      new SFHASH_HashsetBuildCtx{
+        {},
+        { 2, result_hashset_name, make_timestamp(), result_hashset_desc, {} },
+        { 0, 0, {} },
+        {},
+        {},
         write_records,
         write_hashsets,
-        temp_dir,
-        output_file,
-        err
-      ),
+        {},
+        {},
+        {},
+        {},
+        0
+      },
       sfhash_hashset_builder_destroy
     );
 
-    if (*err) {
-      return nullptr;
-    }
+    bctx->outfile = output_file;
+    bctx->merge_left = l;
+    bctx->merge_right = r;
+    bctx->merge_op = op;
 
-    for (const auto& r: u) {
-      sfhash_hashset_builder_add_record(bctx.get(), r.data());
+    // the output's record fields, as the merge widens them (a field length
+    // mismatch between the inputs is rejected here, before any writing)
+    const RecordHeader& lrhdr = l->holder.rhdr;
+    const RecordHeader& rrhdr = r->holder.rhdr;
+    if (!lrhdr.fields.empty() && !rrhdr.fields.empty()) {
+      bctx->rhdr.fields = merged_record_fields(lrhdr, rrhdr);
+      for (const auto& f: bctx->rhdr.fields) {
+        bctx->rhdr.record_length += 1 + f.length;
+      }
     }
 
     return bctx.release();
@@ -149,6 +116,8 @@ SFHASH_HashsetBuildCtx* setop_open(
   }
 }
 
+} // namespace
+
 std::pair<
   std::vector<std::vector<uint8_t>>,
   std::vector<SFHASH_HashAlgorithm>
@@ -158,18 +127,7 @@ std::pair<
   const RecordHeader& rrhdr,
   const ConstRecordData& rrdat)
 {
-  return apply_op<
-    std::set_union<
-      std::vector<std::vector<uint8_t>>::const_iterator,
-      std::vector<std::vector<uint8_t>>::const_iterator,
-      std::back_insert_iterator<std::vector<std::vector<uint8_t>>>
-    >
-  >(
-    lrhdr,
-    lrdat,
-    rrhdr,
-    rrdat
-  );
+  return apply_op(MergeOp::UNION, lrhdr, lrdat, rrhdr, rrdat);
 }
 
 std::pair<
@@ -181,18 +139,7 @@ std::pair<
   const RecordHeader& rrhdr,
   const ConstRecordData& rrdat)
 {
-  return apply_op<
-    std::set_intersection<
-      std::vector<std::vector<uint8_t>>::const_iterator,
-      std::vector<std::vector<uint8_t>>::const_iterator,
-      std::back_insert_iterator<std::vector<std::vector<uint8_t>>>
-    >
-  >(
-    lrhdr,
-    lrdat,
-    rrhdr,
-    rrdat
-  );
+  return apply_op(MergeOp::INTERSECT, lrhdr, lrdat, rrhdr, rrdat);
 }
 
 std::pair<
@@ -204,18 +151,7 @@ std::pair<
   const RecordHeader& rrhdr,
   const ConstRecordData& rrdat)
 {
-  return apply_op<
-    std::set_difference<
-      std::vector<std::vector<uint8_t>>::const_iterator,
-      std::vector<std::vector<uint8_t>>::const_iterator,
-      std::back_insert_iterator<std::vector<std::vector<uint8_t>>>
-    >
-  >(
-    lrhdr,
-    lrdat,
-    rrhdr,
-    rrdat
-  );
+  return apply_op(MergeOp::DIFFERENCE, lrhdr, lrdat, rrhdr, rrdat);
 }
 
 SFHASH_HashsetBuildCtx* sfhash_hashset_builder_union_open(
@@ -225,20 +161,14 @@ SFHASH_HashsetBuildCtx* sfhash_hashset_builder_union_open(
   const char* result_hashset_desc,
   bool write_records,
   bool write_hashsets,
-  const char* temp_dir,
   const char* output_file,
+  const char* /* temp_dir */,
   SFHASH_Error** err)
 {
-  return setop_open<union_op>(
-    l,
-    r,
-    result_hashset_name,
-    result_hashset_desc,
-    write_records,
-    write_hashsets,
-    temp_dir,
-    output_file,
-    err
+  return setop_open(
+    l, r, SFHASH_HSET_OP_UNION,
+    result_hashset_name, result_hashset_desc,
+    write_records, write_hashsets, output_file, err
   );
 }
 
@@ -249,20 +179,14 @@ SFHASH_HashsetBuildCtx* sfhash_hashset_builder_intersect_open(
   const char* result_hashset_desc,
   bool write_records,
   bool write_hashsets,
-  const char* temp_dir,
   const char* output_file,
+  const char* /* temp_dir */,
   SFHASH_Error** err)
 {
-  return setop_open<intersect_op>(
-    l,
-    r,
-    result_hashset_name,
-    result_hashset_desc,
-    write_records,
-    write_hashsets,
-    temp_dir,
-    output_file,
-    err
+  return setop_open(
+    l, r, SFHASH_HSET_OP_INTERSECT,
+    result_hashset_name, result_hashset_desc,
+    write_records, write_hashsets, output_file, err
   );
 }
 
@@ -273,19 +197,21 @@ SFHASH_HashsetBuildCtx* sfhash_hashset_builder_subtract_open(
   const char* result_hashset_desc,
   bool write_records,
   bool write_hashsets,
-  const char* temp_dir,
   const char* output_file,
+  const char* /* temp_dir */,
   SFHASH_Error** err)
 {
-  return setop_open<difference_op>(
-    l,
-    r,
-    result_hashset_name,
-    result_hashset_desc,
-    write_records,
-    write_hashsets,
-    temp_dir,
-    output_file,
-    err
+  return setop_open(
+    l, r, SFHASH_HSET_OP_DIFFERENCE,
+    result_hashset_name, result_hashset_desc,
+    write_records, write_hashsets, output_file, err
   );
+}
+
+void sfhash_hashset_builder_set_coalesce_threshold(
+  SFHASH_HashsetBuildCtx* bctx,
+  uint32_t coalesce_threshold)
+{
+  bctx->coalesce_threshold = coalesce_threshold == SFHASH_HSET_COALESCE_DEFAULT ?
+    TLSH_IVF_DEFAULT_COALESCE : coalesce_threshold;
 }
