@@ -58,30 +58,53 @@ TlshHasher* TlshHasher::clone() const {
 }
 
 void TlshHasher::update(const uint8_t* beg, const uint8_t* end) {
+  if (beg == end) {
+    return;
+  }
+
   uint32_t len = Length;
   uint8_t checksum = Checksum;
 
-  for (const uint8_t* p = beg; p != end; ++p, ++len) {
-    const uint32_t j = len % 5;
-    Window[j] = *p;
+  // the previous four bytes, newest first; Window[i] holds byte i (mod 5)
+  uint8_t w1 = Window[(len + 4) % 5];
+  uint8_t w2 = Window[(len + 3) % 5];
+  uint8_t w3 = Window[(len + 2) % 5];
+  uint8_t w4 = Window[(len + 1) % 5];
 
-    if (len >= 4) {
-      const uint8_t w0 = Window[j];
-      const uint8_t w1 = Window[(j + 4) % 5];
-      const uint8_t w2 = Window[(j + 3) % 5];
-      const uint8_t w3 = Window[(j + 2) % 5];
-      const uint8_t w4 = Window[(j + 1) % 5];
+  const uint8_t* p = beg;
 
-      checksum = b_map<0>(w0, w1, checksum);
-
-      ++Buckets[b_map<2>(w0, w1, w2)];
-      ++Buckets[b_map<3>(w0, w1, w3)];
-      ++Buckets[b_map<5>(w0, w2, w3)];
-      ++Buckets[b_map<7>(w0, w2, w4)];
-      ++Buckets[b_map<11>(w0, w1, w4)];
-      ++Buckets[b_map<13>(w0, w3, w4)];
-    }
+  // warm up until four bytes have been seen
+  for (; p != end && len < 4; ++p, ++len) {
+    w4 = w3;
+    w3 = w2;
+    w2 = w1;
+    w1 = *p;
   }
+
+  uint32_t* const buckets = Buckets;
+  for (; p != end; ++p, ++len) {
+    const uint8_t w0 = *p;
+
+    checksum = b_map<0>(w0, w1, checksum);
+
+    ++buckets[b_map<2>(w0, w1, w2)];
+    ++buckets[b_map<3>(w0, w1, w3)];
+    ++buckets[b_map<5>(w0, w2, w3)];
+    ++buckets[b_map<7>(w0, w2, w4)];
+    ++buckets[b_map<11>(w0, w1, w4)];
+    ++buckets[b_map<13>(w0, w3, w4)];
+
+    w4 = w3;
+    w3 = w2;
+    w2 = w1;
+    w1 = w0;
+  }
+
+  // store the last four bytes back where the next call expects them
+  Window[(len + 4) % 5] = w1;
+  Window[(len + 3) % 5] = w2;
+  Window[(len + 2) % 5] = w3;
+  Window[(len + 1) % 5] = w4;
 
   Length = len;
   Checksum = checksum;
