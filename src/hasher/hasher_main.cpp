@@ -1,4 +1,5 @@
 #include "hasher/hasher.h"
+#include "hasher/tlsh.h"
 #include "hash_types.h"
 #include "hex.h"
 #include "throw.h"
@@ -68,15 +69,20 @@ int main(int argc, char** argv) {
       case SFHASH_SHA_3_512:
       case SFHASH_QUICK_MD5:
         {
-          const size_t off = hash_member_offset(a);
-          std::cout << to_hex(
-            reinterpret_cast<const char*>(&hashes + off),
-            reinterpret_cast<const char*>(&hashes + off + sfhash_hash_length(a))) << '\n';
+          const char* beg = reinterpret_cast<const char*>(&hashes) + hash_member_offset(a);
+          std::cout << to_hex(beg, beg + sfhash_hash_length(a)) << '\n';
           break;
         }
       case SFHASH_FUZZY:
         std::cout << reinterpret_cast<const char*>(hashes.Fuzzy) << '\n';
         break;
+      case SFHASH_TLSH:
+        {
+          char hex[SFHASH_TLSH_HEX_LENGTH + 1];
+          sfhash_tlsh_to_hex(hashes.Tlsh, hex);
+          std::cout << hex << '\n';
+          break;
+        }
       case SFHASH_ENTROPY:
         std::cout << std::setprecision(std::numeric_limits<double>::digits10 + 1)
                   << std::fixed

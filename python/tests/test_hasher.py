@@ -384,6 +384,163 @@ class TestHashSetAPI(unittest.TestCase):
 #                    os.remove(outfile)
 
 
+# TLSH reference vectors from the vendored trendmicro/tlsh test suite.
+# The test runner chdirs into python/tests, so locate the repo root from here.
+TLSH_TESTING = os.path.join(
+    os.path.dirname(os.path.realpath(__file__)),
+    '..', '..', 'vendors', 'tlsh', 'Testing'
+)
+
+
+def tlsh_expected_hashes():
+    """{ 'example_data/<file>': 'T1...' } from the reference out_EXP file."""
+    exp = {}
+    with open(os.path.join(TLSH_TESTING, 'exp', 'example_data.128.1.len.out_EXP')) as f:
+        for line in f:
+            hexdigest, path = line.split()
+            exp[path] = hexdigest
+    return exp
+
+
+def tlsh_expected_scores(name):
+    """[(fileA, fileB, score)] from a reference scores_EXP file."""
+    scores = []
+    with open(os.path.join(TLSH_TESTING, 'exp', name)) as f:
+        for line in f:
+            a, b, score = line.split()
+            scores.append((a, b, int(score)))
+    return scores
+
+
+def tlsh_hash_file(path):
+    with open(os.path.join(TLSH_TESTING, path), 'rb') as f:
+        buf = f.read()
+    with hasher.Hasher(hasher.TLSH) as h:
+        h.update(buf)
+        return h.get_hashes()
+
+
+class TestTlsh(unittest.TestCase):
+    ALICE = 'example_data/0Alice.txt'
+    ALICE_HEX = 'T145D18407A78523B35A030267671FA2C2F725402973629B25545EB43C3356679477F7FC'
+
+    def test_hash_file_alice(self):
+        hashes = tlsh_hash_file(self.ALICE)
+        self.assertEqual({'tlsh': self.ALICE_HEX}, hashes.to_dict(hasher.TLSH))
+        self.assertEqual(hasher.HasherHashes.from_dict({'tlsh': self.ALICE_HEX}), hashes)
+        self.assertFalse(hasher.tlsh_is_null(hashes.tlsh))
+
+    def test_hash_file_vectors(self):
+        exp = tlsh_expected_hashes()
+        self.assertEqual(80, len(exp))
+        # Alice plus one more from the reference set
+        for path in (self.ALICE, 'example_data/021106_yossivassa.txt'):
+            hashes = tlsh_hash_file(path)
+            self.assertEqual(exp[path], hasher.tlsh_to_hex(hashes.tlsh), path)
+            self.assertEqual(exp[path], hashes.to_dict(hasher.TLSH)['tlsh'], path)
+
+    def test_hash_in_multihash(self):
+        with open(os.path.join(TLSH_TESTING, self.ALICE), 'rb') as f:
+            buf = f.read()
+        with hasher.Hasher(hasher.MD5 | hasher.TLSH) as h:
+            h.update(buf)
+            d = h.get_hashes().to_dict(hasher.MD5 | hasher.TLSH)
+        self.assertEqual({'md5', 'tlsh'}, set(d.keys()))
+        self.assertEqual(self.ALICE_HEX, d['tlsh'])
+
+    def test_short_input_is_null(self):
+        with hasher.Hasher(hasher.TLSH) as h:
+            h.update(abc)
+            hashes = h.get_hashes()
+        self.assertEqual(bytes(36), bytes(hashes.tlsh))
+        self.assertTrue(hasher.tlsh_is_null(hashes.tlsh))
+        self.assertEqual({'tlsh': 'TNULL'}, hashes.to_dict(hasher.TLSH))
+        self.assertEqual(hasher.HasherHashes.from_dict({'tlsh': 'TNULL'}), hashes)
+
+    def test_empty_input_is_null(self):
+        with hasher.Hasher(hasher.TLSH) as h:
+            self.assertTrue(hasher.tlsh_is_null(h.get_hashes().tlsh))
+
+    def test_diff_scores(self):
+        exp = tlsh_expected_hashes()
+        digests = {path: hasher.tlsh_from_hex(hexdigest) for path, hexdigest in exp.items()}
+        for name, include_length in (
+            ('example_data.128.1.len.scores_EXP', True),
+            ('example_data.128.1.xlen.scores_EXP', False),
+        ):
+            scores = tlsh_expected_scores(name)
+            self.assertEqual(80, len(scores))
+            for a, b, score in scores:
+                self.assertEqual(
+                    score,
+                    hasher.tlsh_diff(digests[a], digests[b], include_length),
+                    f'{name}: {a} {b}'
+                )
+
+    def test_diff_from_hashed_files(self):
+        a = tlsh_hash_file('example_data/website_course_descriptors06-07.txt').tlsh
+        b = tlsh_hash_file(self.ALICE).tlsh
+        self.assertEqual(137, hasher.tlsh_diff(a, b))
+        self.assertEqual(137, hasher.tlsh_diff(a, b, include_length=True))
+        self.assertEqual(101, hasher.tlsh_diff(a, b, include_length=False))
+        self.assertEqual(0, hasher.tlsh_diff(a, a))
+
+    def test_diff_null(self):
+        a = hasher.tlsh_from_hex(self.ALICE_HEX)
+        null = bytes(36)
+        self.assertEqual(-1, hasher.tlsh_diff(a, null))
+        self.assertEqual(-1, hasher.tlsh_diff(null, a))
+        self.assertEqual(-1, hasher.tlsh_diff(null, null))
+
+    def test_hex_round_trip(self):
+        for hexdigest in tlsh_expected_hashes().values():
+            digest = hasher.tlsh_from_hex(hexdigest)
+            self.assertEqual(36, len(digest))
+            self.assertEqual(hexdigest, hasher.tlsh_to_hex(digest))
+            self.assertEqual(digest, hasher.tlsh_from_hex(hasher.tlsh_to_hex(digest)))
+
+    def test_from_hex_variants(self):
+        digest = hasher.tlsh_from_hex(self.ALICE_HEX)
+        # without the T1 prefix
+        self.assertEqual(digest, hasher.tlsh_from_hex(self.ALICE_HEX[2:]))
+        # lowercase hex digits (the T1 prefix itself is case-sensitive)
+        self.assertEqual(digest, hasher.tlsh_from_hex('T1' + self.ALICE_HEX[2:].lower()))
+        self.assertEqual(digest, hasher.tlsh_from_hex(self.ALICE_HEX[2:].lower()))
+        # null
+        self.assertEqual(bytes(36), hasher.tlsh_from_hex('TNULL'))
+        self.assertEqual('TNULL', hasher.tlsh_to_hex(bytes(36)))
+
+    def test_bad_hex_raises(self):
+        for bad in (
+            '',
+            'xyz',
+            'T1',
+            'T1' + 'G' * 70,          # not hex
+            self.ALICE_HEX[:-1],      # too short
+            self.ALICE_HEX + '0',     # too long
+            self.ALICE_HEX + '\x00x',  # embedded NUL
+            'd41d8cd98f00b204e9800998ecf8427e',
+        ):
+            with self.assertRaises(ValueError, msg=repr(bad)):
+                hasher.tlsh_from_hex(bad)
+
+        with self.assertRaises(ValueError):
+            hasher.HasherHashes.from_dict({'tlsh': 'bogus'})
+
+    def test_bad_digest_length_raises(self):
+        with self.assertRaises(ValueError):
+            hasher.tlsh_to_hex(b'\x00' * 35)
+        with self.assertRaises(ValueError):
+            hasher.tlsh_is_null(b'')
+        with self.assertRaises(ValueError):
+            hasher.tlsh_diff(bytes(36), bytes(37))
+
+    def test_hash_name(self):
+        self.assertEqual('TLSH', hasher.hash_name(hasher.TLSH))
+        self.assertEqual(hasher.TLSH, hasher.hash_alg('tlsh'))
+        self.assertEqual(1 << 15, hasher.TLSH)
+
+
 class HashNameTest(unittest.TestCase):
     def test_hash_name(self):
         self.assertEqual('MD5', hasher.hash_name(hasher.MD5))

@@ -63,11 +63,17 @@ ALL_HASHES = [
     ('fuzzy',     1 << 11),
     ('entropy',   1 << 12),
     ('size',      1 << 13),
-    ('quick_md5', 1 << 14)
+    ('quick_md5', 1 << 14),
+    ('tlsh',      1 << 15)
 ]
 
 # the list of hash names/enums for hashes which are hexadecimal
-HEX_HASHES = [(n, a) for n, a in ALL_HASHES if n not in ('entropy', 'fuzzy')]
+# (tlsh is excluded: it is stored in a 36-byte canonical form and
+# rendered as a "T1..." string, see tlsh_to_hex)
+HEX_HASHES = [(n, a) for n, a in ALL_HASHES if n not in ('entropy', 'fuzzy', 'tlsh')]
+
+TLSH_DIGEST_LENGTH = 36
+TLSH_HEX_LENGTH = 72  # "T1" + 70 hex characters
 
 # map hash names to enums
 HASH_NAME_TO_ENUM = { name: mask for name, mask in ALL_HASHES }
@@ -103,6 +109,7 @@ class HasherHashes(Structure):
         ('blake3',    c_uint8 * 32),
         ('fuzzy',     c_uint8 * 148),
         ('quick_md5', c_uint8 * 16),
+        ('tlsh',      c_uint8 * TLSH_DIGEST_LENGTH),
         ('entropy',   c_double)
     ]
 
@@ -121,7 +128,8 @@ class HasherHashes(Structure):
                     self.blake3[:] == other.blake3[:] and
                     self.fuzzy[:] == other.fuzzy[:] and
                     self.entropy == other.entropy and
-                    self.quick_md5[:] == other.quick_md5[:])
+                    self.quick_md5[:] == other.quick_md5[:] and
+                    self.tlsh[:] == other.tlsh[:])
         return NotImplemented
 
     def hash_for_alg(self, alg):
@@ -139,6 +147,9 @@ class HasherHashes(Structure):
         if algs & FUZZY:
             d['fuzzy'] = bytes(self.fuzzy).rstrip(b'\x00').decode('ascii')
 
+        if algs & TLSH:
+            d['tlsh'] = tlsh_to_hex(self.tlsh)
+
         return d
 
     @classmethod
@@ -150,6 +161,8 @@ class HasherHashes(Structure):
                 h.entropy = v
             elif k == 'fuzzy':
                 h.fuzzy = (c_ubyte * sizeof(h.fuzzy))(*v.encode('ascii'))
+            elif k == 'tlsh':
+                h.tlsh = (c_ubyte * sizeof(h.tlsh))(*tlsh_from_hex(v))
             else:
                 setattr(h, k, (c_ubyte * sizeof(getattr(h, k)))(*bytes.fromhex(v)))
 
@@ -300,6 +313,26 @@ _sfhash_destroy_fuzzy_matcher = _hasher.sfhash_destroy_fuzzy_matcher
 _sfhash_destroy_fuzzy_matcher.argtypes = [c_void_p]
 _sfhash_destroy_fuzzy_matcher.restype = None
 
+# bool sfhash_tlsh_from_hex(const char* hex, void* digest);
+_sfhash_tlsh_from_hex = _hasher.sfhash_tlsh_from_hex
+_sfhash_tlsh_from_hex.argtypes = [c_char_p, c_void_p]
+_sfhash_tlsh_from_hex.restype = c_bool
+
+# void sfhash_tlsh_to_hex(const void* digest, char* hex);
+_sfhash_tlsh_to_hex = _hasher.sfhash_tlsh_to_hex
+_sfhash_tlsh_to_hex.argtypes = [c_void_p, c_char_p]
+_sfhash_tlsh_to_hex.restype = None
+
+# bool sfhash_tlsh_is_null(const void* digest);
+_sfhash_tlsh_is_null = _hasher.sfhash_tlsh_is_null
+_sfhash_tlsh_is_null.argtypes = [c_void_p]
+_sfhash_tlsh_is_null.restype = c_bool
+
+# int sfhash_tlsh_diff(const void* a, const void* b, bool include_length);
+_sfhash_tlsh_diff = _hasher.sfhash_tlsh_diff
+_sfhash_tlsh_diff.argtypes = [c_void_p, c_void_p, c_bool]
+_sfhash_tlsh_diff.restype = c_int
+
 c_ssize_p = POINTER(c_ssize_t)
 
 
@@ -404,6 +437,56 @@ def hash_name(alg):
 
 def hash_alg(name):
     return _sfhash_hash_type(name.encode('utf-8')) or None
+
+
+#
+# TLSH helpers
+#
+
+def _tlsh_digest(digest):
+    # accept bytes, bytearray, memoryview, or a ctypes c_uint8 array
+    b = bytes(digest)
+    if len(b) != TLSH_DIGEST_LENGTH:
+        raise ValueError(
+            f"TLSH digest must be {TLSH_DIGEST_LENGTH} bytes, got {len(b)}"
+        )
+    return b
+
+
+def tlsh_to_hex(digest):
+    """Encode a 36-byte canonical TLSH digest as 'T1' + 70 hex characters,
+    or 'TNULL' for the null digest."""
+    out = create_string_buffer(TLSH_HEX_LENGTH + 1)
+    _sfhash_tlsh_to_hex(_tlsh_digest(digest), out)
+    return out.value.decode('ascii')
+
+
+def tlsh_from_hex(hex):
+    """Decode a TLSH string ('T1' + 70 hex characters, 70 bare hex characters,
+    or 'TNULL') into the 36-byte canonical digest. Raises ValueError on
+    bad input."""
+    try:
+        s = hex.encode('ascii')
+    except (AttributeError, UnicodeEncodeError) as e:
+        raise ValueError(f"invalid TLSH string: {hex!r}") from e
+    if b'\x00' in s:
+        raise ValueError(f"invalid TLSH string: {hex!r}")
+
+    out = (c_uint8 * TLSH_DIGEST_LENGTH)()
+    if not _sfhash_tlsh_from_hex(s, out):
+        raise ValueError(f"invalid TLSH string: {hex!r}")
+    return bytes(out)
+
+
+def tlsh_is_null(digest):
+    """True if digest is the null digest (TNULL)."""
+    return _sfhash_tlsh_is_null(_tlsh_digest(digest))
+
+
+def tlsh_diff(a, b, include_length=True):
+    """TLSH distance between two canonical digests, as in the reference
+    implementation's Tlsh::totalDiff(). Returns -1 if either is null."""
+    return _sfhash_tlsh_diff(_tlsh_digest(a), _tlsh_digest(b), include_length)
 
 
 class Hasher(Handle):
