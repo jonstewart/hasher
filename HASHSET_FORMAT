@@ -116,16 +116,78 @@ Payload:
   16 n           uint64_t, equals the section's hash count
   24 reserved    uint64_t, 0
   32 cell_lists  uint32_t[65537], lists of cell c are [cell_lists[c], cell_lists[c+1])
-     medoids     36-byte TLSH rows [C], one member digest per list
-     radius2     uint32_t[C], max squared body-embedding distance from the
-                 medoid to a member of the list
+     medoids     36-byte TLSH rows [C], one digest per list
+     radius2     uint32_t[C], every member of the list is within this
+                 squared body-embedding distance of the medoid
      list_start  uint64_t[C+1], CSR offsets into ids
      ids         uint32_t[n], HDAT row indexes, ascending within a list
+
+The medoid of a list is any digest such that every member is within radius2
+of it; the search only relies on that bound. A freshly built index uses a
+member (the one nearest the k-means centroid) with the exact radius, but a
+merged index (below) may keep a medoid whose row is no longer a member, and
+a radius that is merely an upper bound. Lists are never empty, and the lists
+of a cell partition the cell's rows; in particular when a cell has a single
+list its ids are the cell's row range.
 
 A reader checks the version, dims, length, row count, cell and list offsets;
 the ids are not validated at load time. The TIVF payload is only 4-byte
 aligned in general, so readers must not assume list_start is 8-byte
 aligned.
+
+
+Set operations
+==============
+
+sfhash_hashset_merge (and the hsetop tool) computes the union, intersection
+or difference (left minus right) of two hset files by merging, not by
+rebuilding: every HDAT is the two-pointer merge of the inputs' sorted rows,
+and each derived structure is carried through that merge by the row map
+(old row -> new row, or dropped) in O(n) with no sort, no re-embedding and
+no re-clustering. The builder-based sfhash_hashset_builder_*_open functions
+remain and rebuild everything from the record tables.
+
+Hash sections. The output has a section for every hash type present in
+either input (left's types in left's order, then right's extras), with the
+left input's field name. A type on one side only is merged against an
+empty run: union and difference copy it, intersection empties it.
+
+Records. When both inputs have record tables the output has one: records
+are widened to the union of the fields (left's fields, then right's
+extras; absent fields are a zero presence byte and zero value), merged in
+sorted order, and identical records collapse to one (the left copy). A
+side whose field order changed by the widening is re-sorted first. Rows
+then follow their records: a row is emitted iff its record is, equal rows
+belonging to different records stay duplicates (as the builder writes
+them), and RIDX is remapped through the record map. When only one input
+has records, or neither, the output is a hashsets-only file: no RHDR, RDAT
+or RIDX, and equal rows (within or across the inputs) are written once. A
+records-only input (RDAT but no hash sections) can only be merged with
+another records-only input, giving a records-only output.
+
+Cell index (HINT 0x7400) is recomputed from the merged rows as a prefix
+sum.
+
+TVEC rows are copied from the input that contributed the row; a row from
+an input without vectors is embedded with tlsh_embed. TIVF lists are
+carried through merge_tlsh_ivf: per cell, the left input's lists followed
+by the right's, ids remapped, dropped ids removed, lists that become empty
+omitted, medoids and radii unchanged. The members of an output list are a
+subset of the input list's, so the stored radius remains a valid bound and
+the indexed search stays exact. If either input lacks a TIVF and the output
+wants one, build_tlsh_ivf clusters the merged rows from scratch instead.
+
+Options. tlsh_options selects the optional TLSH sections of the output as
+for the builder (SFHASH_HSET_TLSH_VECTORS, SFHASH_HSET_TLSH_INDEX), or
+SFHASH_HSET_TLSH_INHERIT (hsetop's default) writes each section iff every
+input that has a TLSH section has it. Repeated merges only shrink lists
+(union appends lists, intersection and difference thin them), so after
+many merges a from-scratch build tightens the index; it never becomes
+incorrect.
+
+Layout is as for a built file: HDAT chunks start on a 4096-byte boundary,
+TVEC data is 4096-aligned, the FTOC lists exactly the chunks written, and
+the SHA-256 covers the file from offset 40.
 
 sfhash_hashset_tlsh_knn uses the TIVF index when present and brute force
 otherwise; both are exact for every max_distance. sfhash_hashset_tlsh_knn_with

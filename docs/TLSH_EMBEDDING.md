@@ -158,6 +158,33 @@ The writer emits `TIVF` by default for TLSH fields
 and falls back to brute force otherwise; `sfhash_hashset_tlsh_knn_strategies`
 reports which is available and `sfhash_hashset_tlsh_knn_with` picks one.
 
+### Merging indexes
+
+Set operations on whole files (`sfhash_hashset_merge`, the `hsetop` tool;
+see HASHSET_FORMAT "Set operations") do not rebuild the index. The rows of
+the two inputs are merged by a two-pointer pass that yields, per input, a map
+old row -> new row (or dropped), and `merge_tlsh_ivf` carries the lists
+through it: for each cell the left input's lists then the right's, ids
+remapped, dropped ids removed, lists that end up empty omitted, medoids and
+radii copied verbatim. That is correct because the search only needs every
+member of a list to lie within `radius2` of the medoid: the output list's
+members are a subset of the input list's, so the bound still holds (it is
+merely no longer tight), and the medoid need not itself be a member; the
+format allows any digest with that property. The whole index merge is
+O(lists + ids), with no embedding and no k-means, and the result searches
+exactly like a fresh index.
+
+What degrades is quality, not correctness. A union doubles the number of
+lists in a cell both inputs populate, and each list keeps its own medoid, so
+the per-cell bound evaluation costs more than for a fresh clustering of the
+same rows; intersections and differences thin lists, leaving radii looser
+than the surviving members warrant. After many merges, or when a merged
+index has far more than `cell_size / 32` lists per cell, rebuild it from the
+rows (`build_tlsh_ivf`, or merge with `SFHASH_HSET_TLSH_INDEX` set and an
+input without an index) to restore the target list sizes. When one input
+has no `TIVF` and the output wants one, the merge already builds it from
+scratch.
+
 ## 4. Indexed kNN (exact for every distance)
 
 Given query digest q, k and max_distance T:
