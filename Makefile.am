@@ -152,7 +152,9 @@ test_test_SOURCES = \
 	test/test_record_iterator.cpp \
 	test/test_parser.cpp \
 	test/test_tlsh.cpp \
-	test/test_util.cpp
+	test/test_tlsh_corpus.cpp \
+	test/test_util.cpp \
+	test/tlsh_corpus.cpp
 
 test_test_CPPFLAGS = $(AM_CPPFLAGS) $(CATCH2_CFLAGS)
 
