@@ -115,7 +115,7 @@ std::vector<std::pair<int64_t, int64_t>> make_block_bounds(
 
 
 // TIVF lists hold about this many rows each
-constexpr size_t TLSH_IVF_TARGET_LIST_SIZE = 128;
+constexpr size_t TLSH_IVF_TARGET_LIST_SIZE = 32;
 
 bool wants_tvec(const RecordFieldDescriptor& field, uint32_t tlsh_options) {
   return field.type == SFHASH_TLSH && (tlsh_options & SFHASH_HSET_TLSH_VECTORS);

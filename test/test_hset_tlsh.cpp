@@ -668,9 +668,9 @@ TEST_CASE("tlsh_knn_brute_matches_naive_and_reference") {
           CHECK(same_matches(out, exp));
 
           // C API, default strategy: the file has a TIVF index, which is
-          // exact up to distance 144 when the length is included
+          // exact for every threshold
           {
-            const uint32_t clamped = include_length ? std::min(maxd, 144u) : maxd;
+            const uint32_t clamped = maxd;
             std::vector<SFHASH_TlshMatch> aout(k + 1);
             const size_t an = sfhash_hashset_tlsh_knn(
               hset.get(), tidx, &q, k, maxd, include_length, aout.data()

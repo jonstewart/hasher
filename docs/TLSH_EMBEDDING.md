@@ -123,47 +123,79 @@ The writer emits `TVEC` by default for TLSH fields; see
 Optional, following `TVEC` (or `HDAT`/`RIDX` when no vectors are stored; the
 index does not need the vectors, it embeds digests on the fly). The chunk type
 is `"TIVF"` (0x54495646), framed like `TVEC`, and likewise only valid after a
-TLSH hash set. Lists never span L values: rows are grouped by L, and each
-group is split by k-means over the embedding into about
-`ceil(group_size / target_list_size)` lists (the writer uses a target of 128).
+TLSH hash set.
 
-| offset | type       | field       | meaning                                      |
-|--------|------------|-------------|----------------------------------------------|
-| 0      | u16        | version     | 1                                            |
-| 2      | u16        | flags       | 0                                            |
-| 4      | u32        | dims        | 264                                          |
-| 8      | u32        | lists       | C                                            |
-| 12     | u32        | reserved    | 0                                            |
-| 16     | u64        | n           | row count, equals the HDAT hash count        |
-| 24     | u64        | reserved    | 0                                            |
-| 32     | f32[C×dims]| centroids   | one embedding-space point per list           |
-|        | f32[C]     | radius      | max Euclidean distance from centroid to a member |
-|        | u64[C+1]   | list_start  | CSR offsets into ids                         |
-|        | u32[n]     | ids         | HDAT row indexes, ascending within each list |
+Lists are grouped by header cell, the same (L, Q1, Q2) cells the 0x7400
+`HINT` indexes, so the header part of the TLSH distance is exact for every
+list and the embedding only has to bound the body. Each cell is split by
+k-means over the 256-dim body embedding into about
+`ceil(cell_size / target_list_size)` lists (the writer uses a target of 32).
+Every list keeps a *medoid*, the member digest nearest the k-means centroid,
+and the squared body-embedding radius about it; both are exact integers, and
+the bound for a list costs one popcount kernel evaluation.
 
-There is a single radius array: because a list never spans L values, a
-member's distance to the centroid is the same with or without dim 256, so
-the radius serves both the with-length and the without-length search. Only
-the header, the lengths and the list offsets are validated at load time.
+| offset | type        | field       | meaning                                                   |
+|--------|-------------|-------------|-----------------------------------------------------------|
+| 0      | u16         | version     | 3                                                         |
+| 2      | u16         | flags       | 0                                                         |
+| 4      | u32         | dims        | 256                                                       |
+| 8      | u32         | lists       | C                                                         |
+| 12     | u32         | reserved    | 0                                                         |
+| 16     | u64         | n           | row count, equals the HDAT hash count                     |
+| 24     | u64         | reserved    | 0                                                         |
+| 32     | u32[65537]  | cell_lists  | lists of cell c are [cell_lists[c], cell_lists[c+1])      |
+|        | row[C]      | medoids     | one 36-byte canonical digest per list, a member of it     |
+|        | u32[C]      | radius2     | max `emb_body2(medoid, member)` over the list             |
+|        | u64[C+1]    | list_start  | CSR offsets into ids                                      |
+|        | u32[n]      | ids         | HDAT row indexes, ascending within each list              |
+
+`emb_body2(a, b)` is the squared distance between body embeddings,
+`popcount(X ^ Y) + popcount(Y) + 4 popcount(X & Y & S)` (section 1). Only the
+header, the lengths and the cell/list offsets are validated at load time.
 
 The writer emits `TIVF` by default for TLSH fields
 (`SFHASH_HSET_TLSH_INDEX`). `sfhash_hashset_tlsh_knn` uses it when present
 and falls back to brute force otherwise; `sfhash_hashset_tlsh_knn_strategies`
 reports which is available and `sfhash_hashset_tlsh_knn_with` picks one.
 
-## 4. Indexed kNN (exact for diff <= 144)
+## 4. Indexed kNN (exact for every distance)
 
-Given query digest q, k, max_distance T ≤ 144:
+Given query digest q, k and max_distance T:
 
-1. `v = phi(q)`. For each list c compute `b_c = max(0, ||v - centroid_c|| - radius_c)^2`.
-2. Visit lists in increasing `b_c`. Keep a bounded max-heap of the k best
-   exact TLSH distances (computed on the 36-byte HDAT rows with the popcount
-   kernel; `tau` = k-th best so far, initially T + 1).
-3. Stop when `b_c >= tau`. Correctness: for any row r in list c,
-   `||v - phi(r)|| >= ||v - c|| - radius_c` (triangle inequality), and
-   `||v - phi(r)||^2 <= diff(q, r)` when `diff(q, r) <= 144`; so every row with
-   `diff < tau <= 145` lives in a list with `b_c < tau`.
+1. Build the header cost tables for q: `l_cost[L]` (0 when the length is
+   excluded) and `q_cost[Q]` over the 256 Q bytes, each enumerated in
+   nondecreasing cost (`TlshHeaderOrder`; the order is a translation of a
+   static table, no sorting at query time). Let `tau = T` be the largest
+   useful distance; it shrinks to the k-th best distance once k hits exist.
+2. Visit L values in cost order and, for each, Q bytes in cost order, stopping
+   a loop as soon as `ch = l_cost + q_cost` exceeds `tau`. For a cell with one
+   list, scan the cell's contiguous rows directly. Otherwise compute for each
+   list the body bound `b = max(0, sqrt(emb_body2(q, medoid)) - sqrt(radius2))^2`
+   and scan the lists with `ch + b <= tau` in increasing `b`.
+3. Scanning a row costs a checksum compare and one body kernel evaluation;
+   hits go into a bounded max-heap ordered by (distance, index).
 
-The same procedure with `include_length = false` uses the distance over dims
-except 256 (and the same radius, see above), and is exact for every T. With
-the length included, a T above 144 is clamped to 144 by the indexed search.
+Correctness: a row r in list l satisfies
+`sqrt(emb_body2(q, r)) >= sqrt(emb_body2(q, medoid)) - sqrt(radius2)` by the
+triangle inequality in embedding space, and `emb_body2(q, r) <= body(q, r)`
+for every pair (per bucket 1, 1, 1, 2, 2, 5 against 1, 1, 1, 2, 2, 6). Since the
+header cost of every row in the cell is exactly `ch` (plus the 0/1 checksum
+term), every row with `diff(q, r) <= tau` lies in a cell with `ch <= tau` and a
+list with `ch + b <= tau`. No approximation is involved, so the indexed search
+returns exactly what brute force does, for any T, with or without the length.
+The 144 cap of section 1 only concerns the L coordinate of the full
+embedding, which the index never uses: within a cell L is constant.
+
+## 5. Measurements
+
+See `test/bench_tlsh.cpp` (Catch2) and `rust/tlsh-bench` (Criterion). On an
+Apple M-series core with a synthetic family corpus (k = 10, T = 144):
+
+| rows      | reference brute | kernel brute | cell index | IVF (this section) | IVF build |
+|-----------|-----------------|--------------|------------|--------------------|-----------|
+| 10,000    | 95 us           | 7.2 us       | 3.4 us     | 4.9 us             | 2.5 ms    |
+| 100,000   | 943 us          | 57 us        | 7.0 us     | 8.8 us             | 120 ms    |
+| 1,000,000 | 9.5 ms          | 553 us       | 16 us      | 8.0 us             | 1.5 s     |
+
+Per query. "Reference brute" is `Tlsh::totalDiff` over every row; "kernel
+brute" is the popcount kernel over every row (0.55 ns/row).

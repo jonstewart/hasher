@@ -119,11 +119,8 @@ struct SFHASH_TlshMatch {
  * by ascending index, at most k of them. out must have room for k matches.
  *
  * Uses the hashset's TIVF index when the file has one (see
- * sfhash_hashset_tlsh_knn_strategies) and brute force otherwise. The index
- * is exact only up to distance 144 when include_length is true, so in that
- * case max_distance is clamped to 144; call sfhash_hashset_tlsh_knn_with
- * with SFHASH_TLSH_KNN_BRUTE for larger thresholds. Without the length
- * there is no cap.
+ * sfhash_hashset_tlsh_knn_strategies) and brute force otherwise. Both give
+ * identical results for every max_distance, with or without the length.
  *
  * Returns the number of matches written, or 0 if tidx is not a TLSH
  * hashset, digest is null, or digest is the null digest.
@@ -140,8 +137,7 @@ size_t sfhash_hashset_tlsh_knn(
 
 /*
  * kNN strategies. BRUTE scans every row; INDEX prunes with the TIVF
- * inverted-file index stored in the file (exact for max_distance <= 144
- * when include_length is true; larger thresholds are clamped to 144).
+ * inverted-file index stored in the file. Both are exact.
  */
 enum {
   SFHASH_TLSH_KNN_BRUTE = 1,

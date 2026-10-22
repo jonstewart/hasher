@@ -23,6 +23,7 @@
 #include "hashset/hset_decoder_chunks.h"
 #include "hashset/hset_encoder.h"
 #include "hashset/hset_encoder_chunks.h"
+#include "hashset/tlsh_cells.h"
 #include "hashset/tlsh_ivf.h"
 #include "hashset/tlsh_search.h"
 
@@ -284,7 +285,8 @@ void check_vectors_and_index(const Built& b, uint32_t tlsh_options) {
   if (want_idx) {
     REQUIRE(!ivf.empty());
     CHECK(ivf.n == n);
-    CHECK(ivf.dims == TLSH_EMBED_DIMS);
+    CHECK(ivf.cell_lists[0] == 0);
+    CHECK(ivf.cell_lists[TLSH_CELL_COUNT] == ivf.lists);
     CHECK(ivf.lists > 1);
     CHECK(ivf.list_start[0] == 0);
     CHECK(ivf.list_start[ivf.lists] == n);
@@ -521,7 +523,7 @@ TEST_CASE("hset_tlsh_knn_index_matches_brute") {
   CHECK(sfhash_hashset_tlsh_knn_with(hset, 99, &queries[0], 4, 100, true, SFHASH_TLSH_KNN_BRUTE, out) == 0);
 }
 
-TEST_CASE("hset_tlsh_knn_index_clamps_max_distance_with_length") {
+TEST_CASE("hset_tlsh_knn_index_is_exact_beyond_144") {
   const Built b = build(true, "test/tlsh_vec_knn.hset", true, true, BOTH);
   const SFHASH_Hashset* hset = b.hset.get();
   const size_t tidx = b.tidx;
@@ -530,23 +532,17 @@ TEST_CASE("hset_tlsh_knn_index_clamps_max_distance_with_length") {
 
   const auto q = perturb_tlsh_corpus(9, corpus(), 1, 0.2).front();
 
-  // with the length the index answers up to 144 only
-  const auto chosen = knn(hset, tidx, q, 1000, 100000, true);
-  for (const auto& m: chosen) {
-    CHECK(m.distance <= TLSH_EMBED_MAX_BOUNDED_DIFF);
+  // the index is exact for every threshold, with and without the length
+  for (bool incl: {true, false}) {
+    const auto chosen = knn(hset, tidx, q, 1000, 100000, incl);
+    const auto brute = tlsh_knn_brute(rows, rows + n, q, 1000, 100000, incl);
+    CHECK(chosen.size() == 1000);
+    CHECK(same_matches(chosen, brute));
+    CHECK(same_matches(chosen, knn_with(hset, tidx, q, 1000, 100000, incl, SFHASH_TLSH_KNN_INDEX)));
+    CHECK(same_matches(chosen, knn_with(hset, tidx, q, 1000, 100000, incl, SFHASH_TLSH_KNN_BRUTE)));
   }
-  CHECK(same_matches(chosen, tlsh_knn_brute(rows, rows + n, q, 1000, TLSH_EMBED_MAX_BOUNDED_DIFF, true)));
-  CHECK(same_matches(chosen, knn_with(hset, tidx, q, 1000, 100000, true, SFHASH_TLSH_KNN_INDEX)));
-
-  // explicit brute force honours the threshold
-  const auto brute = knn_with(hset, tidx, q, 1000, 100000, true, SFHASH_TLSH_KNN_BRUTE);
-  CHECK(same_matches(brute, tlsh_knn_brute(rows, rows + n, q, 1000, 100000, true)));
-  CHECK(brute.size() >= chosen.size());
-
-  // without the length there is no cap
-  const auto chosen_x = knn(hset, tidx, q, 1000, 100000, false);
-  CHECK(same_matches(chosen_x, tlsh_knn_brute(rows, rows + n, q, 1000, 100000, false)));
 }
+
 
 TEST_CASE("hset_tlsh_knn_without_index_is_brute") {
   for (const uint32_t opts: { 0u, uint32_t(SFHASH_HSET_TLSH_VECTORS) }) {
@@ -636,7 +632,7 @@ TEST_CASE("hset_tlsh_vectors_decode_rejects_corruption") {
   // TIVF version
   {
     auto buf = b.buf;
-    buf[idata] = 3;
+    buf[idata] = 9;
     CHECK(fails(buf));
   }
   // TIVF dims
