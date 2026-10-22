@@ -35,6 +35,7 @@ namespace bip = boost::interprocess;
 #include "hashset/hset_encoder_chunks.h"
 #include "hashset/record_iterator.h"
 #include "hashset/tlsh_cells.h"
+#include "hashset/tlsh_ivf.h"
 #include "hashset/util.h"
 #include "tlsh_digest.h"
 #include "hasher/hasher.h"
@@ -113,12 +114,30 @@ std::vector<std::pair<int64_t, int64_t>> make_block_bounds(
 
 
 
+// TIVF lists hold about this many rows each
+constexpr size_t TLSH_IVF_TARGET_LIST_SIZE = 128;
+
+bool wants_tvec(const RecordFieldDescriptor& field, uint32_t tlsh_options) {
+  return field.type == SFHASH_TLSH && (tlsh_options & SFHASH_HSET_TLSH_VECTORS);
+}
+
+bool wants_tivf(const RecordFieldDescriptor& field, uint32_t tlsh_options) {
+  return field.type == SFHASH_TLSH && (tlsh_options & SFHASH_HSET_TLSH_INDEX);
+}
+
+// The FTOC is sized when the builder is opened, before the TLSH options can
+// be set, so room is reserved for both optional TLSH chunks of every TLSH
+// field; the FTOC chunk is simply shorter than its reservation when they
+// are not written.
 size_t count_chunks(const std::vector<RecordFieldDescriptor>& fields) {
   size_t chunk_count = 5 + 3 * fields.size();
 
   for (const auto& hi: fields) {
     if (hi.type != SFHASH_SIZE) {
       ++chunk_count;
+    }
+    if (hi.type == SFHASH_TLSH) {
+      chunk_count += 2; // TVEC, TIVF
     }
   }
 
@@ -132,9 +151,100 @@ size_t count_chunks_hashsets_only(const std::vector<RecordFieldDescriptor>& fiel
     if (hi.type != SFHASH_SIZE) {
       ++chunk_count;
     }
+    if (hi.type == SFHASH_TLSH) {
+      chunk_count += 2; // TVEC, TIVF
+    }
   }
 
   return chunk_count;
+}
+
+/*
+ * Lays out the optional TVEC and TIVF chunks of a field following its
+ * HDAT/RIDX at off, recording them in ftoc and off2hbidx when those are
+ * given. Returns the offset following them. Non-TLSH fields have none.
+ */
+uint64_t layout_tlsh_chunks(
+  uint64_t off,
+  const RecordFieldDescriptor& field,
+  uint64_t hash_count,
+  const TlshIvf& ivf,
+  uint32_t tlsh_options,
+  size_t hbidx,
+  TableOfContents* ftoc,
+  std::map<uint64_t, size_t>* off2hbidx)
+{
+  if (wants_tvec(field, tlsh_options)) {
+    // the float data must start on a page boundary
+    off += length_tvec_alignment_padding(off);
+    if (ftoc) {
+      ftoc->entries.emplace_back(off, Chunk::Type::TVEC);
+      (*off2hbidx)[off] = hbidx;
+    }
+    off += length_tvec(hash_count);
+  }
+
+  if (wants_tivf(field, tlsh_options)) {
+    THROW_IF(
+      ivf.n != hash_count,
+      "TIVF index has " << ivf.n << " rows, expected " << hash_count
+    );
+    if (ftoc) {
+      ftoc->entries.emplace_back(off, Chunk::Type::TIVF);
+      (*off2hbidx)[off] = hbidx;
+    }
+    off += length_tivf(static_cast<uint32_t>(ivf.lists()), hash_count);
+  }
+
+  return off;
+}
+
+/*
+ * Counts the hashes present per field in the sorted records [rbeg, rend) and
+ * builds the TIVF index of each TLSH field that gets one. The index is
+ * built from a sorted copy of the field's digests, which has the same rows
+ * in the same order as the HDAT that scatter_records_to_hashset produces.
+ */
+void count_hashes_and_build_indexes(
+  const RecordHeader& rhdr,
+  RecordIterator rbeg,
+  RecordIterator rend,
+  uint32_t tlsh_options,
+  std::vector<uint64_t>& hash_counts,
+  std::vector<TlshIvf>& ivfs)
+{
+  const size_t nfields = rhdr.fields.size();
+  hash_counts.assign(nfields, 0);
+  ivfs.assign(nfields, TlshIvf());
+
+  std::vector<std::vector<TlshDigest>> tlsh_rows(nfields);
+
+  for (auto i = rbeg; i != rend; ++i) {
+    size_t roff = 0;
+    for (size_t f = 0; f < nfields; ++f) {
+      // the presence byte of a field precedes its value
+      const uint8_t* fld = i->rec.data() + roff;
+      if (fld[0] == 0x01) {
+        ++hash_counts[f];
+        if (wants_tivf(rhdr.fields[f], tlsh_options)) {
+          TlshDigest d;
+          std::memcpy(&d, fld + 1, sizeof(d));
+          tlsh_rows[f].push_back(d);
+        }
+      }
+      roff += 1 + rhdr.fields[f].length;
+    }
+  }
+
+  for (size_t f = 0; f < nfields; ++f) {
+    if (wants_tivf(rhdr.fields[f], tlsh_options)) {
+      auto& rows = tlsh_rows[f];
+      std::sort(rows.begin(), rows.end());
+      ivfs[f] = build_tlsh_ivf(rows.data(), rows.data() + rows.size(), TLSH_IVF_TARGET_LIST_SIZE);
+      rows.clear();
+      rows.shrink_to_fit();
+    }
+  }
 }
 
 size_t length_hset(
@@ -142,7 +252,10 @@ size_t length_hset(
   const std::string& hashset_desc,
   const std::string& timestamp,
   const std::vector<RecordFieldDescriptor>& fields,
-  size_t record_count)
+  size_t record_count,
+  const std::vector<uint64_t>& hash_counts,
+  const std::vector<TlshIvf>& ivfs,
+  uint32_t tlsh_options)
 {
   size_t chunk_count = count_chunks(fields);
 
@@ -153,7 +266,9 @@ size_t length_hset(
                length_rhdr(fields) +
                length_rdat(fields, record_count);
 
-  for (const auto& hi: fields) {
+  for (size_t i = 0; i < fields.size(); ++i) {
+    const auto& hi = fields[i];
+
     len += length_hhnn(hi);
 
     if (hi.type != SFHASH_SIZE) {
@@ -162,8 +277,10 @@ size_t length_hset(
 
     len += length_alignment_padding(len, 4096);
 
-    len += length_hdat(record_count, hi.length) +
-           length_ridx(record_count);
+    len += length_hdat(hash_counts[i], hi.length) +
+           length_ridx(hash_counts[i]);
+
+    len = layout_tlsh_chunks(len, hi, hash_counts[i], ivfs[i], tlsh_options, i, nullptr, nullptr);
   }
 
   len += length_fend();
@@ -195,8 +312,9 @@ size_t length_hset_hashsets_only(
   const std::string& hashset_desc,
   const std::string& timestamp,
   const std::vector<RecordFieldDescriptor>& fields,
-  uint64_t record_count,
-  const decltype(SFHASH_HashsetBuildCtx::hsets)& hsets)
+  const decltype(SFHASH_HashsetBuildCtx::hsets)& hsets,
+  const std::vector<TlshIvf>& ivfs,
+  uint32_t tlsh_options)
 {
   size_t chunk_count = count_chunks_hashsets_only(fields);
 
@@ -207,6 +325,8 @@ size_t length_hset_hashsets_only(
                length_rhdr(fields);
 
   for (size_t i = 0; i < fields.size(); ++i) {
+    const auto& hhdr = std::get<HashsetHeader>(hsets[i]);
+
     len += length_hhnn(fields[i]);
 
     if (fields[i].type != SFHASH_SIZE) {
@@ -214,8 +334,9 @@ size_t length_hset_hashsets_only(
     }
 
     len += length_alignment_padding(len, 4096);
-//    len += length_hdat(std::get<0>(hsets[i]).hash_count, std::get<0>(hsets[i]).hash_length);
-    len += length_hdat(record_count, std::get<HashsetHeader>(hsets[i]).hash_length);
+    len += length_hdat(hhdr.hash_count, hhdr.hash_length);
+
+    len = layout_tlsh_chunks(len, fields[i], hhdr.hash_count, ivfs[i], tlsh_options, i, nullptr, nullptr);
   }
 
   len += length_fend();
@@ -258,7 +379,8 @@ void write_chunks(
       uint64_t*
     >
   >& hb,
-  const std::map<uint64_t, size_t>& off2hbidx
+  const std::map<uint64_t, size_t>& off2hbidx,
+  const std::vector<TlshIvf>& ivfs
 )
 {
   char* out = beg;
@@ -331,6 +453,20 @@ void write_chunks(
         };
         write_ridx(ridx, out);
       }
+      break;
+
+    case Chunk::Type::TVEC:
+      {
+        // embeddings of the sorted rows
+        const size_t i = off2hbidx.at(choff);
+        const auto* tbeg = reinterpret_cast<const TlshDigest*>(std::get<1>(hb[i])->rec.data());
+        const auto* tend = reinterpret_cast<const TlshDigest*>(std::get<2>(hb[i])->rec.data());
+        write_tvec(tbeg, tend, out);
+      }
+      break;
+
+    case Chunk::Type::TIVF:
+      write_tivf(ivfs[off2hbidx.at(choff)], out);
       break;
 
     default:
@@ -445,7 +581,8 @@ void write_hset(
   const std::filesystem::path& outfile,
   const std::filesystem::path& tmpdir,
   bool with_records,
-  bool with_hashsets)
+  bool with_hashsets,
+  uint32_t tlsh_options)
 {
   SFHASH_Error* err = nullptr;
 
@@ -465,6 +602,8 @@ void write_hset(
   );
 
   THROW_IF(err, err->message);
+
+  sfhash_hashset_builder_set_tlsh_options(bctx.get(), tlsh_options);
 
   std::vector<uint8_t> rec;
   std::string line;
@@ -509,6 +648,8 @@ void write_hset(
   }
 
   sfhash_hashset_builder_write(bctx.get(), &err);
+
+  THROW_IF(err, err->message);
 }
 
 SFHASH_HashsetBuildCtx* hashset_builder_open(
@@ -679,6 +820,13 @@ SFHASH_HashsetBuildCtx* sfhash_hashset_builder_open(
   }
 }
 
+void sfhash_hashset_builder_set_tlsh_options(
+  SFHASH_HashsetBuildCtx* bctx,
+  uint32_t options)
+{
+  bctx->tlsh_options = options;
+}
+
 void sfhash_hashset_builder_add_record(
   SFHASH_HashsetBuildCtx* bctx,
   const void* record)
@@ -751,13 +899,44 @@ uint64_t hashset_builder_write(SFHASH_HashsetBuildCtx* bctx) {
   if (bctx->with_records) {
     bctx->out.close();
 
+    const uint64_t rdat_off = ftoc.entries.back().first;
+
+    // Sort and deduplicate the records in place, then count the hashes
+    // present per field and build the TLSH indexes: the final file size
+    // depends on all of these, so they come before the file is resized.
+    std::vector<uint64_t> hash_counts(rhdr.fields.size(), 0);
+    bctx->tlsh_ivfs.assign(rhdr.fields.size(), TlshIvf());
+    {
+      bip::file_mapping fm(outfile.string().c_str(), bip::read_write);
+      bip::mapped_region mr(fm, bip::read_write);
+
+      uint8_t* out = static_cast<uint8_t*>(mr.get_address());
+
+      RecordIterator rbeg(out + rdat_off + 12, rhdr.record_length);
+      RecordIterator rend(out + rdat_off + 12 + rhdr.record_count * rhdr.record_length, rhdr.record_length);
+
+      std::sort(rbeg, rend);
+      rend = std::unique(rbeg, rend);
+
+      rhdr.record_count = rend - rbeg;
+
+      if (bctx->with_hashsets) {
+        count_hashes_and_build_indexes(
+          rhdr, rbeg, rend, bctx->tlsh_options, hash_counts, bctx->tlsh_ivfs
+        );
+      }
+    }
+
     const auto hset_size = bctx->with_hashsets ?
       length_hset(
         bctx->fhdr.name,
         bctx->fhdr.desc,
         bctx->fhdr.time,
         bctx->rhdr.fields,
-        bctx->rhdr.record_count
+        bctx->rhdr.record_count,
+        hash_counts,
+        bctx->tlsh_ivfs,
+        bctx->tlsh_options
       )
       :
       length_hset_records_only(
@@ -775,20 +954,10 @@ uint64_t hashset_builder_write(SFHASH_HashsetBuildCtx* bctx) {
 
     uint8_t* out = static_cast<uint8_t*>(mr.get_address());
 
-    rdat.beg = out + ftoc.entries.back().first + 12;
+    rdat.beg = out + rdat_off + 12;
     rdat.end = rdat.beg + rhdr.record_count * rhdr.record_length;
 
-    // sort the records
-    RecordIterator rbeg(rdat.beg, rhdr.record_length);
-    RecordIterator rend(rdat.end, rhdr.record_length);
-
-    std::sort(rbeg, rend);
-    rend = std::unique(rbeg, rend);
-
-    rdat.end = rend->rec.data();
-    rhdr.record_count = rend - rbeg;
-
-    off = ftoc.entries.back().first + length_rdat(rhdr.fields, rhdr.record_count);
+    off = rdat_off + length_rdat(rhdr.fields, rhdr.record_count);
 
     std::vector<
       std::tuple<
@@ -832,7 +1001,7 @@ uint64_t hashset_builder_write(SFHASH_HashsetBuildCtx* bctx) {
           nullptr
         );
 
-        off += length_hdat(rhdr.record_count, field.length);
+        off += length_hdat(hash_counts[hbidx], field.length);
 
         // RIDX
         ftoc.entries.emplace_back(off, Chunk::Type::RIDX);
@@ -840,7 +1009,13 @@ uint64_t hashset_builder_write(SFHASH_HashsetBuildCtx* bctx) {
 
         std::get<4>(hb.back()) = std::get<3>(hb.back()) = reinterpret_cast<uint64_t*>(out + off + 12);
 
-        off += length_ridx(rhdr.record_count);
+        off += length_ridx(hash_counts[hbidx]);
+
+        // TVEC, TIVF
+        off = layout_tlsh_chunks(
+          off, field, hash_counts[hbidx], bctx->tlsh_ivfs[hbidx],
+          bctx->tlsh_options, hbidx, &ftoc, &off2hbidx
+        );
       }
     }
 
@@ -853,11 +1028,13 @@ uint64_t hashset_builder_write(SFHASH_HashsetBuildCtx* bctx) {
     }
 
     // Write
-    write_chunks(reinterpret_cast<char*>(out), ftoc, fhdr, rhdr, rdat, hb, off2hbidx);
+    write_chunks(reinterpret_cast<char*>(out), ftoc, fhdr, rhdr, rdat, hb, off2hbidx, bctx->tlsh_ivfs);
   }
   else if (bctx->with_hashsets) {
     // close the temp files
     bctx->tmp_hashes_out.clear();
+
+    bctx->tlsh_ivfs.assign(bctx->hsets.size(), TlshIvf());
 
     for (size_t i = 0; i < bctx->hsets.size(); ++i) {
       const auto& f = bctx->tmp_hashes_files[i];
@@ -878,6 +1055,14 @@ uint64_t hashset_builder_write(SFHASH_HashsetBuildCtx* bctx) {
         hend = std::unique(hbeg, hend);
 
         fsize = hend->rec.data() - out;
+        hhdr.hash_count = hend - hbeg;
+
+        // the TLSH index is built from the sorted, deduplicated rows, which
+        // are copied verbatim into the HDAT below
+        if (wants_tivf(rhdr.fields[i], bctx->tlsh_options)) {
+          const auto* tbeg = reinterpret_cast<const TlshDigest*>(out);
+          bctx->tlsh_ivfs[i] = build_tlsh_ivf(tbeg, tbeg + hhdr.hash_count, TLSH_IVF_TARGET_LIST_SIZE);
+        }
       }
 
       std::filesystem::resize_file(f, fsize);
@@ -888,8 +1073,9 @@ uint64_t hashset_builder_write(SFHASH_HashsetBuildCtx* bctx) {
       bctx->fhdr.desc,
       bctx->fhdr.time,
       bctx->rhdr.fields,
-      bctx->rhdr.record_count,
-      bctx->hsets
+      bctx->hsets,
+      bctx->tlsh_ivfs,
+      bctx->tlsh_options
     );
 
     std::filesystem::resize_file(outfile, hset_size);
@@ -965,6 +1151,12 @@ uint64_t hashset_builder_write(SFHASH_HashsetBuildCtx* bctx) {
       );
 
       off += length_hdat(hhdr.hash_count, hhdr.hash_length);
+
+      // TVEC, TIVF
+      off = layout_tlsh_chunks(
+        off, field, hhdr.hash_count, bctx->tlsh_ivfs[i],
+        bctx->tlsh_options, i, &ftoc, &off2hbidx
+      );
     }
 
     // FEND
@@ -972,7 +1164,7 @@ uint64_t hashset_builder_write(SFHASH_HashsetBuildCtx* bctx) {
     off += length_fend();
 
     // Write
-    write_chunks(out, ftoc, fhdr, rhdr, rdat, hb, off2hbidx);
+    write_chunks(out, ftoc, fhdr, rhdr, rdat, hb, off2hbidx, bctx->tlsh_ivfs);
   }
 
   std::filesystem::resize_file(outfile, off);

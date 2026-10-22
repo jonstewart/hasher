@@ -10,6 +10,7 @@
 #include "hashset/tlsh_cells.h"
 #include "hashset/tlsh_ls.h"
 #include "hashset/util.h"
+#include "hasher/common.h"
 #include "tlsh_digest.h"
 
 #include <algorithm>
@@ -262,7 +263,9 @@ State::Type handle_hhdr(const Chunk& ch, Holder& h) {
     HashsetHint(),
     ConstHashsetData(),
     nullptr,
-    ConstRecordIndex()
+    ConstRecordIndex(),
+    ConstTlshVectors(),
+    TlshIvfView()
   );
 
   return State::HHDR;
@@ -311,6 +314,59 @@ State::Type handle_ridx(const Chunk& ch, Holder& h) {
   check_data_length(ch, hhdr.hash_count * sizeof(uint64_t));
 
   ridx = parse_ridx(ch);
+  return State::RIDX;
+}
+
+State::Type handle_tvec(const Chunk& ch, Holder& h) {
+  auto& hset = h.hsets.back();
+  const auto& hhdr = std::get<HashsetHeader>(hset);
+  auto& tvec = std::get<ConstTlshVectors>(hset);
+
+  THROW_IF(
+    hhdr.hash_type != SFHASH_TLSH,
+    "TVEC chunk in a " << hhdr.hash_name << " hashset"
+  );
+
+  tvec = parse_tvec(ch);
+
+  THROW_IF(
+    tvec.n != hhdr.hash_count,
+    "TVEC has " << tvec.n << " rows, expected " << hhdr.hash_count
+  );
+
+  return State::TVEC;
+}
+
+State::Type handle_tivf(const Chunk& ch, Holder& h) {
+  auto& hset = h.hsets.back();
+  const auto& hhdr = std::get<HashsetHeader>(hset);
+  auto& ivf = std::get<TlshIvfView>(hset);
+
+  THROW_IF(
+    hhdr.hash_type != SFHASH_TLSH,
+    "TIVF chunk in a " << hhdr.hash_name << " hashset"
+  );
+
+  ivf = parse_tivf(ch);
+
+  THROW_IF(
+    ivf.n != hhdr.hash_count,
+    "TIVF has " << ivf.n << " rows, expected " << hhdr.hash_count
+  );
+
+  // The list offsets are cheap to check; the ids are not checked here, as
+  // that would touch every page of the index at load time.
+  THROW_IF(
+    ivf.list_start[0] != 0 || ivf.list_start[ivf.lists] != ivf.n,
+    "TIVF list offsets do not cover the rows"
+  );
+  for (uint32_t c = 0; c < ivf.lists; ++c) {
+    THROW_IF(
+      ivf.list_start[c] > ivf.list_start[c + 1],
+      "TIVF list offsets are not nondecreasing"
+    );
+  }
+
   return State::SBRK;
 }
 
@@ -358,8 +414,12 @@ Holder decode_hset(const uint8_t* beg, const uint8_t* end) {
   h.fhdr.sha2_256 = hset_hash;
 
   // install lookup strategies
-  for (auto& [hsh, hnt, hsd, ls, _]: h.hsets) {
-    ls = make_lookup_strategy(hsh, hnt, hsd);
+  for (auto& hs: h.hsets) {
+    std::get<std::unique_ptr<LookupStrategy>>(hs) = make_lookup_strategy(
+      std::get<HashsetHeader>(hs),
+      std::get<HashsetHint>(hs),
+      std::get<ConstHashsetData>(hs)
+    );
   }
 
   return h;

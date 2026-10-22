@@ -1,4 +1,5 @@
 #include "hashset/hset_structs.h"
+#include "hashset/tlsh_ivf.h"
 
 #include <cstdint>
 
@@ -19,6 +20,13 @@ HashsetHint parse_hint(const Chunk& ch);
 ConstHashsetData parse_hdat(const Chunk& ch);
 
 ConstRecordIndex parse_ridx(const Chunk& ch);
+
+// validates the TVEC header (version 1, variant 0, 264 dims, float32) and
+// that the payload holds exactly n rows; throws otherwise
+ConstTlshVectors parse_tvec(const Chunk& ch);
+
+// validates the TIVF header and payload length; throws otherwise
+TlshIvfView parse_tivf(const Chunk& ch);
 
 RecordHeader parse_rhdr(const Chunk& ch);
 

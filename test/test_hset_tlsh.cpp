@@ -658,14 +658,27 @@ TEST_CASE("tlsh_knn_brute_matches_naive_and_reference") {
           const auto got = tlsh_knn_brute(beg, end, q, k, maxd, include_length);
           CHECK(same_matches(got, exp));
 
-          // C API
+          // C API, explicit brute force
           std::vector<SFHASH_TlshMatch> out(k + 1);
-          const size_t n = sfhash_hashset_tlsh_knn(
-            hset.get(), tidx, &q, k, maxd, include_length, out.data()
+          const size_t n = sfhash_hashset_tlsh_knn_with(
+            hset.get(), tidx, &q, k, maxd, include_length, SFHASH_TLSH_KNN_BRUTE, out.data()
           );
           REQUIRE(n <= k);
           out.resize(n);
           CHECK(same_matches(out, exp));
+
+          // C API, default strategy: the file has a TIVF index, which is
+          // exact up to distance 144 when the length is included
+          {
+            const uint32_t clamped = include_length ? std::min(maxd, 144u) : maxd;
+            std::vector<SFHASH_TlshMatch> aout(k + 1);
+            const size_t an = sfhash_hashset_tlsh_knn(
+              hset.get(), tidx, &q, k, maxd, include_length, aout.data()
+            );
+            REQUIRE(an <= k);
+            aout.resize(an);
+            CHECK(same_matches(aout, naive_knn(beg, end, q, k, clamped, include_length)));
+          }
 
           // results agree with the reference implementation
           for (const auto& m: out) {

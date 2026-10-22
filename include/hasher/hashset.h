@@ -7,6 +7,7 @@
 #include <sys/types.h>
 
 #include <hasher/common.h>
+#include <hasher/tlsh.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -112,10 +113,17 @@ struct SFHASH_TlshMatch {
 };
 
 /*
- * Brute-force k nearest neighbours by TLSH distance (see sfhash_tlsh_diff).
+ * k nearest neighbours by TLSH distance (see sfhash_tlsh_diff).
  *
  * Writes to out the rows with distance <= max_distance, nearest first, ties
  * by ascending index, at most k of them. out must have room for k matches.
+ *
+ * Uses the hashset's TIVF index when the file has one (see
+ * sfhash_hashset_tlsh_knn_strategies) and brute force otherwise. The index
+ * is exact only up to distance 144 when include_length is true, so in that
+ * case max_distance is clamped to 144; call sfhash_hashset_tlsh_knn_with
+ * with SFHASH_TLSH_KNN_BRUTE for larger thresholds. Without the length
+ * there is no cap.
  *
  * Returns the number of matches written, or 0 if tidx is not a TLSH
  * hashset, digest is null, or digest is the null digest.
@@ -128,6 +136,57 @@ size_t sfhash_hashset_tlsh_knn(
   uint32_t max_distance,
   bool include_length,
   SFHASH_TlshMatch* out
+);
+
+/*
+ * kNN strategies. BRUTE scans every row; INDEX prunes with the TIVF
+ * inverted-file index stored in the file (exact for max_distance <= 144
+ * when include_length is true; larger thresholds are clamped to 144).
+ */
+enum {
+  SFHASH_TLSH_KNN_BRUTE = 1,
+  SFHASH_TLSH_KNN_INDEX = 2
+};
+
+/*
+ * Which kNN strategies the hashset supports: the bitwise OR of
+ * SFHASH_TLSH_KNN_BRUTE (always, for a TLSH hashset) and
+ * SFHASH_TLSH_KNN_INDEX (when the file has a TIVF index). Returns 0 if tidx
+ * is not a TLSH hashset.
+ */
+uint32_t sfhash_hashset_tlsh_knn_strategies(
+  const SFHASH_Hashset* hset,
+  size_t tidx
+);
+
+/*
+ * kNN with an explicit strategy (exactly one of the SFHASH_TLSH_KNN_*
+ * values). Same results and ordering as sfhash_hashset_tlsh_knn; returns 0
+ * if the strategy is not supported by the hashset.
+ */
+size_t sfhash_hashset_tlsh_knn_with(
+  const SFHASH_Hashset* hset,
+  size_t tidx,
+  const void* digest,
+  size_t k,
+  uint32_t max_distance,
+  bool include_length,
+  uint32_t strategy,
+  SFHASH_TlshMatch* out
+);
+
+/*
+ * Pointer to the n x dims float32 row-major embedding matrix (TVEC section)
+ * of a TLSH hashset, or NULL if the file has no vectors. *dims receives
+ * SFHASH_TLSH_EMBEDDING_DIMS (0 when NULL is returned); n is
+ * sfhash_hashset_count. Row r is sfhash_tlsh_embed of
+ * sfhash_hashset_hash(hset, tidx, r). The data starts on a 4096-byte
+ * boundary of the file.
+ */
+const float* sfhash_hashset_tlsh_vectors(
+  const SFHASH_Hashset* hset,
+  size_t tidx,
+  size_t* dims
 );
 
 struct SFHASH_HashsetRecordRange {
@@ -171,6 +230,26 @@ SFHASH_HashsetBuildCtx* sfhash_hashset_builder_open(
   const char* output_file,
   const char* temp_dir,
   SFHASH_Error** err
+);
+
+/*
+ * Optional sections of TLSH hashsets: the embedding vectors (TVEC) and the
+ * kNN index (TIVF). The default is both.
+ */
+enum {
+  SFHASH_HSET_TLSH_VECTORS = 1,
+  SFHASH_HSET_TLSH_INDEX = 2
+};
+
+/*
+ * Select which optional TLSH sections to write; options is a bitwise OR of
+ * SFHASH_HSET_TLSH_* values (0 for neither). Only TLSH hashsets are
+ * affected, and only when hashsets are written. Call after *_open and
+ * before *_write.
+ */
+void sfhash_hashset_builder_set_tlsh_options(
+  SFHASH_HashsetBuildCtx* bctx,
+  uint32_t options
 );
 
 void sfhash_hashset_builder_add_record(

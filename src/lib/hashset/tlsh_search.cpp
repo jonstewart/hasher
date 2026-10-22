@@ -1,10 +1,13 @@
 #include "hashset/tlsh_search.h"
 
 #include <algorithm>
+#include <bit>
 #include <cstring>
 #include <tuple>
+#include <vector>
 
 #include "hashset/hset.h"
+#include "hashset/tlsh_ivf.h"
 
 namespace {
 
@@ -89,6 +92,110 @@ const void* sfhash_hashset_hash(
   return static_cast<const uint8_t*>(hdat.beg) + idx * hhdr.hash_length;
 }
 
+namespace {
+
+using HashsetTuple = decltype(Holder::hsets)::value_type;
+
+// the hashset tuple at tidx if it is a TLSH hashset, else null
+const HashsetTuple* tlsh_hashset(const SFHASH_Hashset* hset, size_t tidx) {
+  if (tidx >= hset->holder.hsets.size()) {
+    return nullptr;
+  }
+  const auto& hs = hset->holder.hsets[tidx];
+  const auto& hhdr = std::get<HashsetHeader>(hs);
+  if (hhdr.hash_type != SFHASH_TLSH || hhdr.hash_length != sizeof(TlshDigest)) {
+    return nullptr;
+  }
+  return &hs;
+}
+
+uint32_t knn_strategies(const HashsetTuple& hs) {
+  uint32_t s = SFHASH_TLSH_KNN_BRUTE;
+  if (!std::get<TlshIvfView>(hs).empty()) {
+    s |= SFHASH_TLSH_KNN_INDEX;
+  }
+  return s;
+}
+
+} // namespace
+
+const float* sfhash_hashset_tlsh_vectors(
+  const SFHASH_Hashset* hset,
+  size_t tidx,
+  size_t* dims)
+{
+  const HashsetTuple* hs = tlsh_hashset(hset, tidx);
+  const ConstTlshVectors* tv = hs ? &std::get<ConstTlshVectors>(*hs) : nullptr;
+  if (dims) {
+    *dims = tv && tv->data ? tv->dims : 0;
+  }
+  return tv ? tv->data : nullptr;
+}
+
+uint32_t sfhash_hashset_tlsh_knn_strategies(
+  const SFHASH_Hashset* hset,
+  size_t tidx)
+{
+  const HashsetTuple* hs = tlsh_hashset(hset, tidx);
+  return hs ? knn_strategies(*hs) : 0;
+}
+
+size_t sfhash_hashset_tlsh_knn_with(
+  const SFHASH_Hashset* hset,
+  size_t tidx,
+  const void* digest,
+  size_t k,
+  uint32_t max_distance,
+  bool include_length,
+  uint32_t strategy,
+  SFHASH_TlshMatch* out)
+{
+  const HashsetTuple* hs = digest ? tlsh_hashset(hset, tidx) : nullptr;
+  if (!hs) {
+    return 0;
+  }
+
+  // exactly one supported strategy
+  if (std::popcount(strategy) != 1 || !(strategy & knn_strategies(*hs))) {
+    return 0;
+  }
+
+  const auto& hdat = std::get<ConstHashsetData>(*hs);
+  const TlshDigest* rows = static_cast<const TlshDigest*>(hdat.beg);
+  const TlshDigest& q = *static_cast<const TlshDigest*>(digest);
+
+  std::vector<SFHASH_TlshMatch> matches;
+  switch (strategy) {
+  case SFHASH_TLSH_KNN_BRUTE:
+    matches = tlsh_knn_brute(
+      rows,
+      static_cast<const TlshDigest*>(hdat.end),
+      q,
+      k,
+      max_distance,
+      include_length
+    );
+    break;
+
+  case SFHASH_TLSH_KNN_INDEX:
+    matches = tlsh_knn_ivf(
+      std::get<TlshIvfView>(*hs),
+      rows,
+      q,
+      k,
+      max_distance,
+      include_length
+    );
+    break;
+
+  default:
+    return 0;
+  }
+
+  std::copy(matches.begin(), matches.end(), out);
+  return matches.size();
+}
+
 size_t sfhash_hashset_tlsh_knn(
   const SFHASH_Hashset* hset,
   size_t tidx,
@@ -98,27 +205,16 @@ size_t sfhash_hashset_tlsh_knn(
   bool include_length,
   SFHASH_TlshMatch* out)
 {
-  if (!digest || tidx >= hset->holder.hsets.size()) {
+  const HashsetTuple* hs = tlsh_hashset(hset, tidx);
+  if (!hs) {
     return 0;
   }
 
-  const auto& hs = hset->holder.hsets[tidx];
-  const auto& hhdr = std::get<HashsetHeader>(hs);
-  if (hhdr.hash_type != SFHASH_TLSH || hhdr.hash_length != sizeof(TlshDigest)) {
-    return 0;
-  }
+  // prefer the index when the file has one
+  const uint32_t strategy = (knn_strategies(*hs) & SFHASH_TLSH_KNN_INDEX) ?
+    SFHASH_TLSH_KNN_INDEX : SFHASH_TLSH_KNN_BRUTE;
 
-  const auto& hdat = std::get<ConstHashsetData>(hs);
-
-  const auto matches = tlsh_knn_brute(
-    static_cast<const TlshDigest*>(hdat.beg),
-    static_cast<const TlshDigest*>(hdat.end),
-    *static_cast<const TlshDigest*>(digest),
-    k,
-    max_distance,
-    include_length
+  return sfhash_hashset_tlsh_knn_with(
+    hset, tidx, digest, k, max_distance, include_length, strategy, out
   );
-
-  std::copy(matches.begin(), matches.end(), out);
-  return matches.size();
 }

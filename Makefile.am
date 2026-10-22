@@ -154,6 +154,7 @@ test_test_SOURCES = \
 	test/test_hset_ops.cpp \
 	test/test_hset_round_trip.cpp \
 	test/test_hset_tlsh.cpp \
+	test/test_hset_tlsh_vectors.cpp \
 	test/test_record_iterator.cpp \
 	test/test_parser.cpp \
 	test/test_tlsh.cpp \

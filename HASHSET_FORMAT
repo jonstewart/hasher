@@ -65,5 +65,64 @@ The hint data starts 12 bytes into the chunk and the offsets 14 bytes in,
 so readers must not assume the offset array is 8-byte aligned.
 
 A lookup binary-searches the digest's cell. Nearest-neighbour search
-(sfhash_hashset_tlsh_knn) currently scans all rows; the cell index is the
-basis for bounding that search by L and Q distance in future.
+(sfhash_hashset_tlsh_knn) scans all rows unless the hashset has a TIVF
+index (below).
+
+Optional chunks: TVEC and TIVF
+------------------------------
+
+A TLSH hashset section may be followed by two optional chunks, in this
+order, each belonging to the section whose HDAT precedes it:
+
+  HHnn HINT HDAT [RIDX] [TVEC] [TIVF]
+
+Neither may appear in a section of any other hash type (a reader rejects
+the file). Both are written by default for TLSH fields when hashsets are
+written; sfhash_hashset_builder_set_tlsh_options (or HSET_TLSH_OPTIONS for
+mkhashset) turns either off. The FTOC reserves room for both whether or not
+they are written, so the FTOC chunk may be shorter than the gap before
+FHDR.
+
+TVEC ("TVEC", 0x54564543): the lower-bound Euclidean embedding of every
+row, see docs/TLSH_EMBEDDING.md sections 1-2. Payload:
+
+   0 version   uint16_t, 1
+   2 variant   uint8_t, 0 (128 buckets, 1-byte checksum)
+   3 flags     uint8_t, 0
+   4 dims      uint32_t, 264
+   8 n         uint64_t, equals the section's hash count
+  16 dtype     uint32_t, 1 = float32 little-endian
+  20 reserved  uint32_t, 0
+  24 reserved  uint64_t, 0
+  32 data      float32[n][dims], row r is the embedding of HDAT row r
+
+The chunk is placed so that data starts on a 4096-byte boundary of the
+file: offset(TVEC) + 12 + 32 is a multiple of 4096, with zero padding
+before the chunk as needed. The matrix can therefore be memory-mapped and
+handed directly to numpy, faiss, etc.; sfhash_hashset_tlsh_vectors returns
+a pointer to it.
+
+TIVF ("TIVF", 0x54495646): an inverted-file index over the embedding for
+exact pruned kNN, see docs/TLSH_EMBEDDING.md sections 3-4. Payload:
+
+   0 version     uint16_t, 1
+   2 flags       uint16_t, 0
+   4 dims        uint32_t, 264
+   8 lists       uint32_t, C
+  12 reserved    uint32_t, 0
+  16 n           uint64_t, equals the section's hash count
+  24 reserved    uint64_t, 0
+  32 centroids   float32[C][dims]
+     radius      float32[C], max distance from a centroid to a member
+     list_start  uint64_t[C+1], CSR offsets into ids
+     ids         uint32_t[n], HDAT row indexes, ascending within a list
+
+A reader checks the version, dims, length, row count and list offsets;
+the ids are not validated at load time. The TIVF payload is only 4-byte
+aligned in general, so readers must not assume list_start is 8-byte
+aligned.
+
+sfhash_hashset_tlsh_knn uses the TIVF index when present (clamping
+max_distance to 144 when the length is included, where the embedding bound
+holds) and brute force otherwise; sfhash_hashset_tlsh_knn_with selects a
+strategy explicitly.

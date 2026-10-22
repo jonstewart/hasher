@@ -132,7 +132,9 @@ TEST_CASE("hashset_index_for_type") {
     HashsetHint{},
     ConstHashsetData{},
     std::unique_ptr<LookupStrategy>(),
-    ConstRecordIndex{}
+    ConstRecordIndex{},
+    ConstTlshVectors{},
+    TlshIvfView{}
   );
 
   hset.holder.hsets.emplace_back(
@@ -140,7 +142,9 @@ TEST_CASE("hashset_index_for_type") {
     HashsetHint{},
     ConstHashsetData{},
     std::unique_ptr<LookupStrategy>(),
-    ConstRecordIndex{}
+    ConstRecordIndex{},
+    ConstTlshVectors{},
+    TlshIvfView{}
   );
 
   hset.holder.hsets.emplace_back(
@@ -148,7 +152,9 @@ TEST_CASE("hashset_index_for_type") {
     HashsetHint{},
     ConstHashsetData{},
     std::unique_ptr<LookupStrategy>(),
-    ConstRecordIndex{}
+    ConstRecordIndex{},
+    ConstTlshVectors{},
+    TlshIvfView{}
   );
 
   CHECK(sfhash_hashset_index_for_type(&hset, SFHASH_SIZE) == 0);
@@ -206,7 +212,9 @@ TEST_CASE("hashset_lookup") {
     HashsetHint{},
     ConstHashsetData{ md5s.begin(),  md5s.end() },
     std::unique_ptr<LookupStrategy>(new BasicLookupStrategy<16>(md5s.begin(), md5s.end())),
-    ConstRecordIndex{}
+    ConstRecordIndex{},
+    ConstTlshVectors{},
+    TlshIvfView{}
   );
 
   hset.holder.hsets.emplace_back(
@@ -214,7 +222,9 @@ TEST_CASE("hashset_lookup") {
     HashsetHint{},
     ConstHashsetData{ sha1s.begin(), sha1s.end() },
     std::unique_ptr<LookupStrategy>(new BasicLookupStrategy<20>(sha1s.begin(), sha1s.end())),
-    ConstRecordIndex{}
+    ConstRecordIndex{},
+    ConstTlshVectors{},
+    TlshIvfView{}
   );
 
   // lookup some MD5s
@@ -284,7 +294,9 @@ TEST_CASE("hashset_lookup_bulk") {
     HashsetHint{},
     ConstHashsetData{ sha1s.begin(), sha1s.end() },
     std::unique_ptr<LookupStrategy>(new BasicLookupStrategy<20>(sha1s.begin(), sha1s.end())),
-    ConstRecordIndex{}
+    ConstRecordIndex{},
+    ConstTlshVectors{},
+    TlshIvfView{}
   );
 
   // lookup some SHA1s
@@ -472,7 +484,9 @@ TEST_CASE("hashset_record_lookup") {
     HashsetHint{},
     ConstHashsetData{ md5s.begin(), md5s.end() },
     std::unique_ptr<LookupStrategy>(),
-    ConstRecordIndex{ md5s_r.begin(), md5s_r.end() }
+    ConstRecordIndex{ md5s_r.begin(), md5s_r.end() },
+    ConstTlshVectors{},
+    TlshIvfView{}
   );
 
   hset.holder.hsets.emplace_back(
@@ -480,7 +494,9 @@ TEST_CASE("hashset_record_lookup") {
     HashsetHint{},
     ConstHashsetData{ sha1s.begin(), sha1s.end() },
     std::unique_ptr<LookupStrategy>(),
-    ConstRecordIndex{ sha1s_r.begin(), sha1s_r.end() }
+    ConstRecordIndex{ sha1s_r.begin(), sha1s_r.end() },
+    ConstTlshVectors{},
+    TlshIvfView{}
   );
 
   hset.holder.hsets.emplace_back(
@@ -488,7 +504,9 @@ TEST_CASE("hashset_record_lookup") {
     HashsetHint{},
     ConstHashsetData{ sizes.begin(), sizes.end() },
     std::unique_ptr<LookupStrategy>(),
-    ConstRecordIndex{ sizes_r.begin(), sizes_r.end() }
+    ConstRecordIndex{ sizes_r.begin(), sizes_r.end() },
+    ConstTlshVectors{},
+    TlshIvfView{}
   );
 
   // lookup records for some MD5s
