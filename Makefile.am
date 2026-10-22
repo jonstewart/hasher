@@ -28,6 +28,7 @@ src_lib_libhasherint_la_SOURCES = \
 	src/lib/parser.cpp \
 	src/lib/rwutil.cpp \
 	src/lib/tlsh.cpp \
+	src/lib/tlsh_embedding.cpp \
 	src/lib/util.cpp \
 	src/lib/hasher/entropy.cpp \
 	src/lib/hasher/fuzzy_hasher.cpp \
@@ -45,6 +46,7 @@ src_lib_libhasherint_la_SOURCES = \
 	src/lib/hashset/hset_structs.cpp \
 	src/lib/hashset/record_iterator.cpp \
 	src/lib/hashset/tlsh_cells.cpp \
+	src/lib/hashset/tlsh_ivf.cpp \
 	src/lib/hashset/tlsh_search.cpp \
 	src/lib/hashset/util.cpp \
 	src/lib/hex/hex.cpp \
@@ -155,6 +157,8 @@ test_test_SOURCES = \
 	test/test_record_iterator.cpp \
 	test/test_parser.cpp \
 	test/test_tlsh.cpp \
+	test/test_tlsh_embedding.cpp \
+	test/test_tlsh_ivf.cpp \
 	test/test_tlsh_corpus.cpp \
 	test/test_util.cpp \
 	test/tlsh_corpus.cpp

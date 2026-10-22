@@ -63,6 +63,25 @@ bool sfhash_tlsh_is_null(const void* digest);
  */
 int sfhash_tlsh_diff(const void* a, const void* b, bool include_length);
 
+/******************************************************************************
+ Lower-bound Euclidean embedding
+
+ sfhash_tlsh_embed maps a digest to SFHASH_TLSH_EMBEDDING_DIMS float32
+ coordinates such that for any two digests a, b with sfhash_tlsh_diff(a, b,
+ true) <= 144, the squared Euclidean distance between their embeddings is at
+ most that TLSH distance. See docs/TLSH_EMBEDDING.md.
+******************************************************************************/
+
+#define SFHASH_TLSH_EMBEDDING_DIMS 264
+
+/* Index of the length (L) coordinate; omit it for include_length = false. */
+#define SFHASH_TLSH_EMBEDDING_L_DIM 256
+
+void sfhash_tlsh_embed(const void* digest, float* out);
+
+/* Squared Euclidean distance between two embeddings. */
+float sfhash_tlsh_embed_dist2(const float* a, const float* b, bool include_length);
+
 #ifdef __cplusplus
 }
 #endif
