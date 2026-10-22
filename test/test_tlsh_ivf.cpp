@@ -88,6 +88,20 @@ TEST_CASE("tlsh_ivf_build_invariants") {
   }
 }
 
+TEST_CASE("tlsh_ivf_build_is_deterministic_across_threads") {
+  const auto rows = sorted_corpus(9, 6000);
+  const auto a = build_tlsh_ivf(rows.data(), rows.data() + rows.size(), 32, 1, 1);
+  const auto b = build_tlsh_ivf(rows.data(), rows.data() + rows.size(), 32, 1, 4);
+  const auto c = build_tlsh_ivf(rows.data(), rows.data() + rows.size(), 32, 1, 0);
+  CHECK(a.cell_lists == b.cell_lists);
+  CHECK(a.medoids == b.medoids);
+  CHECK(a.radius2 == b.radius2);
+  CHECK(a.list_start == b.list_start);
+  CHECK(a.ids == b.ids);
+  CHECK(a.ids == c.ids);
+  CHECK(a.medoids == c.medoids);
+}
+
 TEST_CASE("tlsh_ivf_serialization_round_trip") {
   const auto rows = sorted_corpus(2, 2000);
   const auto ivf = build_tlsh_ivf(rows.data(), rows.data() + rows.size(), 32);

@@ -8,6 +8,8 @@
 #include <numeric>
 #include <queue>
 #include <random>
+#include <atomic>
+#include <thread>
 
 #include "rwutil.h"
 #include "throw.h"
@@ -27,16 +29,24 @@ inline float dist2(const float* a, const float* b) {
   return s;
 }
 
-// k-means over the body embeddings of one cell's rows [beg, end), appending
-// its lists to ivf. Row indexes written to ids are offset by base.
-void cluster_cell(
+// the lists of one cell
+struct CellLists {
+  std::vector<TlshDigest> medoids;
+  std::vector<uint32_t> radius2;
+  std::vector<uint32_t> sizes;
+  std::vector<uint32_t> ids; // concatenated, ascending within a list
+};
+
+// k-means over the body embeddings of one cell's rows [beg, end). Row
+// indexes written to ids are offset by base.
+CellLists cluster_cell(
   const TlshDigest* beg,
   const TlshDigest* end,
   uint64_t base,
   size_t target_list_size,
-  std::mt19937_64& rng,
-  TlshIvf& ivf)
+  std::mt19937_64& rng)
 {
+  CellLists out;
   const size_t m = end - beg;
   const size_t k = std::max<size_t>(1, (m + target_list_size - 1) / target_list_size);
 
@@ -171,21 +181,21 @@ void cluster_cell(
   for (size_t c = 0; c < k; ++c) {
     start[c + 1] = start[c] + cnt[c];
   }
-  const size_t id_base = ivf.ids.size();
-  ivf.ids.resize(id_base + m);
+  out.ids.resize(m);
   std::vector<uint64_t> fill(start.begin(), start.end() - 1);
   for (size_t i = 0; i < m; ++i) {
-    ivf.ids[id_base + fill[assign[i]]++] = static_cast<uint32_t>(base + i);
+    out.ids[fill[assign[i]]++] = static_cast<uint32_t>(base + i);
   }
 
   for (size_t c = 0; c < k; ++c) {
     if (!cnt[c]) {
       continue;
     }
-    ivf.medoids.push_back(beg[medoid[c]]);
-    ivf.radius2.push_back(rad2[c]);
-    ivf.list_start.push_back(id_base + start[c + 1]);
+    out.medoids.push_back(beg[medoid[c]]);
+    out.radius2.push_back(rad2[c]);
+    out.sizes.push_back(cnt[c]);
   }
+  return out;
 }
 
 } // namespace
@@ -194,34 +204,77 @@ TlshIvf build_tlsh_ivf(
   const TlshDigest* beg,
   const TlshDigest* end,
   size_t target_list_size,
-  uint64_t seed)
+  uint64_t seed,
+  unsigned threads)
 {
   THROW_IF(target_list_size == 0, "target_list_size must be positive");
   const uint64_t n = end - beg;
   THROW_IF(n > std::numeric_limits<uint32_t>::max(), "too many rows for a TIVF index");
 
+  // cell boundaries
+  const std::vector<uint64_t> cells = make_tlsh_cell_index(beg, end);
+
+  // nonempty cells, clustered independently (and in parallel)
+  std::vector<uint32_t> nonempty;
+  for (uint32_t c = 0; c < TLSH_CELL_COUNT; ++c) {
+    if (cells[c] != cells[c + 1]) {
+      nonempty.push_back(c);
+    }
+  }
+
+  std::vector<CellLists> results(nonempty.size());
+
+  auto work = [&](size_t i) {
+    const uint32_t c = nonempty[i];
+    std::mt19937_64 rng(seed ^ (static_cast<uint64_t>(c) * 0x9E3779B97F4A7C15ull));
+    results[i] = cluster_cell(beg + cells[c], beg + cells[c + 1], cells[c], target_list_size, rng);
+  };
+
+  if (threads == 0) {
+    threads = std::max(1u, std::thread::hardware_concurrency());
+  }
+  threads = static_cast<unsigned>(std::min<size_t>(threads, std::max<size_t>(1, nonempty.size())));
+
+  if (threads <= 1) {
+    for (size_t i = 0; i < nonempty.size(); ++i) {
+      work(i);
+    }
+  }
+  else {
+    std::atomic<size_t> next{0};
+    std::vector<std::thread> pool;
+    for (unsigned t = 0; t < threads; ++t) {
+      pool.emplace_back([&]() {
+        for (size_t i = next++; i < nonempty.size(); i = next++) {
+          work(i);
+        }
+      });
+    }
+    for (auto& t: pool) {
+      t.join();
+    }
+  }
+
+  // concatenate in cell order
   TlshIvf ivf;
   ivf.n = n;
-  ivf.cell_lists.resize(TLSH_CELL_COUNT + 1);
+  ivf.cell_lists.assign(TLSH_CELL_COUNT + 1, 0);
   ivf.list_start.push_back(0);
   ivf.ids.reserve(n);
 
-  std::mt19937_64 rng(seed);
-
-  const TlshDigest* g = beg;
+  size_t ri = 0;
   for (uint32_t c = 0; c < TLSH_CELL_COUNT; ++c) {
     ivf.cell_lists[c] = static_cast<uint32_t>(ivf.lists());
-    const TlshDigest* ge = g;
-    while (ge != end && tlsh_cell_id(*ge) == c) {
-      ++ge;
+    if (ri < nonempty.size() && nonempty[ri] == c) {
+      const CellLists& r = results[ri++];
+      ivf.medoids.insert(ivf.medoids.end(), r.medoids.begin(), r.medoids.end());
+      ivf.radius2.insert(ivf.radius2.end(), r.radius2.begin(), r.radius2.end());
+      for (const uint32_t sz: r.sizes) {
+        ivf.list_start.push_back(ivf.list_start.back() + sz);
+      }
+      ivf.ids.insert(ivf.ids.end(), r.ids.begin(), r.ids.end());
     }
-    THROW_IF(ge != end && tlsh_cell_id(*ge) < c, "rows are not sorted");
-    if (ge != g) {
-      cluster_cell(g, ge, g - beg, target_list_size, rng, ivf);
-    }
-    g = ge;
   }
-  THROW_IF(g != end, "rows are not sorted");
   ivf.cell_lists[TLSH_CELL_COUNT] = static_cast<uint32_t>(ivf.lists());
 
   return ivf;

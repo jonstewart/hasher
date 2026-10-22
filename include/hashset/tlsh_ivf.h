@@ -34,11 +34,15 @@ struct TlshIvf {
   size_t lists() const { return radius2.size(); }
 };
 
+// Builds the index over sorted rows [beg, end). Cells are clustered in
+// parallel on `threads` threads (0 = hardware concurrency); the result does
+// not depend on the thread count.
 TlshIvf build_tlsh_ivf(
   const TlshDigest* beg,
   const TlshDigest* end,
   size_t target_list_size = 32,
-  uint64_t seed = 0x7175657279
+  uint64_t seed = 0x7175657279,
+  unsigned threads = 0
 );
 
 // Read-only view over a serialized TIVF payload (pointers into mapped memory).
