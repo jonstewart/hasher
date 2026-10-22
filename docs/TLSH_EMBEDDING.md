@@ -199,3 +199,35 @@ Apple M-series core with a synthetic family corpus (k = 10, T = 144):
 
 Per query. "Reference brute" is `Tlsh::totalDiff` over every row; "kernel
 brute" is the popcount kernel over every row (0.55 ns/row).
+
+## 6. Using the vectors from Python
+
+`hasher.hsvectors` (`python/hasher/hsvectors.py`) walks the chunks of an hset
+in pure Python, with no dependency on libhasher, and hands the `TVEC` matrix
+to numpy as a read-only memory map of the file:
+
+```python
+from hasher import hsvectors
+X = hsvectors.load_tlsh_vectors('corpus.hset')   # (n, 264) float32 memmap
+D = hsvectors.load_tlsh_digests('corpus.hset')   # (n, 36) uint8, row r <-> X[r]
+R = hsvectors.load_tlsh_record_index('corpus.hset')  # (n,) uint64 RIDX, or None
+```
+
+`X` can go straight into numpy, scikit-learn, faiss, HDBSCAN or UMAP; drop
+column 256 (`hasher.TLSH_EMBEDDING_L_DIM`, the length coordinate) for the
+`include_length = false` distance. `hsvectors.tlsh_hex(bytes(D[r]))`
+renders a row as `"T1..."`, `hsvectors.read_toc(path)` lists every chunk,
+and `utils/hschunks.py` prints that table. `utils/hsvectors_example.py` runs
+brute-force kNN, `NearestNeighbors` and HDBSCAN over a file.
+
+The C library's view of the same data is `HSet.tlsh_vectors()` in the ctypes
+bindings, next to `HSet.tlsh_knn(digest, k, max_distance, include_length,
+strategy)`, the exact kNN of section 4:
+
+```python
+import hasher
+with hasher.HSet.open('corpus.hset') as hset:
+    tidx = hset.index_for_type(hasher.TLSH)
+    for row, dist in hset.tlsh_knn(hasher.tlsh_from_hex('T1...'), k=5):
+        print(dist, hasher.tlsh_to_hex(hset.hash(tidx, row)))
+```

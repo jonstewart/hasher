@@ -333,6 +333,57 @@ _sfhash_tlsh_diff = _hasher.sfhash_tlsh_diff
 _sfhash_tlsh_diff.argtypes = [c_void_p, c_void_p, c_bool]
 _sfhash_tlsh_diff.restype = c_int
 
+TLSH_EMBEDDING_DIMS = 264   # SFHASH_TLSH_EMBEDDING_DIMS
+TLSH_EMBEDDING_L_DIM = 256  # SFHASH_TLSH_EMBEDDING_L_DIM
+
+# void sfhash_tlsh_embed(const void* digest, float* out);
+_sfhash_tlsh_embed = _hasher.sfhash_tlsh_embed
+_sfhash_tlsh_embed.argtypes = [c_void_p, POINTER(c_float)]
+_sfhash_tlsh_embed.restype = None
+
+# float sfhash_tlsh_embed_dist2(const float* a, const float* b, bool include_length);
+_sfhash_tlsh_embed_dist2 = _hasher.sfhash_tlsh_embed_dist2
+_sfhash_tlsh_embed_dist2.argtypes = [POINTER(c_float), POINTER(c_float), c_bool]
+_sfhash_tlsh_embed_dist2.restype = c_float
+
+# const void* sfhash_hashset_hash(const SFHASH_Hashset* hset, size_t tidx, size_t idx);
+_sfhash_hashset_hash = _hasher.sfhash_hashset_hash
+_sfhash_hashset_hash.argtypes = [c_void_p, c_size_t, c_size_t]
+_sfhash_hashset_hash.restype = c_void_p
+
+
+class TlshMatch(Structure):
+    # struct SFHASH_TlshMatch { uint64_t index; uint32_t distance; };
+    _fields_ = [
+        ('index', c_uint64),
+        ('distance', c_uint32)
+    ]
+
+
+# kNN strategies (SFHASH_TLSH_KNN_*)
+TLSH_KNN_BRUTE = 1
+TLSH_KNN_INDEX = 2
+
+# size_t sfhash_hashset_tlsh_knn(const SFHASH_Hashset* hset, size_t tidx, const void* digest, size_t k, uint32_t max_distance, bool include_length, SFHASH_TlshMatch* out);
+_sfhash_hashset_tlsh_knn = _hasher.sfhash_hashset_tlsh_knn
+_sfhash_hashset_tlsh_knn.argtypes = [c_void_p, c_size_t, c_void_p, c_size_t, c_uint32, c_bool, POINTER(TlshMatch)]
+_sfhash_hashset_tlsh_knn.restype = c_size_t
+
+# size_t sfhash_hashset_tlsh_knn_with(const SFHASH_Hashset* hset, size_t tidx, const void* digest, size_t k, uint32_t max_distance, bool include_length, uint32_t strategy, SFHASH_TlshMatch* out);
+_sfhash_hashset_tlsh_knn_with = _hasher.sfhash_hashset_tlsh_knn_with
+_sfhash_hashset_tlsh_knn_with.argtypes = [c_void_p, c_size_t, c_void_p, c_size_t, c_uint32, c_bool, c_uint32, POINTER(TlshMatch)]
+_sfhash_hashset_tlsh_knn_with.restype = c_size_t
+
+# uint32_t sfhash_hashset_tlsh_knn_strategies(const SFHASH_Hashset* hset, size_t tidx);
+_sfhash_hashset_tlsh_knn_strategies = _hasher.sfhash_hashset_tlsh_knn_strategies
+_sfhash_hashset_tlsh_knn_strategies.argtypes = [c_void_p, c_size_t]
+_sfhash_hashset_tlsh_knn_strategies.restype = c_uint32
+
+# const float* sfhash_hashset_tlsh_vectors(const SFHASH_Hashset* hset, size_t tidx, size_t* dims);
+_sfhash_hashset_tlsh_vectors = _hasher.sfhash_hashset_tlsh_vectors
+_sfhash_hashset_tlsh_vectors.argtypes = [c_void_p, c_size_t, POINTER(c_size_t)]
+_sfhash_hashset_tlsh_vectors.restype = POINTER(c_float)
+
 c_ssize_p = POINTER(c_ssize_t)
 
 
@@ -489,6 +540,23 @@ def tlsh_diff(a, b, include_length=True):
     return _sfhash_tlsh_diff(_tlsh_digest(a), _tlsh_digest(b), include_length)
 
 
+def tlsh_embed(digest):
+    """The lower-bound Euclidean embedding of a canonical digest as a list of
+    TLSH_EMBEDDING_DIMS (264) floats; see docs/TLSH_EMBEDDING.md. Element
+    TLSH_EMBEDDING_L_DIM is the length coordinate."""
+    out = (c_float * TLSH_EMBEDDING_DIMS)()
+    _sfhash_tlsh_embed(_tlsh_digest(digest), out)
+    return list(out)
+
+
+def tlsh_embed_dist2(a, b, include_length=True):
+    """Squared Euclidean distance between two embeddings (sequences of 264
+    floats, as returned by tlsh_embed())."""
+    fa = (c_float * TLSH_EMBEDDING_DIMS)(*a)
+    fb = (c_float * TLSH_EMBEDDING_DIMS)(*b)
+    return _sfhash_tlsh_embed_dist2(fa, fb, include_length)
+
+
 class Hasher(Handle):
     def __init__(self, algs, clone=None):
         super().__init__(_sfhash_clone_hasher(clone) if clone else _sfhash_create_hasher(algs))
@@ -516,7 +584,36 @@ class Hasher(Handle):
         return h
 
 
+def _tlsh_knn(hset, tidx, digest, k, max_distance, include_length, strategy):
+    if k <= 0:
+        return []
+    out = (TlshMatch * k)()
+    d = _tlsh_digest(digest)
+    if strategy is None:
+        n = _sfhash_hashset_tlsh_knn(hset, tidx, d, k, max_distance, include_length, out)
+    else:
+        n = _sfhash_hashset_tlsh_knn_with(hset, tidx, d, k, max_distance, include_length, strategy, out)
+    return [(out[i].index, out[i].distance) for i in range(n)]
+
+
+def _tlsh_vectors(hset, tidx):
+    dims = c_size_t()
+    ptr = _sfhash_hashset_tlsh_vectors(hset, tidx, byref(dims))
+    if not ptr:
+        return None
+    try:
+        import numpy as np
+    except ImportError:
+        return None
+    n = _sfhash_hashset_count(hset, tidx)
+    a = np.ctypeslib.as_array(ptr, shape=(n, dims.value))
+    a.flags.writeable = False
+    return a
+
+
 class Hashset(object):
+    """One hash set (hash type) of a loaded HSet, by type index."""
+
     def __init__(self, hset, idx):
         self.hset = hset
         self.idx = idx
@@ -527,15 +624,98 @@ class Hashset(object):
     def count(self):
         return _sfhash_hashset_count(self.hset, self.idx)
 
+    def hash_length(self):
+        """Row length in bytes of this hash set."""
+        for _, alg in ALL_HASHES:
+            if _sfhash_hashset_index_for_type(self.hset, alg) == self.idx:
+                return _sfhash_hash_length(alg)
+        raise ValueError(f"no hash set with index {self.idx}")
+
+    def hash(self, idx):
+        """The idx-th row (sorted bytewise) as bytes."""
+        n = self.count()
+        if not 0 <= idx < n:
+            raise IndexError(f"row {idx} out of range [0, {n})")
+        return string_at(_sfhash_hashset_hash(self.hset, self.idx, idx), self.hash_length())
+
+    def tlsh_knn(self, digest, k=10, max_distance=144, include_length=True, strategy=None):
+        """k nearest rows to a canonical TLSH digest as [(index, distance)],
+        nearest first, ties by index, only rows with distance <= max_distance.
+        strategy is None (the C library's choice: the TIVF index when the
+        file has one), TLSH_KNN_BRUTE or TLSH_KNN_INDEX; both are exact.
+        Empty if this is not a TLSH hash set or the digest is null."""
+        return _tlsh_knn(self.hset, self.idx, digest, k, max_distance, include_length, strategy)
+
+    def tlsh_knn_strategies(self):
+        """Bitwise OR of the TLSH_KNN_* strategies this hash set supports;
+        0 if it is not a TLSH hash set."""
+        return _sfhash_hashset_tlsh_knn_strategies(self.hset, self.idx)
+
+    def tlsh_vectors(self):
+        """The TVEC embedding matrix as a read-only (n, 264) float32 numpy
+        array viewing the hset's memory (valid while the HSet is alive), or
+        None when there are no vectors or numpy is not installed."""
+        return _tlsh_vectors(self.hset, self.idx)
+
 
 class HSet(Handle):
-    # For internal use only. Use load() to load a hashset.
-    def __init__(self, buf):
+    """A loaded hset file. Use HSet.load(buf) over a buffer the caller keeps
+    alive, or HSet.open(path) to memory-map a file; both are context
+    managers.
+
+        with hasher.HSet.open('corpus.hset') as hset:
+            tidx = hset.index_for_type(hasher.TLSH)
+            for row, dist in hset.tlsh_knn(digest, k=5):
+                print(dist, hasher.tlsh_to_hex(hset.hash(tidx, row)))
+    """
+
+    # For internal use only. Use load() or open() to load a hashset.
+    def __init__(self, buf, keep=()):
         super().__init__(buf)
+        # objects (mmap, file) that own the memory the hset points into
+        self._keep = list(keep)
 
     def destroy(self):
-        _sfhash_destroy_hashset(self.handle)
+        if self.handle:
+            _sfhash_destroy_hashset(self.handle)
         super().destroy()
+        for obj in reversed(self._keep):
+            obj.close()
+        self._keep = []
+
+    def index_for_type(self, ht):
+        """Type index of the hash set for hash type ht, or -1 if none."""
+        return _sfhash_hashset_index_for_type(self.get(), ht)
+
+    def count(self, tidx):
+        """Number of rows in hash set tidx."""
+        return _sfhash_hashset_count(self.get(), tidx)
+
+    def hash(self, tidx, idx):
+        """The idx-th row of hash set tidx as bytes."""
+        return self.hashset(tidx).hash(idx)
+
+    def _tlsh_index(self, tidx):
+        if tidx is None:
+            tidx = self.index_for_type(TLSH)
+            if tidx < 0:
+                raise ValueError("hset has no TLSH hash set")
+        return tidx
+
+    def tlsh_knn(self, digest, k=10, max_distance=144, include_length=True, strategy=None, tidx=None):
+        """k nearest rows of the TLSH hash set (tidx, default the first) to a
+        canonical digest, as [(index, distance)]; see Hashset.tlsh_knn."""
+        return _tlsh_knn(self.get(), self._tlsh_index(tidx), digest, k, max_distance, include_length, strategy)
+
+    def tlsh_knn_strategies(self, tidx=None):
+        """Bitwise OR of the TLSH_KNN_* strategies hash set tidx supports."""
+        return _sfhash_hashset_tlsh_knn_strategies(self.get(), self._tlsh_index(tidx))
+
+    def tlsh_vectors(self, tidx=None):
+        """The TVEC matrix of TLSH hash set tidx as a read-only (n, 264)
+        float32 numpy array over the mapped file, or None (no vectors, or no
+        numpy). Valid only while this HSet is alive."""
+        return _tlsh_vectors(self.get(), self._tlsh_index(tidx))
 
     def name(self):
         return _sfhash_hashset_name(self.get()).decode('utf-8')
@@ -556,12 +736,30 @@ class HSet(Handle):
         return Hashset(self.get(), idx)
 
     @classmethod
-    def load(cls, buf):
+    def load(cls, buf, keep=()):
         with Error() as err:
-            hset = cls(_sfhash_load_hashset(*buf_range(buf, c_char), byref(err.get())))
+            hset = cls(_sfhash_load_hashset(*buf_range(buf, c_char), byref(err.get())), keep)
             if err:
                 raise RuntimeError(str(err))
         return hset
+
+    @classmethod
+    def open(cls, path):
+        """Memory-map an hset file read-only and load it. The mapping is
+        released by destroy() (or leaving the with block)."""
+        import mmap
+        f = open(path, 'rb')
+        try:
+            m = mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ)
+        except Exception:
+            f.close()
+            raise
+        try:
+            return cls.load(m, keep=(f, m))
+        except Exception:
+            m.close()
+            f.close()
+            raise
 
 
 class FuzzyResult(Handle):
