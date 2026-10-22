@@ -37,7 +37,7 @@ struct TlshIvf {
 TlshIvf build_tlsh_ivf(
   const TlshDigest* beg,
   const TlshDigest* end,
-  size_t target_list_size = 128,
+  size_t target_list_size = 32,
   uint64_t seed = 0x7175657279
 );
 

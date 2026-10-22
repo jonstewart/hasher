@@ -33,6 +33,7 @@ std::vector<SFHASH_TlshMatch> tlsh_knn_cells(
   }
 
   const TlshHeaderOrder order(q, include_length);
+  const TlshBodyQuery qb(q);
 
   std::priority_queue<Hit> best;
   uint32_t tau = max_distance; // inclusive bound on useful distances
@@ -62,7 +63,7 @@ std::vector<SFHASH_TlshMatch> tlsh_knn_cells(
         if (hd > tau) {
           continue;
         }
-        const uint32_t d = hd + tlsh_body_diff(q, r);
+        const uint32_t d = hd + qb.body(r);
         if (d > tau) {
           continue;
         }

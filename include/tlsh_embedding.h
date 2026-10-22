@@ -67,7 +67,7 @@ float tlsh_embed_body_dist2_to_point(const TlshDigest& d, const float* p);
 
 /*
  * Squared Euclidean distance between the body embeddings of two digests.
- * Per bucket 1, 1, 1 (adjacent codes), 2, 2 (two apart), 4 ((0, 3)):
+ * Per bucket 1, 1, 1 (adjacent codes), 2, 2 (two apart), 5 ((0, 3)):
  * popcount(X ^ Y) + popcount(Y) + 4 popcount(X & Y & S), an integer.
  */
 inline uint32_t tlsh_embed_body_dist2(const TlshDigest& a, const TlshDigest& b) {

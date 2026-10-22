@@ -38,13 +38,22 @@ std::vector<SFHASH_TlshMatch> tlsh_knn_brute(
 
   uint32_t bound = max_distance;
 
+  // per-query header cost tables and body planes
+  uint32_t l_cost[256], q_cost[256];
+  for (uint32_t v = 0; v < 256; ++v) {
+    l_cost[v] = include_length ? tlsh_l_cost(tlsh_mod_diff(v, q.L, 256)) : 0;
+    q_cost[v] = tlsh_q_cost(tlsh_mod_diff(v >> 4, q.q1(), 16)) +
+                tlsh_q_cost(tlsh_mod_diff(v & 0x0F, q.q2(), 16));
+  }
+  const TlshBodyQuery qb(q);
+
   for (const TlshDigest* d = beg; d != end; ++d) {
-    const uint32_t hdist = tlsh_header_diff(q, *d, include_length);
+    const uint32_t hdist = l_cost[d->L] + q_cost[d->Q] + (d->checksum != q.checksum);
     if (hdist > bound) {
       continue;
     }
 
-    const uint32_t dist = hdist + tlsh_body_diff(q, *d);
+    const uint32_t dist = hdist + qb.body(*d);
     if (dist > bound) {
       continue;
     }

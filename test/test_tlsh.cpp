@@ -344,6 +344,31 @@ TEST_CASE("tlsh_hasher_clone_and_reset") {
   CHECK(h.digest() == c->digest());
 }
 
+TEST_CASE("tlsh_body_query_matches_scalar_kernels") {
+  std::mt19937 rng(2024);
+  std::vector<TlshDigest> ds;
+  for (int i = 0; i < 64; ++i) {
+    uint8_t codes[128];
+    for (auto& c: codes) {
+      c = rng() % 4;
+    }
+    ds.push_back(make_tlsh_digest(rng() % 256, rng() % 16, rng() % 16, rng() % 256, codes));
+  }
+  for (const auto& q: ds) {
+    const TlshBodyQuery qb(q);
+    for (const auto& r: ds) {
+      CHECK(qb.body(r) == tlsh_body_diff(q, r));
+      // embedding body distance: 1, 1, 1, 2, 2, 4 per bucket
+      uint32_t exp = 0;
+      for (size_t i = 0; i < 128; ++i) {
+        const int ad = std::abs(q.bucket(i) - r.bucket(i));
+        exp += ad == 3 ? 5 : ad;
+      }
+      CHECK(qb.emb_body(r) == exp);
+    }
+  }
+}
+
 TEST_CASE("tlsh_canonical_order_is_bytewise") {
   // L, then Q1, then Q2 dominate the bytewise order
   uint8_t codes[128] = {};

@@ -123,3 +123,71 @@ inline uint32_t tlsh_header_diff(const TlshDigest& a, const TlshDigest& b, bool 
 inline uint32_t tlsh_diff(const TlshDigest& a, const TlshDigest& b, bool include_length = true) {
   return tlsh_header_diff(a, b, include_length) + tlsh_body_diff(a, b);
 }
+
+/*
+ * Query-side precomputation for scanning many rows against one digest: the
+ * query planes and S = ~(lo ^ hi) are held in registers, and on arm64 the
+ * three popcounts are done with NEON byte counts and a single horizontal
+ * reduction. body(r) == tlsh_body_diff(q, r) and emb_body(r) ==
+ * tlsh_embed_body_dist2(q, r) for every r.
+ */
+#if defined(__ARM_NEON) || defined(__ARM_NEON__)
+#define TLSH_HAVE_NEON 1
+#endif
+
+#ifdef TLSH_HAVE_NEON
+#include <arm_neon.h>
+#endif
+
+struct TlshBodyQuery {
+#ifdef TLSH_HAVE_NEON
+  uint8x16_t lo, hi, s;
+
+  explicit TlshBodyQuery(const TlshDigest& q):
+    lo(vld1q_u8(q.lo)), hi(vld1q_u8(q.hi)), s(vmvnq_u8(veorq_u8(lo, hi))) {}
+
+  // popcount(X ^ Y) + popcount(Y) + w * popcount(X & Y & S)
+  template <int W>
+  uint32_t weighted(const TlshDigest& r) const {
+    const uint8x16_t x = veorq_u8(lo, vld1q_u8(r.lo));
+    const uint8x16_t y = veorq_u8(hi, vld1q_u8(r.hi));
+    const uint8x16_t b = vandq_u8(vandq_u8(x, y), s);
+    uint8x16_t c = vaddq_u8(vcntq_u8(veorq_u8(x, y)), vcntq_u8(y));
+    const uint8x16_t cb = vcntq_u8(b);
+    if constexpr (W == 5) {
+      c = vaddq_u8(c, vaddq_u8(cb, vshlq_n_u8(cb, 2)));
+    }
+    else {
+      c = vaddq_u8(c, vshlq_n_u8(cb, 2));
+    }
+    return vaddlvq_u8(c);
+  }
+#else
+  uint64_t lo[2], hi[2], s[2];
+
+  explicit TlshBodyQuery(const TlshDigest& q) {
+    for (size_t i = 0; i < 2; ++i) {
+      lo[i] = load_u64(q.lo + 8 * i);
+      hi[i] = load_u64(q.hi + 8 * i);
+      s[i] = ~(lo[i] ^ hi[i]);
+    }
+  }
+
+  template <int W>
+  uint32_t weighted(const TlshDigest& r) const {
+    uint32_t d = 0;
+    for (size_t i = 0; i < 2; ++i) {
+      const uint64_t x = lo[i] ^ load_u64(r.lo + 8 * i);
+      const uint64_t y = hi[i] ^ load_u64(r.hi + 8 * i);
+      d += std::popcount(x ^ y) + std::popcount(y) + W * std::popcount(x & y & s[i]);
+    }
+    return d;
+  }
+#endif
+
+  // TLSH body distance
+  uint32_t body(const TlshDigest& r) const { return weighted<5>(r); }
+
+  // squared body-embedding distance
+  uint32_t emb_body(const TlshDigest& r) const { return weighted<4>(r); }
+};

@@ -341,13 +341,51 @@ std::vector<SFHASH_TlshMatch> tlsh_knn_ivf(
   }
 
   const TlshHeaderOrder order(q, include_length);
+  const TlshBodyQuery qb(q);
 
   std::priority_queue<Hit> best;
   uint32_t tau = max_distance; // inclusive bound on useful distances
 
   std::vector<std::pair<float, uint32_t>> lists; // (body bound, list)
 
-  auto scan = [&](uint64_t lb, uint64_t le, uint32_t ch) {
+  auto consider = [&](uint32_t d, uint32_t id) {
+    const Hit h{ d, id };
+    if (best.size() < k) {
+      best.push(h);
+    }
+    else if (h < best.top()) {
+      best.pop();
+      best.push(h);
+    }
+    else {
+      return;
+    }
+    if (best.size() == k) {
+      tau = best.top().distance;
+    }
+  };
+
+  // rows [first, first + count) of the hash set, contiguous
+  auto scan_rows = [&](uint32_t first, uint64_t count, uint32_t ch) {
+    if (stats) {
+      stats->rows += count;
+    }
+    const TlshDigest* r = rows + first;
+    const TlshDigest* re = r + count;
+    for (; r != re; ++r) {
+      const uint32_t hd = ch + (r->checksum != q.checksum);
+      if (hd > tau) {
+        continue;
+      }
+      const uint32_t d = hd + qb.body(*r);
+      if (d <= tau) {
+        consider(d, static_cast<uint32_t>(r - rows));
+      }
+    }
+  };
+
+  // the rows of list entries [lb, le)
+  auto scan_list = [&](uint64_t lb, uint64_t le, uint32_t ch) {
     if (stats) {
       stats->rows += le - lb;
     }
@@ -358,23 +396,9 @@ std::vector<SFHASH_TlshMatch> tlsh_knn_ivf(
       if (hd > tau) {
         continue;
       }
-      const uint32_t d = hd + tlsh_body_diff(q, r);
-      if (d > tau) {
-        continue;
-      }
-      const Hit h{ d, id };
-      if (best.size() < k) {
-        best.push(h);
-      }
-      else if (h < best.top()) {
-        best.pop();
-        best.push(h);
-      }
-      else {
-        continue;
-      }
-      if (best.size() == k) {
-        tau = best.top().distance;
+      const uint32_t d = hd + qb.body(r);
+      if (d <= tau) {
+        consider(d, id);
       }
     }
   };
@@ -398,8 +422,21 @@ std::vector<SFHASH_TlshMatch> tlsh_knn_ivf(
         ++stats->cells;
       }
 
-      if (el - fl == 1 && ivf.list_start[el] - ivf.list_start[fl] < MIN_BOUNDED_LIST) {
-        scan(ivf.list_start[fl], ivf.list_start[el], ch);
+      if (el - fl == 1) {
+        // a single list holds the whole cell: its ids are the cell's
+        // contiguous row range in ascending order
+        const uint64_t lb = ivf.list_start[fl], le = ivf.list_start[el];
+        const uint64_t count = le - lb;
+        if (count < MIN_BOUNDED_LIST ||
+            ch + list_bound(qb.emb_body(ivf.medoids[fl]), ivf.radius2[fl]) <= static_cast<float>(tau)) {
+          if (stats && count >= MIN_BOUNDED_LIST) {
+            ++stats->lists;
+          }
+          scan_rows(ivf.ids[lb], count, ch);
+        }
+        else if (stats) {
+          ++stats->lists;
+        }
         continue;
       }
 
@@ -409,17 +446,19 @@ std::vector<SFHASH_TlshMatch> tlsh_knn_ivf(
         stats->lists += el - fl;
       }
       for (uint32_t l = fl; l < el; ++l) {
-        const float b2 = list_bound(tlsh_embed_body_dist2(q, ivf.medoids[l]), ivf.radius2[l]);
+        const float b2 = list_bound(qb.emb_body(ivf.medoids[l]), ivf.radius2[l]);
         if (ch + b2 <= static_cast<float>(tau)) {
           lists.emplace_back(b2, l);
         }
       }
-      std::sort(lists.begin(), lists.end());
+      if (lists.size() > 1) {
+        std::sort(lists.begin(), lists.end());
+      }
       for (const auto& [b2, l]: lists) {
         if (ch + b2 > static_cast<float>(tau)) {
           break;
         }
-        scan(ivf.list_start[l], ivf.list_start[l + 1], ch);
+        scan_list(ivf.list_start[l], ivf.list_start[l + 1], ch);
       }
     }
   }

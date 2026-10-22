@@ -44,7 +44,7 @@ namespace {
 
 constexpr size_t K = 10;
 constexpr uint32_t MAX_DISTANCE = 144;
-constexpr size_t IVF_LIST_SIZE = 128;
+const size_t IVF_LIST_SIZE = std::getenv("TLSH_BENCH_LIST") ? std::stoull(std::getenv("TLSH_BENCH_LIST")) : 32;
 constexpr size_t NUM_QUERIES = 20;
 constexpr uint64_t CORPUS_SEED = 0x7a5b;
 constexpr uint64_t QUERY_SEED = 0x51e;
@@ -274,6 +274,15 @@ TEST_CASE("tlsh_knn") {
 
     BENCHMARK("knn_ivf_embedding" + tag) {
       return run_all(run_ivf, NUM_QUERIES);
+    };
+
+    // per-query fixed cost: a radius-0 search visits one cell
+    BENCHMARK("knn_ivf_fixed_overhead" + tag) {
+      size_t s = 0;
+      for (size_t qi = 0; qi < NUM_QUERIES; ++qi) {
+        s += tlsh_knn_ivf(view, beg, queries[qi], K, 0, true).size();
+      }
+      return s;
     };
 
     {
