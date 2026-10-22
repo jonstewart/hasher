@@ -305,6 +305,117 @@ query is dominated by scanning a few thousand rows at ~0.5 ns each plus a few
 hundred list bounds; the remaining lever is tighter lists at the cost of
 build time and index size.
 
+### Incremental merge
+
+`test/bench_hset_merge` (Catch2; `MERGE_BENCH_N`, `MERGE_BENCH_T`,
+`MERGE_BENCH_C`) measures the "Incremental merge" scheme of section 3
+against a from-scratch rebuild, and `rust/tlsh-bench` (`cargo bench --
+hset_incremental_merge`) the default configuration through the C API. The
+scenario is VirusShare's rate of ~5 samples/s: a master of N rows absorbs
+either 24 hourly batches of 18,000 rows or 7 daily batches of 432,000 rows
+by successive unions (`sfhash_hashset_merge`, index carried through and
+coalesced). Each batch is half new families from the corpus generator and
+half digest-space perturbations of master rows (near-duplicates). Files are
+hashsets-only with the index and no vectors: the TVEC matrix is 1 KiB per
+row of plain I/O that kNN never reads and would hide the index cost both in
+the merge (a copy) and in the build (an embedding pass). The master and the
+batches are built with the target list size T under test; C is the
+coalescing threshold. "Rebuild" is one from-scratch build of the final rows
+through the builder (sort, dedup, parallel k-means, file write); the merge is
+single-threaded. Queries: k = 10, max_distance = 144, 50 fixed queries, time
+per query and rows scanned per query on the merged and on the rebuilt index.
+The lists bound of section 3 (merged ≤ rebuilt + nonempty cells) held in
+every configuration with C ≥ 2T, as proven, and in all but one of the C = T
+runs, where it is not implied (N = 100,000, T = 16); TIVF sizes are the
+payloads.
+
+Apple M5 Pro (15 cores, 48 GiB), N = 1,000,000, 8.5 minutes for the whole
+sweep. Hourly: 24 × 18,000 rows, final set 1,431,931 rows, 9,704 nonempty
+cells.
+
+| T  | C   | 24 merges | rebuild | TIVF merged | TIVF rebuilt | lists merged | lists rebuilt | kNN merged | kNN rebuilt | rows/q merged | rows/q rebuilt |
+|----|-----|-----------|---------|-------------|--------------|--------------|---------------|------------|-------------|---------------|----------------|
+| 16 | 0   | 1144 ms   | 5288 ms | 14.0 MiB    | 10.0 MiB     | 181,740      | 94,484        | 55.4 us    | 44.7 us     | 13,269        | 10,668         |
+| 16 | 16  | 1091 ms   | 5317 ms | 9.8 MiB     | 10.0 MiB     | 88,760       | 94,484        | 41.5 us    | 42.3 us     | 14,666        | 10,668         |
+| 16 | 32  | 1115 ms   | 5336 ms | 8.5 MiB     | 10.0 MiB     | 61,065       | 94,484        | 32.0 us    | 41.8 us     | 15,250        | 10,668         |
+| 16 | 64  | 1155 ms   | 5352 ms | 7.7 MiB     | 10.0 MiB     | 43,366       | 94,484        | 29.6 us    | 41.6 us     | 16,397        | 10,668         |
+| 32 | 0   | 1114 ms   | 3303 ms | 12.4 MiB    | 8.0 MiB      | 146,237      | 50,378        | 43.5 us    | 28.2 us     | 15,148        | 12,586         |
+| 32 | 32  | 1070 ms   | 3319 ms | 8.2 MiB     | 8.0 MiB      | 54,526       | 50,378        | 30.9 us    | 26.4 us     | 15,953        | 12,586         |
+| **32** | **64** | **1048 ms** | **3318 ms** | **7.6 MiB** | **8.0 MiB** | **40,197** | **50,378** | **29.2 us** | **26.7 us** | **16,916** | **12,586** |
+| 32 | 128 | 1047 ms   | 3313 ms | 6.9 MiB     | 8.0 MiB      | 25,196       | 50,378        | 34.0 us    | 26.5 us     | 23,290        | 12,586         |
+| 64 | 0   | 1102 ms   | 1469 ms | 11.7 MiB    | 7.0 MiB      | 130,035      | 28,642        | 41.6 us    | 24.6 us     | 19,282        | 15,831         |
+| 64 | 64  | 1034 ms   | 1466 ms | 7.3 MiB     | 7.0 MiB      | 34,041       | 28,642        | 31.3 us    | 24.6 us     | 20,102        | 15,831         |
+| 64 | 128 | 1032 ms   | 1894 ms | 6.8 MiB     | 7.0 MiB      | 24,039       | 28,642        | 34.2 us    | 24.6 us     | 23,867        | 15,831         |
+| 64 | 256 | 1008 ms   | 1465 ms | 6.5 MiB     | 7.0 MiB      | 16,569       | 28,642        | 35.1 us    | 24.4 us     | 26,889        | 15,831         |
+
+Daily: 7 × 432,000 rows, final set 4,023,698 rows, 10,384 nonempty cells.
+
+| T  | C   | 7 merges | rebuild  | TIVF merged | TIVF rebuilt | lists merged | lists rebuilt | kNN merged | kNN rebuilt | rows/q merged | rows/q rebuilt |
+|----|-----|----------|----------|-------------|--------------|--------------|---------------|------------|-------------|---------------|----------------|
+| 16 | 0   | 815 ms   | 48.5 s   | 29.0 MiB    | 27.3 MiB     | 291,890      | 256,456       | 155.9 us   | 89.1 us     | 38,110        | 18,909         |
+| 16 | 16  | 857 ms   | 48.1 s   | 26.2 MiB    | 27.3 MiB     | 231,366      | 256,456       | 147.5 us   | 89.9 us     | 40,605        | 18,909         |
+| 16 | 32  | 890 ms   | 47.8 s   | 23.3 MiB    | 27.3 MiB     | 168,000      | 256,456       | 137.4 us   | 90.7 us     | 48,008        | 18,909         |
+| 16 | 64  | 1039 ms  | 49.2 s   | 20.4 MiB    | 27.3 MiB     | 104,566      | 256,456       | 125.1 us   | 101.6 us    | 55,564        | 18,909         |
+| 32 | 0   | 761 ms   | 24.8 s   | 23.4 MiB    | 21.6 MiB     | 170,885      | 131,172       | 129.3 us   | 88.5 us     | 50,001        | 30,776         |
+| 32 | 32  | 767 ms   | 24.6 s   | 21.5 MiB    | 21.6 MiB     | 129,883      | 131,172       | 124.9 us   | 90.6 us     | 52,534        | 30,776         |
+| **32** | **64** | **788 ms** | **24.5 s** | **19.9 MiB** | **21.6 MiB** | **94,042** | **131,172** | **120.6 us** | **89.9 us** | **56,972** | **30,776** |
+| 32 | 128 | 825 ms   | 24.6 s   | 18.1 MiB    | 21.6 MiB     | 54,986       | 131,172       | 115.4 us   | 88.5 us     | 65,525        | 30,776         |
+| 64 | 0   | 721 ms   | 8.4 s    | 20.8 MiB    | 18.7 MiB     | 113,079      | 68,783        | 118.8 us   | 84.8 us     | 59,867        | 40,541         |
+| 64 | 64  | 713 ms   | 8.6 s    | 19.0 MiB    | 18.7 MiB     | 75,202       | 68,783        | 115.8 us   | 84.4 us     | 61,509        | 40,541         |
+| 64 | 128 | 719 ms   | 8.4 s    | 17.9 MiB    | 18.7 MiB     | 50,922       | 68,783        | 113.9 us   | 82.8 us     | 66,638        | 40,541         |
+| 64 | 256 | 739 ms   | 8.5 s    | 17.0 MiB    | 18.7 MiB     | 31,310       | 68,783        | 109.5 us   | 83.5 us     | 70,282        | 40,541         |
+
+What the sweep shows:
+
+- One incremental union costs about 45 ms at 1.0-1.4M rows (hourly) and
+  100-150 ms at 1.4-4M rows (daily), essentially the cost of copying the
+  rows and hashing the file; 24 hourly merges together are 3x cheaper than
+  one rebuild of the final set at T = 32 (1.05 s against 3.3 s), and the
+  7 daily merges 30x cheaper (0.8 s against 24.5 s; k-means over 4M rows is
+  the rebuild's cost, superlinear in the size of the large cells).
+- Without coalescing (C = 0) lists pile up: 3x the lists of a rebuild
+  after 24 hourly merges, 1.5x the TIVF bytes, and queries 1.5-1.7x slower
+  than on the rebuilt index. Any C > 0 brings the list count and the TIVF
+  size below the rebuild's (the invariant packs cells more tightly than
+  k-means' `ceil(m / T)`), and the bound of section 3 held throughout.
+- Query time on the merged index is minimized at C = 2T for T = 16 and
+  T = 32 and at C = T for T = 64; the raw minimum over the hourly sweep is
+  T = 32, C = 64 (29.2 us, within 9% of the rebuilt index's 26.7 us), with
+  T = 16, C = 64 a statistical tie (29.6 us) at a 60% higher rebuild cost
+  and 20% more TIVF. Larger C trades list bounds for scanned rows: at
+  C = 4T the merged index scans 40-70% more rows than at 2T and queries
+  are 15-20% slower, since coalescing by smallest union radius still joins
+  clusters k-means would have kept apart.
+- The daily scenario is the hard case for the merge: each batch is 43% of
+  the master, so most lists of the final index come from the batches' own
+  fresh builds and their coalesced pairs; the merged index scans 1.9x the
+  rows of a rebuild and answers in 1.3x the time (120 us against 90 us at
+  the default), still two orders of magnitude under brute force over 4M
+  rows (~2.2 ms). Query time improves slightly with larger C here because
+  halving the lists saves more bound evaluations than the extra rows cost,
+  but at the price of scanned rows that keep growing; it does not change
+  the choice.
+
+At N = 100,000 (same sweep, 4.8 minutes) the hourly final set is 532k rows
+of which 80% came in through the batches, so it behaves like the daily case
+above: at T = 32 the merged index answers in 21.1 / 19.1 / 17.9 us for
+C = T / 2T / 4T against 17.5 us rebuilt (39.9 us without coalescing), with
+13.7-13.9k rows scanned against 11.1k; 24 merges take 0.3 s against a
+0.5 s rebuild. The daily scenario at this N is a 3.1M-row set built almost
+entirely from 432k-row batches: 56.5 us merged against 38.1 us rebuilt at
+the default, 0.5 s of merges against a 15.4 s rebuild.
+
+Defaults: T = `TLSH_IVF_TARGET_LIST_SIZE` = 32 confirmed, and C =
+`TLSH_IVF_DEFAULT_COALESCE` = 2T = 64, the configuration that minimizes the
+query time on the merged index while the merge stays 3-30x cheaper than a
+rebuild and the storage bound holds (the merged TIVF is in fact smaller
+than the rebuilt one). A master that takes daily batches of this size for
+weeks will drift further from a fresh clustering than this table shows;
+when the rows scanned per query matter, a rebuild (any merge with
+`SFHASH_HSET_TLSH_INDEX` against an input without an index, or
+`build_tlsh_ivf`) restores the fresh profile and the incremental merges
+resume from it.
+
 ## 6. Using the vectors from Python
 
 `hasher.hsvectors` (`python/hasher/hsvectors.py`) walks the chunks of an hset

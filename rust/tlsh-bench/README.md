@@ -63,6 +63,9 @@ its place; `otool -L` / `ldd` on the bench binary should not list libhasher.
 | `hset_knn`       | `hset_knn_brute`   | `sfhash_hashset_tlsh_knn_with(..., SFHASH_TLSH_KNN_BRUTE)`: libhasher's popcount kernel over every row of the file |
 | `hset_knn`       | `hset_knn_index`   | `sfhash_hashset_tlsh_knn_with(..., SFHASH_TLSH_KNN_INDEX)`: the TIVF inverted-file index over the lower-bound embedding (`docs/TLSH_EMBEDDING.md`) |
 | `hset_knn`       | `hset_knn_default` | `sfhash_hashset_tlsh_knn`, which picks the index when the file has one   |
+| `hset_incremental_merge` | `incremental_union` | `sfhash_hashset_merge(UNION)` of an 18,000-row batch into a 1,000,000-row master hset: rows merged, the TIVF index carried through and its small lists coalesced (`docs/TLSH_EMBEDDING.md` section 3); the output file is written each iteration |
+| `hset_incremental_merge` | `rebuild_union`     | the alternative: one from-scratch build of the same 1,018,000 rows through the builder API (sort, dedup, k-means index, file write) |
+| `hset_incremental_merge` | `knn_merged`, `knn_rebuilt` | `sfhash_hashset_tlsh_knn_with(..., INDEX)` over the merged and over the rebuilt file, 20 queries as in `hset_knn` |
 
 `hset_knn` runs for N in {10 000, 100 000, 1 000 000} rows by default. Each
 N builds a TLSH-only hset once (through the builder API, with the TIVF index
@@ -77,6 +80,17 @@ the group finishes.
 Throughput is `rows x queries` per iteration, so Criterion's `elem/s` is rows
 scanned per second for the brute-force cases and the equivalent rate for the
 index, which touches only a fraction of the rows.
+
+`hset_incremental_merge` builds the master (1,000,000 rows, index only) and
+one batch (18,000 rows: 9,000 new families plus 9,000 digest-space
+perturbations of master rows) once, then times one incremental union
+against one from-scratch build of the union's rows, and finally the kNN
+query time over each result (the harness first asserts that the two files
+have the same row count and answer the 20 queries identically). The files
+carry the TIVF index and no TVEC vectors: kNN never reads the vectors and
+their 1 KiB per row would dominate both the merge (a copy) and the build (an
+embedding pass). `TLSH_BENCH_COALESCE` overrides the coalescing threshold
+(`SFHASH_HSET_COALESCE_DEFAULT` otherwise; 0 disables coalescing).
 
 All kNN groups return matches nearest first, ties by ascending row index,
 exactly as the C API does, so the naive baseline and the hash set calls are
@@ -119,6 +133,26 @@ Criterion's own figures for the same run (per iteration of 20 queries) were
 for the index. Building the 1M-row hset (sort, dedup, TIVF index) took 1.45 s
 and the file was 40.6 MiB; generating the corpus took 1.4 s.
 
+### Incremental merge
+
+Apple M5 Pro, `cargo bench -- hset_incremental_merge` (default coalescing
+threshold, `SFHASH_HSET_COALESCE_DEFAULT` = 64), master 999,975 rows
+(40.6 MiB with the index, no vectors), batch 18,000 rows, union 1,017,974
+rows:
+
+| benchmark           | per iteration     | note                                                        |
+|---------------------|-------------------|-------------------------------------------------------------|
+| `incremental_union` | 41.5 ms           | `sfhash_hashset_merge`, output 40.9 MiB written each time   |
+| `rebuild_union`     | 1.449 s           | builder over the 1,017,974 rows, output 41.3 MiB            |
+| `knn_merged`        | 397 us (19.8 us/query) | index carried through the merge, coalesced             |
+| `knn_rebuilt`       | 381 us (19.0 us/query) | fresh k-means index                                    |
+
+The incremental union is 35x cheaper than the rebuild and its index answers
+within 4% of the rebuilt one's time; the merged file is slightly smaller
+(fewer, fuller lists). The C++ sweep over T and C, hourly and daily batch
+sizes and 24 or 7 successive merges is in `docs/TLSH_EMBEDDING.md`
+section 5 ("Incremental merge").
+
 The naive baseline is roughly a few nanoseconds per row (an FFI call per
 pair), the kernel brute force a fraction of a nanosecond per row, and the
 index is close to flat in N. For the C++ view of the same comparison,
@@ -142,4 +176,8 @@ the same answer as a pure-Rust brute force over `sfhash_tlsh_diff` for 20
 queries x k in {1, 10} x max_distance in {30, 144, 1000} x both
 `include_length` settings, and that the TVEC matrix has `n x 264` floats
 whose rows equal `sfhash_tlsh_embed` of the corresponding hash. A second
-hset is built with neither optional section to check the fallbacks.
+hset is built with neither optional section to check the fallbacks. A merge
+test unions two built hsets through `sfhash_hashset_merge` with the default,
+a disabled and an explicit coalescing threshold and checks the rows against
+the deduplicated union and the carried index against a Rust brute force,
+then the difference and the intersection.
