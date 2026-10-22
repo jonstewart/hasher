@@ -33,7 +33,8 @@ const std::map<std::string, SFHASH_HashAlgorithm> NAMES_TO_TYPES{
   { "fuzzy",     SFHASH_FUZZY },
   { "entropy",   SFHASH_ENTROPY },
   { "size",      SFHASH_SIZE },
-  { "quick md5", SFHASH_QUICK_MD5 }
+  { "quick md5", SFHASH_QUICK_MD5 },
+  { "tlsh",      SFHASH_TLSH }
 };
 
 SFHASH_HashAlgorithm hash_type(const char* name) {

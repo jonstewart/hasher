@@ -1,12 +1,13 @@
 ACLOCAL_AMFLAGS = -I m4
 
-AM_CPPFLAGS = -I$(srcdir)/include -I$(srcdir)/vendors/parallel-hashmap -I$(srcdir)/vendors/xor_singleheader/include $(PROJECT_CPPFLAGS)
+AM_CPPFLAGS = -I$(srcdir)/include -I$(srcdir)/vendors/parallel-hashmap -I$(srcdir)/vendors/xor_singleheader/include -I$(srcdir)/vendors/tlsh/include -I$(srcdir)/vendors/tlsh_support $(PROJECT_CPPFLAGS)
 AM_CXXFLAGS = $(PROJECT_CXXFLAGS)
 AM_LDFLAGS = $(PROJECT_LDFLAGS)
 
 HASHER_LIB = src/lib/libhasher.la
 HASHER_LIB_INT = src/lib/libhasherint.la
 BLAKE3_LIB_INT = vendors/BLAKE3/c/libblake3int.la
+TLSH_LIB_INT = vendors/tlsh/libtlshint.la
 
 lib_LTLIBRARIES = $(HASHER_LIB)
 
@@ -17,7 +18,7 @@ src_lib_libhasher_la_SOURCES =
 #endif
 nodist_EXTRA_src_lib_libhasher_la_SOURCES = dummy.cpp # forces C++ linking
 
-noinst_LTLIBRARIES = $(HASHER_LIB_INT) $(BLAKE3_LIB_INT)
+noinst_LTLIBRARIES = $(HASHER_LIB_INT) $(BLAKE3_LIB_INT) $(TLSH_LIB_INT)
 
 src_lib_libhasherint_la_SOURCES = \
 	src/lib/error.cpp \
@@ -26,6 +27,7 @@ src_lib_libhasherint_la_SOURCES = \
 	src/lib/hashsetinfo.cpp \
 	src/lib/parser.cpp \
 	src/lib/rwutil.cpp \
+	src/lib/tlsh.cpp \
 	src/lib/util.cpp \
 	src/lib/hasher/entropy.cpp \
 	src/lib/hasher/fuzzy_hasher.cpp \
@@ -33,6 +35,7 @@ src_lib_libhasherint_la_SOURCES = \
 	src/lib/hasher/libblake3_hasher.cpp \
 	src/lib/hasher/libcrypto_hasher.cpp \
 	src/lib/hasher/quick_hasher.cpp \
+	src/lib/hasher/tlsh_hasher.cpp \
 	src/lib/hashset/hset.cpp \
 	src/lib/hashset/hset_decoder.cpp \
 	src/lib/hashset/hset_decoder_chunks.cpp \
@@ -46,7 +49,7 @@ src_lib_libhasherint_la_SOURCES = \
 	src/lib/hex/hex_avx2.cpp \
 	src/lib/hex/hex_sse41.cpp
 
-src_lib_libhasher_la_LIBADD = $(HASHER_LIB_INT) $(BLAKE3_LIB_INT) $(PROJECT_LIBS)
+src_lib_libhasher_la_LIBADD = $(HASHER_LIB_INT) $(BLAKE3_LIB_INT) $(TLSH_LIB_INT) $(PROJECT_LIBS)
 if BUILD_DLL
 src_lib_libhasher_la_LDFLAGS = $(AM_LDFLAGS) $(HASHER_LIB_LDFLAGS) -avoid-version
 else
@@ -61,7 +64,8 @@ src_lib_libhasher_la_HEADERS = \
 	include/hasher/fuzzy.h \
 	include/hasher/hasher.h \
 	include/hasher/hashset.h \
-	include/hasher/hex.h
+	include/hasher/hex.h \
+	include/hasher/tlsh.h
 
 vendors_BLAKE3_c_libblake3int_la_CPPFLAGS = $(AM_CPPFLAGS)
 
@@ -96,6 +100,15 @@ endif
 if HOST_NO_SIMD
 vendors_BLAKE3_c_libblake3int_la_CPPFLAGS += -DBLAKE3_NO_SSE2 -DBLAKE3_NO_SSE41 -DBLAKE3_NO_AVX2 -DBLAKE3_NO_AVX512
 endif
+
+# TLSH reference implementation (Trend Micro, Apache-2.0 OR BSD-3-Clause)
+vendors_tlsh_libtlshint_la_CPPFLAGS = -I$(srcdir)/vendors/tlsh/include -I$(srcdir)/vendors/tlsh_support -DBUCKETS_128 -DCHECKSUM_1B
+vendors_tlsh_libtlshint_la_CXXFLAGS = $(AM_CXXFLAGS) -w
+
+vendors_tlsh_libtlshint_la_SOURCES = \
+	vendors/tlsh/src/tlsh.cpp \
+	vendors/tlsh/src/tlsh_impl.cpp \
+	vendors/tlsh/src/tlsh_util.cpp
 
 src_fuzzy_fuzzy_SOURCES = \
 	src/fuzzy/fuzzy_main.cpp
@@ -138,6 +151,7 @@ test_test_SOURCES = \
 	test/test_hset_round_trip.cpp \
 	test/test_record_iterator.cpp \
 	test/test_parser.cpp \
+	test/test_tlsh.cpp \
 	test/test_util.cpp
 
 test_test_CPPFLAGS = $(AM_CPPFLAGS) $(CATCH2_CFLAGS)

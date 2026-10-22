@@ -28,7 +28,8 @@ typedef enum {
   SFHASH_FUZZY     = 1 << 11, // ssdeep fuzzy hash
   SFHASH_ENTROPY   = 1 << 12, // Shannon entropy
   SFHASH_SIZE      = 1 << 13, // file size
-  SFHASH_QUICK_MD5 = 1 << 14  // TOOD: Can we kill this?
+  SFHASH_QUICK_MD5 = 1 << 14, // TOOD: Can we kill this?
+  SFHASH_TLSH      = 1 << 15  // TLSH, 36-byte canonical form (see hasher/tlsh.h)
 } SFHASH_HashAlgorithm;
 
 // Returns a name string corresponding to the given hash type

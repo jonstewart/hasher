@@ -8,3 +8,6 @@
 [submodule "vendors/xor_singleheader"]
 	path = vendors/xor_singleheader
 	url = https://github.com/FastFilter/xor_singleheader.git
+[submodule "vendors/tlsh"]
+	path = vendors/tlsh
+	url = https://github.com/trendmicro/tlsh.git

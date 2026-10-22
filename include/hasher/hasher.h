@@ -27,6 +27,7 @@ struct SFHASH_HashValues {
   uint8_t Blake3[32];
   uint8_t Fuzzy[148];
   uint8_t QuickMd5[16];
+  uint8_t Tlsh[36];
   double Entropy;
 };
 

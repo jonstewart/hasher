@@ -26,6 +26,7 @@ constexpr const char* hash_name(uint64_t type) {
   case SFHASH_ENTROPY:   return "Entropy";
   case SFHASH_SIZE:      return "Size";
   case SFHASH_QUICK_MD5: return "Quick MD5";
+  case SFHASH_TLSH:      return "TLSH";
   default:               return nullptr;
   }
 }
@@ -49,6 +50,7 @@ constexpr uint64_t hash_length(SFHASH_HashAlgorithm type) {
   case SFHASH_ENTROPY:   return sizeof(SFHASH_HashValues::Entropy);
   case SFHASH_SIZE:      return sizeof(uint64_t);
   case SFHASH_QUICK_MD5: return sizeof(SFHASH_HashValues::QuickMd5);
+  case SFHASH_TLSH:      return sizeof(SFHASH_HashValues::Tlsh);
   default:               return 0;
   }
 }
@@ -68,6 +70,7 @@ constexpr size_t hash_member_offset(SFHASH_HashAlgorithm type) {
   case SFHASH_FUZZY:     return offsetof(SFHASH_HashValues, Fuzzy);
   case SFHASH_ENTROPY:   return offsetof(SFHASH_HashValues, Entropy);
   case SFHASH_QUICK_MD5: return offsetof(SFHASH_HashValues, QuickMd5);
+  case SFHASH_TLSH:      return offsetof(SFHASH_HashValues, Tlsh);
   default:               return std::numeric_limits<size_t>::max();
   }
 }

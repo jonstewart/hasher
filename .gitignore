@@ -46,3 +46,4 @@
 /test/*.log
 /test/*.trs
 /test/*.hset
+.DS_Store

@@ -9,6 +9,7 @@
 #include "libblake3_hasher.h"
 #include "libcrypto_hasher.h"
 #include "quick_hasher.h"
+#include "tlsh_hasher.h"
 
 using HashValues = SFHASH_HashValues;
 
@@ -28,7 +29,8 @@ HasherInit{
   {make_fuzzy_hasher,       offsetof(HashValues, Fuzzy)   },
   {make_entropy_calculator, offsetof(HashValues, Entropy) },
   {nullptr, /* size */      0 },
-  {make_quick_md5_hasher,   offsetof(HashValues, QuickMd5)}
+  {make_quick_md5_hasher,   offsetof(HashValues, QuickMd5)},
+  {make_tlsh_hasher,        offsetof(HashValues, Tlsh)    }
 };
 
 // TODO: make a header for this class once hasher.h is empty
