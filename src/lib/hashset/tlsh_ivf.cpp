@@ -230,9 +230,47 @@ private:
       out.emplace_back(lo, hi);
       return;
     }
-    const size_t mid = lo + (hi - lo) / 2;
+    const size_t mid = partition(lo, hi);
     split(lo, mid, out);
     split(mid, hi, out);
+  }
+
+  // a uniform-ish draw in [0, n) straight from the engine: the standard
+  // distributions are implementation-defined, mt19937_64 is not
+  size_t draw(size_t n) { return rng_() % n; }
+
+  // the member of [lo, hi) farthest from p, ties by the smaller local index
+  uint32_t farthest(size_t lo, size_t hi, uint32_t p) const {
+    const TlshBodyQuery q(rows_[p]);
+    uint32_t best = p, best_d = 0;
+    for (size_t i = lo; i < hi; ++i) {
+      const uint32_t id = perm_[i];
+      const uint32_t d = q.emb_body(rows_[id]);
+      if (d > best_d || (d == best_d && id < best)) {
+        best = id;
+        best_d = d;
+      }
+    }
+    return best;
+  }
+
+  // moves the members of [lo, hi) nearer a than b (ties to a) to the front,
+  // stably; returns the end of a's side
+  size_t assign(size_t lo, size_t hi, uint32_t a, uint32_t b) {
+    const TlshBodyQuery qa(rows_[a]), qb(rows_[b]);
+    const auto mid = std::stable_partition(
+      perm_.begin() + lo, perm_.begin() + hi,
+      [&](uint32_t id) { return qa.emb_body(rows_[id]) <= qb.emb_body(rows_[id]); }
+    );
+    return mid - perm_.begin();
+  }
+
+  // splits node [lo, hi) in two in place; returns the boundary
+  size_t partition(size_t lo, size_t hi) {
+    const uint32_t p0 = perm_[lo + draw(hi - lo)];
+    const uint32_t a = farthest(lo, hi, p0);
+    const uint32_t b = farthest(lo, hi, a);
+    return assign(lo, hi, a, b);
   }
 
   const TlshDigest* rows_;

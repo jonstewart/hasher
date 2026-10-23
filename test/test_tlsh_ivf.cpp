@@ -244,3 +244,36 @@ TEST_CASE("tlsh_ivf_bisect_lists_are_bounded_one_centers") {
   }
   check_one_centers(ivf, rows);
 }
+
+TEST_CASE("tlsh_ivf_bisect_separates_two_clusters") {
+  // two clusters of 30 rows in one cell: random leading body bytes, and the
+  // trailing 8 bytes of both planes all 0 (codes 0) or all 1 (codes 3), so
+  // sorted order interleaves the clusters while cross-cluster distances
+  // exceed within-cluster ones by 64 buckets x 5
+  std::mt19937_64 rng(5);
+  std::vector<TlshDigest> rows;
+  for (int c = 0; c < 2; ++c) {
+    for (int i = 0; i < 30; ++i) {
+      TlshDigest d{};
+      d.L = 3;
+      d.Q = 0x45;
+      for (int b = 0; b < 8; ++b) {
+        d.hi[b] = static_cast<uint8_t>(rng());
+        d.lo[b] = static_cast<uint8_t>(rng());
+        d.hi[8 + b] = d.lo[8 + b] = c ? 0xFF : 0x00;
+      }
+      rows.push_back(d);
+    }
+  }
+  std::sort(rows.begin(), rows.end());
+
+  const auto ivf = build_bisect(rows, 32);
+  REQUIRE(ivf.lists() == 2);
+  for (size_t l = 0; l < 2; ++l) {
+    CHECK(ivf.list_start[l + 1] - ivf.list_start[l] == 30);
+    const int side = rows[ivf.ids[ivf.list_start[l]]].hi[8];
+    for (uint64_t i = ivf.list_start[l]; i < ivf.list_start[l + 1]; ++i) {
+      CHECK(int(rows[ivf.ids[i]].hi[8]) == side);
+    }
+  }
+}
