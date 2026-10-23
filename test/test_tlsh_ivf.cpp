@@ -431,3 +431,37 @@ TEST_CASE("tlsh_ivf_bisect_one_large_cell") {
     ));
   }
 }
+
+TEST_CASE("tlsh_ivf_merge_of_bisect_builds_is_exact") {
+  // two BISECT indexes over the even and odd rows of one sorted corpus,
+  // merged into an index over all of it
+  auto rows = sorted_corpus(81, 12000);
+  rows.erase(std::unique(rows.begin(), rows.end()), rows.end());
+  std::vector<TlshDigest> even, odd;
+  std::vector<uint32_t> even_map, odd_map;
+  for (size_t i = 0; i < rows.size(); ++i) {
+    (i % 2 ? odd : even).push_back(rows[i]);
+    (i % 2 ? odd_map : even_map).push_back(static_cast<uint32_t>(i));
+  }
+  const auto a = build_bisect(even, 32);
+  const auto b = build_bisect(odd, 32);
+  const auto m = merge_tlsh_ivf(
+    make_tlsh_ivf_view(a), even_map.data(), make_tlsh_ivf_view(b), odd_map.data(),
+    rows.data(), rows.size()
+  );
+  const auto view = make_tlsh_ivf_view(m);
+  CHECK(tlsh_ivf_check_invariant(view, TLSH_IVF_DEFAULT_COALESCE));
+  for (size_t l = 0; l < m.lists(); ++l) {
+    for (uint64_t i = m.list_start[l]; i < m.list_start[l + 1]; ++i) {
+      REQUIRE(tlsh_embed_body_dist2(m.medoids[l], rows[m.ids[i]]) <= m.radius2[l]);
+    }
+  }
+  for (const auto& q: perturb_tlsh_corpus(82, rows, 40, 0.04)) {
+    for (const uint32_t T: { 30u, 100u, 300u }) {
+      CHECK(same_matches(
+        tlsh_knn_ivf(view, rows.data(), q, 10, T, true),
+        tlsh_knn_brute(rows.data(), rows.data() + rows.size(), q, 10, T, true)
+      ));
+    }
+  }
+}
