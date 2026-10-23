@@ -76,6 +76,12 @@ struct TlshIvf {
  */
 enum class TlshIvfBuild : uint8_t { KMEANS, BISECT };
 
+// the build method an SFHASH_HSET_TLSH_* options word selects: KMEANS with
+// SFHASH_HSET_TLSH_INDEX_KMEANS, BISECT otherwise
+constexpr TlshIvfBuild tlsh_ivf_build_of(uint32_t tlsh_options) {
+  return (tlsh_options & SFHASH_HSET_TLSH_INDEX_KMEANS) ? TlshIvfBuild::KMEANS : TlshIvfBuild::BISECT;
+}
+
 /*
  * BISECT splits a node in two only while it has more than this many rows;
  * a node of at most this many rows is clustered flat by integer k-means

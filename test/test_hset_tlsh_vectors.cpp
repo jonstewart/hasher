@@ -87,7 +87,8 @@ HsetPtr load(const std::vector<char>& buf) {
   return hset;
 }
 
-Built build(
+Built build_text(
+  const std::string& text,
   bool with_md5,
   const std::string& outpath,
   bool with_records,
@@ -98,7 +99,7 @@ Built build(
     std::vector<SFHASH_HashAlgorithm>{ SFHASH_MD5, SFHASH_TLSH } :
     std::vector<SFHASH_HashAlgorithm>{ SFHASH_TLSH };
 
-  std::istringstream in(corpus_text(with_md5));
+  std::istringstream in(text);
 
   write_hset(
     in,
@@ -119,6 +120,16 @@ Built build(
   b.tidx = sfhash_hashset_index_for_type(b.hset.get(), SFHASH_TLSH);
   REQUIRE(b.tidx >= 0);
   return b;
+}
+
+Built build(
+  bool with_md5,
+  const std::string& outpath,
+  bool with_records,
+  bool with_hashsets,
+  uint32_t tlsh_options)
+{
+  return build_text(corpus_text(with_md5), with_md5, outpath, with_records, with_hashsets, tlsh_options);
 }
 
 size_t count_type(const TableOfContents& toc, uint32_t type) {
@@ -669,5 +680,58 @@ TEST_CASE("hset_tlsh_vectors_decode_rejects_corruption") {
     buf[entry + 3] = 0x0a;
     buf[b.toc.entries[hi].first + 3] = 0x0a;
     CHECK(fails(buf));
+  }
+}
+
+TEST_CASE("hset_tlsh_index_kmeans_option_selects_the_build_method") {
+  // 3000 rows in one header cell, where the two methods give different
+  // lists for the same rows and seed
+  auto one_cell = make_tlsh_corpus(31, 3000);
+  std::ostringstream text;
+  for (auto& d: one_cell) {
+    d.L = 0x40;
+    d.Q = 0x21;
+    text << tlsh_to_hex(d) << '\n';
+  }
+
+  for (const bool records: { true, false }) {
+    for (const bool kmeans: { false, true }) {
+      const uint32_t opts = SFHASH_HSET_TLSH_INDEX | (kmeans ? uint32_t(SFHASH_HSET_TLSH_INDEX_KMEANS) : 0u);
+      const Built b = build_text(text.str(), false, "test/tlsh_vec_method.hset", records, true, opts);
+      const SFHASH_Hashset* hset = b.hset.get();
+      const size_t tidx = b.tidx;
+      const uint64_t n = sfhash_hashset_count(hset, tidx);
+      const TlshDigest* rows = rows_of(hset, tidx);
+      REQUIRE(n > 2000);
+
+      // the TIVF payload is the serialized build_tlsh_ivf of the HDAT rows
+      // with the selected method, and not that of the other method
+      const auto bytes_of = [&](TlshIvfBuild method) {
+        const TlshIvf ivf = build_tlsh_ivf(rows, rows + n, TLSH_IVF_TARGET_LIST_SIZE, 0x7175657279, 0, method);
+        std::vector<char> buf(length_tivf_data(ivf.lists(), ivf.n));
+        REQUIRE(write_tivf_data(ivf, buf.data()) == buf.size());
+        return buf;
+      };
+      const auto selected = bytes_of(kmeans ? TlshIvfBuild::KMEANS : TlshIvfBuild::BISECT);
+      const auto other = bytes_of(kmeans ? TlshIvfBuild::BISECT : TlshIvfBuild::KMEANS);
+      REQUIRE((selected != other));
+
+      const Chunk ch = chunk_at(b.buf, b.toc, find_type(b.toc, Chunk::TIVF));
+      const std::vector<char> payload(
+        reinterpret_cast<const char*>(ch.dbeg), reinterpret_cast<const char*>(ch.dend)
+      );
+      CHECK((payload == selected));
+
+      // either index is exact
+      const auto queries = perturb_tlsh_corpus(5, one_cell, 20, 0.03);
+      for (const auto& q: queries) {
+        for (const size_t k: { 1u, 10u, 50u }) {
+          for (const bool incl: { true, false }) {
+            const auto exp = tlsh_knn_brute(rows, rows + n, q, k, 1000, incl);
+            CHECK(same_matches(knn_with(hset, tidx, q, k, 1000, incl, SFHASH_TLSH_KNN_INDEX), exp));
+          }
+        }
+      }
+    }
   }
 }

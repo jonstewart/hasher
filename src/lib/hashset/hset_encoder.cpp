@@ -210,7 +210,10 @@ void count_hashes_and_build_indexes(
     if (wants_tivf(rhdr.fields[f], tlsh_options)) {
       auto& rows = tlsh_rows[f];
       std::sort(rows.begin(), rows.end());
-      ivfs[f] = build_tlsh_ivf(rows.data(), rows.data() + rows.size(), target_list_size);
+      ivfs[f] = build_tlsh_ivf(
+        rows.data(), rows.data() + rows.size(), target_list_size,
+        0x7175657279, 0, tlsh_ivf_build_of(tlsh_options)
+      );
       rows.clear();
       rows.shrink_to_fit();
     }
@@ -1060,7 +1063,10 @@ uint64_t hashset_builder_write(SFHASH_HashsetBuildCtx* bctx) {
         // are copied verbatim into the HDAT below
         if (wants_tivf(rhdr.fields[i], bctx->tlsh_options)) {
           const auto* tbeg = reinterpret_cast<const TlshDigest*>(out);
-          bctx->tlsh_ivfs[i] = build_tlsh_ivf(tbeg, tbeg + hhdr.hash_count, bctx->tlsh_ivf_target_list_size);
+          bctx->tlsh_ivfs[i] = build_tlsh_ivf(
+            tbeg, tbeg + hhdr.hash_count, bctx->tlsh_ivf_target_list_size,
+            0x7175657279, 0, tlsh_ivf_build_of(bctx->tlsh_options)
+          );
         }
       }
 
