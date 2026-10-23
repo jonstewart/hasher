@@ -28,6 +28,14 @@ and SFHASH_HSET_TLSH_INDEX (2) to choose; 0 writes neither:
 
 HSET_TLSH_OPTIONS=0 mkhashset 'Some test hashes' 'md5 and tlsh' md5 tlsh true true md5_tlsh.txt md5_tlsh.hset
 
+The TIVF index is built by integer clustering by default, whose bytes are the
+same on every platform. Add SFHASH_HSET_TLSH_INDEX_KMEANS (8) to build it with
+the float k-means instead: equally exact, but quadratic in the largest header
+cell, and its bytes depend on compiler and platform. Both sections, k-means
+index:
+
+HSET_TLSH_OPTIONS=11 mkhashset 'Some test hashes' 'md5 and tlsh' md5 tlsh true true md5_tlsh.txt md5_tlsh.hset
+
 */
 
 #include <cstdlib>

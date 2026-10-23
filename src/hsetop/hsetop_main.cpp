@@ -16,7 +16,12 @@ hashsets-only file. See HASHSET_FORMAT, "Set operations".
 By default each optional TLSH section is written iff both inputs have it.
 Set HSET_TLSH_OPTIONS to a bitwise OR of SFHASH_HSET_TLSH_VECTORS (1) and
 SFHASH_HSET_TLSH_INDEX (2) to choose explicitly (0 writes neither); a
-section an input lacks is then computed for the output.
+section an input lacks is then computed for the output. An index computed
+that way is built by integer clustering, whose bytes are the same on every
+platform, unless SFHASH_HSET_TLSH_INDEX_KMEANS (8) is added to select the
+float k-means (equally exact, quadratic in the largest header cell, bytes
+dependent on compiler and platform). By default, and whenever both inputs
+have an index, the index is merged and the bit has no effect.
 
 A merged TIVF index coalesces small lists per header cell so that repeated
 incremental merges stay within one list per cell of a from-scratch build

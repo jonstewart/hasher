@@ -79,7 +79,12 @@ order, each belonging to the section whose HDAT precedes it:
 Neither may appear in a section of any other hash type (a reader rejects
 the file). Both are written by default for TLSH fields when hashsets are
 written; sfhash_hashset_builder_set_tlsh_options (or HSET_TLSH_OPTIONS for
-mkhashset) turns either off. The FTOC reserves room for both whether or not
+mkhashset) turns either off: SFHASH_HSET_TLSH_VECTORS (1) and
+SFHASH_HSET_TLSH_INDEX (2). SFHASH_HSET_TLSH_INDEX_KMEANS (8) builds the
+TIVF with the float k-means instead of the default integer clustering;
+the index is equally exact, builds in time quadratic in the largest header
+cell, and its bytes depend on compiler and platform, whereas the default
+build's bytes are the same everywhere for the same rows. The FTOC reserves room for both whether or not
 they are written, so the FTOC chunk may be shorter than the gap before
 FHDR.
 
@@ -202,7 +207,10 @@ scratch instead.
 Options. tlsh_options selects the optional TLSH sections of the output as
 for the builder (SFHASH_HSET_TLSH_VECTORS, SFHASH_HSET_TLSH_INDEX), or
 SFHASH_HSET_TLSH_INHERIT (hsetop's default) writes each section iff every
-input that has a TLSH section has it. coalesce_threshold is C above
+input that has a TLSH section has it. SFHASH_HSET_TLSH_INDEX_KMEANS
+selects the build method of an index built from scratch because an input
+lacks one; under SFHASH_HSET_TLSH_INHERIT the index is always merged, so
+it has no effect there. coalesce_threshold is C above
 (SFHASH_HSET_COALESCE_DEFAULT for the default, 0 to disable coalescing, in
 which case lists accumulate over merges without a bound; hsetop reads it
 from HSET_COALESCE). Pruning quality (rows scanned per query) has no
