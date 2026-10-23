@@ -336,9 +336,10 @@ void coalesce_cell(std::vector<MergeList>& lists, const TlshDigest* rows, uint32
 // log_{8/7} m and guarantees termination. A quality knob only.
 constexpr size_t BISECT_MIN_SIDE_DIVISOR = 8;
 
-// the flat k-medoids of a BISECT node stops after this many Lloyd rounds
-// if assignments still change. A quality and build-cost knob only.
-constexpr size_t BISECT_KMEDOIDS_MAX_ITERATIONS = 10;
+// the flat k-means of a BISECT node stops after this many update and
+// reassignment rounds if assignments still change. A quality and
+// build-cost knob only.
+constexpr size_t BISECT_KMEANS_MAX_ITERATIONS = 10;
 
 /*
  * The partition of one cell's rows for bisect_cell: recursive two-way
@@ -378,12 +379,12 @@ private:
 
   /*
    * The flat clustering of node [lo, hi) into at most k = ceil(s / T)
-   * lists by integer k-medoids: k-medoids++ seeding, then every member is
-   * assigned to its nearest medoid (ties to the smaller medoid index), and
-   * Lloyd-style rounds alternate re-choosing each list's medoid with
-   * reassignment until no assignment changes. The node's range of perm is
-   * rearranged so each nonempty list is a contiguous range, in medoid
-   * order; empty lists are dropped.
+   * lists by k-means over exact integer centroids: k-means++ seeding, then
+   * every member is assigned to its nearest centroid (ties to the smaller
+   * centroid index), and rounds alternate recomputing each centroid from
+   * its members with reassignment until no assignment changes. The node's
+   * range of perm is rearranged so each nonempty list is a contiguous
+   * range, in centroid order; empty lists are dropped.
    */
   void cluster(size_t lo, size_t hi, std::vector<std::pair<size_t, size_t>>& out) {
     const size_t s = hi - lo;
@@ -393,17 +394,19 @@ private:
       return;
     }
     node_.assign(perm_.begin() + lo, perm_.begin() + hi);
+    embed_node();
     seed_medoids(k);
+    seed_centroids();
     assign_nearest();
-    for (size_t it = 0; it < BISECT_KMEDOIDS_MAX_ITERATIONS; ++it) {
-      update_medoids();
+    for (size_t it = 0; it < BISECT_KMEANS_MAX_ITERATIONS; ++it) {
+      update_centroids();
       if (!assign_nearest()) {
         break;
       }
     }
 
     group_by_list();
-    for (size_t l = 0; l < med_.size(); ++l) {
+    for (size_t l = 0; l < cnt_.size(); ++l) {
       if (start_[l] != start_[l + 1]) {
         out.emplace_back(lo + start_[l], lo + start_[l + 1]);
       }
@@ -416,7 +419,7 @@ private:
   // members_ = the positions in node_ grouped by list, ascending within a
   // list; list l is members_[start_[l], start_[l + 1])
   void group_by_list() {
-    start_.assign(med_.size() + 1, 0);
+    start_.assign(cnt_.size() + 1, 0);
     for (const uint32_t l: of_) {
       ++start_[l + 1];
     }
@@ -469,54 +472,87 @@ private:
     }
   }
 
-  /*
-   * Replaces the medoid of every nonempty list by its member with the least
-   * sum of squared distances to the list's members, ties by the smaller
-   * local row index; empty lists keep theirs. O(|list|^2) kernel calls per
-   * list.
-   */
-  void update_medoids() {
-    group_by_list();
-    for (size_t l = 0; l < med_.size(); ++l) {
-      if (start_[l] == start_[l + 1]) {
-        continue;
-      }
-      uint32_t best = med_[l];
-      uint64_t best_s = UINT64_MAX;
-      for (size_t a = start_[l]; a < start_[l + 1]; ++a) {
-        const uint32_t c = members_[a];
-        const TlshBodyQuery q(rows_[node_[c]]);
-        uint64_t sum = 0;
-        for (size_t b = start_[l]; b < start_[l + 1] && sum <= best_s; ++b) {
-          sum += q.emb_body(rows_[node_[members_[b]]]);
-        }
-        if (sum < best_s || (sum == best_s && node_[c] < node_[best])) {
-          best = c;
-          best_s = sum;
-        }
-      }
-      med_[l] = best;
+  // emb_ = the node's body embeddings, row i at emb_[i * BD], and norm2_
+  // their squared norms
+  void embed_node() {
+    emb_.resize(node_.size() * BD);
+    norm2_.resize(node_.size());
+    for (size_t i = 0; i < node_.size(); ++i) {
+      norm2_[i] = tlsh_embed_body_i8(rows_[node_[i]], &emb_[i * BD]);
     }
   }
 
-  // of_[i] = the index of the medoid nearest node_[i], ties to the smaller
-  // index; returns whether any assignment changed
-  bool assign_nearest() {
-    std::vector<TlshBodyQuery> qs;
-    qs.reserve(med_.size());
-    for (const uint32_t m: med_) {
-      qs.emplace_back(rows_[node_[m]]);
+  // centroid c is the seed row med_[c] alone: (x, 1)
+  void seed_centroids() {
+    const size_t k = med_.size();
+    sum_.assign(k * BD, 0);
+    cnt_.assign(k, 1);
+    sum2_.resize(k);
+    for (size_t c = 0; c < k; ++c) {
+      std::copy_n(&emb_[med_[c] * BD], BD, &sum_[c * BD]);
+      sum2_[c] = norm2_[med_[c]];
     }
+  }
+
+  /*
+   * Recomputes every centroid's (S, n, ||S||^2) from its members; integer
+   * sums, so independent of the order. A centroid with no members keeps
+   * its previous (S, n): it may win members back in the next assignment,
+   * and is dropped at the end if it is still empty.
+   */
+  void update_centroids() {
+    const size_t k = cnt_.size();
+    std::vector<int32_t> sum(k * BD, 0);
+    std::vector<uint32_t> cnt(k, 0);
+    for (size_t i = 0; i < node_.size(); ++i) {
+      const int8_t* x = &emb_[i * BD];
+      int32_t* S = &sum[of_[i] * BD];
+      for (size_t j = 0; j < BD; ++j) {
+        S[j] += x[j];
+      }
+      ++cnt[of_[i]];
+    }
+    for (size_t c = 0; c < k; ++c) {
+      if (cnt[c] == 0) {
+        continue;
+      }
+      std::copy_n(&sum[c * BD], BD, &sum_[c * BD]);
+      cnt_[c] = cnt[c];
+      int64_t s2 = 0;
+      for (size_t j = 0; j < BD; ++j) {
+        s2 += int64_t{sum_[c * BD + j]} * sum_[c * BD + j];
+      }
+      sum2_[c] = s2;
+    }
+  }
+
+  /*
+   * of_[i] = the index of the centroid nearest row i of the node, ties to
+   * the smaller index; returns whether any assignment changed. For
+   * centroid (S, n), N = ||n x - S||^2 = n^2 ||x||^2 - 2n (x . S) + ||S||^2
+   * and the squared distance is N / n^2, compared exactly by
+   * tlsh_ivf_nearer (whose comment bounds N).
+   */
+  bool assign_nearest() {
+    const size_t k = cnt_.size();
     of_.resize(node_.size(), UINT32_MAX);
     bool changed = false;
     for (size_t i = 0; i < node_.size(); ++i) {
-      const TlshDigest& r = rows_[node_[i]];
-      uint32_t best = 0, best_d = qs[0].emb_body(r);
-      for (uint32_t j = 1; j < qs.size(); ++j) {
-        const uint32_t d = qs[j].emb_body(r);
-        if (d < best_d) {
-          best = j;
-          best_d = d;
+      const int8_t* x = &emb_[i * BD];
+      uint32_t best = 0;
+      uint64_t best_N = 0, best_n = 0;
+      for (uint32_t c = 0; c < k; ++c) {
+        const int32_t* S = &sum_[c * BD];
+        int32_t dot = 0;
+        for (size_t j = 0; j < BD; ++j) {
+          dot += x[j] * S[j];
+        }
+        const int64_t n = cnt_[c];
+        const uint64_t N = static_cast<uint64_t>(n * n * norm2_[i] - 2 * n * dot + sum2_[c]);
+        if (c == 0 || tlsh_ivf_nearer(N, n, best_N, best_n)) {
+          best = c;
+          best_N = N;
+          best_n = n;
         }
       }
       changed |= of_[i] != best;
@@ -588,11 +624,18 @@ private:
   std::vector<uint32_t> perm_;
   size_t target_, flat_max_;
   std::mt19937_64& rng_;
-  // scratch for cluster(): the node's members, the medoids (positions in
+  // scratch for cluster(): the node's members, the seeds (positions in
   // node_), each member's squared distance to the nearest seed so far,
-  // each member's list, and the members grouped by list (from start_)
+  // each member's list, the members grouped by list (from start_), the
+  // members' embeddings and squared norms, and per centroid the
+  // coordinate sum S, the member count n and ||S||^2
   std::vector<uint32_t> node_, med_, best_, of_, members_;
   std::vector<size_t> start_;
+  std::vector<int8_t> emb_;
+  std::vector<uint32_t> norm2_;
+  std::vector<int32_t> sum_;
+  std::vector<uint32_t> cnt_;
+  std::vector<int64_t> sum2_;
 };
 
 /*

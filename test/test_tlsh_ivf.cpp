@@ -536,3 +536,75 @@ TEST_CASE("tlsh_ivf_nearer") {
   CHECK(tlsh_ivf_nearer(N - 1, 4096, N, 4096));
   CHECK_FALSE(tlsh_ivf_nearer(N, 4096, N - 1, 4096));
 }
+
+namespace {
+
+// a one-cell digest whose body is all code 1 (the zero embedding) except
+// code 0 (embedding coordinate 2b = 1) in the given buckets
+TlshDigest unit_body(std::initializer_list<size_t> buckets, uint8_t checksum = 0) {
+  TlshDigest d{};
+  d.L = 9;
+  d.Q = 0x12;
+  d.checksum = checksum;
+  std::fill(std::begin(d.lo), std::end(d.lo), 0xFF);
+  for (const size_t b: buckets) {
+    d.lo[b >> 3] &= static_cast<uint8_t>(~(1u << (b & 7)));
+  }
+  return d;
+}
+
+} // namespace
+
+TEST_CASE("tlsh_ivf_bisect_assigns_to_the_nearest_mean") {
+  /*
+   * One flat node, T = 16, of s = 23 rows: k = ceil(23 / 16) = 2. With
+   * unit_body the squared distance between two rows is the size of the
+   * symmetric difference of their code-0 buckets.
+   *
+   *   cluster P: x_i, code 0 in buckets 2i, 2i + 1 (i < 6)
+   *   test row t: code 0 in buckets 12, 13
+   *   Q: 16 copies of f, code 0 in buckets 12..16 (checksums 0..15)
+   *
+   * d(x_i, x_j) = 4, d(x_i, t) = 4, d(t, f) = 3, d(x_i, f) = 7. The mean of
+   * P is 1/6 in each of its 12 coordinates, so d(t, mean P) = 2 + 12/36 =
+   * 7/3 < 3 = d(t, f) = d(t, mean Q), and with t in it the mean of P is
+   * nearer t still: by means t belongs with P. By medoids (rows) it does
+   * not: every member of P is at 4 from t, f at 3. {P + t}, {Q} is the
+   * only fixed point k-means reaches from any k-means++ seeding of this
+   * node (checked exhaustively over the seed pairs of nonzero weight by a
+   * model of the algorithm); nearest-medoid reaches it from none. The
+   * lists, 7 and 16 rows, have one below T / 2, so nothing is coalesced.
+   */
+  std::vector<TlshDigest> rows;
+  for (size_t i = 0; i < 6; ++i) {
+    rows.push_back(unit_body({ 2 * i, 2 * i + 1 }));
+  }
+  const TlshDigest t = unit_body({ 12, 13 });
+  rows.push_back(t);
+  for (uint8_t c = 0; c < 16; ++c) {
+    rows.push_back(unit_body({ 12, 13, 14, 15, 16 }, c));
+  }
+  REQUIRE(tlsh_embed_body_dist2(rows[0], rows[1]) == 4);
+  REQUIRE(tlsh_embed_body_dist2(rows[0], t) == 4);
+  REQUIRE(tlsh_embed_body_dist2(t, rows.back()) == 3);
+  REQUIRE(tlsh_embed_body_dist2(rows[0], rows.back()) == 7);
+  std::sort(rows.begin(), rows.end());
+
+  for (const uint64_t seed: { 1u, 7u, 99u }) {
+    const auto ivf = build_bisect(rows, 16, seed);
+    REQUIRE(ivf.lists() == 2);
+    const TlshDigest f = unit_body({ 12, 13, 14, 15, 16 });
+    for (size_t l = 0; l < 2; ++l) {
+      // one list is P and t (7 rows, no copy of f), the other the 16 copies
+      bool has_t = false;
+      size_t copies_of_f = 0;
+      for (uint64_t i = ivf.list_start[l]; i < ivf.list_start[l + 1]; ++i) {
+        has_t |= rows[ivf.ids[i]] == t;
+        copies_of_f += tlsh_embed_body_dist2(rows[ivf.ids[i]], f) == 0;
+      }
+      const size_t size = ivf.list_start[l + 1] - ivf.list_start[l];
+      CHECK(size == (has_t ? 7 : 16));
+      CHECK(copies_of_f == (has_t ? 0 : 16));
+    }
+  }
+}
