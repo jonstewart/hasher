@@ -57,8 +57,7 @@ struct TlshIvf {
  * BISECT: recursive two-way splits of the cell with the integer kernel
  *   only (no floating point, so the index bytes are the same everywhere for
  *   the same rows and seed). A node of more than tlsh_ivf_bisect_leaf_max(T)
- *   rows is split around two far-apart member pivots, refined over bounded
- *   random samples, with a median split when one side would be tiny; O(m)
+ *   rows is split around two far-apart member pivots, with a median split when one side would be tiny; O(m)
  *   kernel calls per tree level, O(m log m) per cell. Lists are the leaves in
  *   depth-first order, each with its exact 1-center as medoid (the member
  *   minimizing the max distance to the others, which minimizes radius2).
