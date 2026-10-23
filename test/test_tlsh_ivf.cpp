@@ -349,3 +349,85 @@ TEST_CASE("tlsh_ivf_bisect_coalesces_small_lists") {
     CHECK(tlsh_ivf_check_invariant(make_tlsh_ivf_view(build_bisect(many, T)), static_cast<uint32_t>(T)));
   }
 }
+
+namespace {
+
+/*
+ * List sizes and counts of a BISECT build with coalescing threshold T.
+ * Leaves hold at most L = 4T/3 rows and a coalesced pair fewer than
+ * 2 (T / 2) <= T <= L, so every list has at most L rows and a cell of m rows
+ * has at least ceil(m / L) lists. Coalescing leaves at most one list per
+ * cell below T / 2, so the other lists hold at least T / 2 rows each and
+ * (lists - 1) (T / 2) <= m: at most 2m / T + 1 lists, about twice
+ * ceil(m / T) in the worst case.
+ */
+void check_bisect_shape(const TlshIvf& ivf, size_t T) {
+  const size_t L = tlsh_ivf_bisect_leaf_max(T);
+  const size_t half = T / 2;
+  for (uint32_t c = 0; c < TLSH_CELL_COUNT; ++c) {
+    const uint32_t fl = ivf.cell_lists[c], el = ivf.cell_lists[c + 1];
+    if (fl == el) {
+      continue;
+    }
+    const uint64_t m = ivf.list_start[el] - ivf.list_start[fl];
+    const uint64_t lists = el - fl;
+    for (uint32_t l = fl; l < el; ++l) {
+      CHECK(ivf.list_start[l + 1] - ivf.list_start[l] <= L);
+    }
+    CHECK(lists * L >= m);
+    CHECK((lists - 1) * half <= m);
+  }
+}
+
+} // namespace
+
+TEST_CASE("tlsh_ivf_bisect_list_sizes_and_counts") {
+  for (const size_t T: { 8u, 32u, 64u }) {
+    const auto rows = sorted_corpus(51, 20000);
+    const auto ivf = build_bisect(rows, T);
+    check_bisect_shape(ivf, T);
+    check_one_centers(ivf, rows);
+  }
+  check_bisect_shape(build_bisect(same_body_corpus(250), 32), 32);
+}
+
+TEST_CASE("tlsh_ivf_bisect_small_cells") {
+  // one row: one list of it, radius 0
+  const auto one = one_cell_corpus(61, 1);
+  const auto a = build_bisect(one, 32);
+  REQUIRE(a.lists() == 1);
+  CHECK(a.medoids[0] == one[0]);
+  CHECK(a.radius2[0] == 0);
+  CHECK(a.ids == std::vector<uint32_t>{ 0 });
+
+  // exactly T rows: a single leaf, its 1-center
+  const auto t = one_cell_corpus(62, 40);
+  REQUIRE(t.size() >= 32);
+  const std::vector<TlshDigest> rows(t.begin(), t.begin() + 32);
+  const auto b = build_bisect(rows, 32);
+  REQUIRE(b.lists() == 1);
+  check_one_centers(b, rows);
+}
+
+TEST_CASE("tlsh_ivf_bisect_one_large_cell") {
+  // a deep tree: ~20k rows in one cell
+  const auto rows = one_cell_corpus(71, 20000);
+  REQUIRE(rows.size() > 15000);
+  const auto ivf = build_bisect(rows, 32);
+  REQUIRE(ivf.ids.size() == rows.size());
+  check_bisect_shape(ivf, 32);
+  CHECK(tlsh_ivf_check_invariant(make_tlsh_ivf_view(ivf), 32));
+  for (size_t l = 0; l < ivf.lists(); ++l) {
+    for (uint64_t i = ivf.list_start[l]; i < ivf.list_start[l + 1]; ++i) {
+      REQUIRE(tlsh_embed_body_dist2(ivf.medoids[l], rows[ivf.ids[i]]) <= ivf.radius2[l]);
+    }
+  }
+
+  const auto view = make_tlsh_ivf_view(ivf);
+  for (const auto& q: perturb_tlsh_corpus(72, rows, 10, 0.05)) {
+    CHECK(same_matches(
+      tlsh_knn_ivf(view, rows.data(), q, 10, 300, true),
+      tlsh_knn_brute(rows.data(), rows.data() + rows.size(), q, 10, 300, true)
+    ));
+  }
+}
