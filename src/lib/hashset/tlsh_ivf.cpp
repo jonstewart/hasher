@@ -336,6 +336,10 @@ void coalesce_cell(std::vector<MergeList>& lists, const TlshDigest* rows, uint32
 // log_{8/7} m and guarantees termination. A quality knob only.
 constexpr size_t BISECT_MIN_SIDE_DIVISOR = 8;
 
+// the flat k-medoids of a BISECT node stops after this many Lloyd rounds
+// if assignments still change. A quality and build-cost knob only.
+constexpr size_t BISECT_KMEDOIDS_MAX_ITERATIONS = 10;
+
 /*
  * The partition of one cell's rows for bisect_cell: recursive two-way
  * splits while a node has more than flat_max rows, then a flat clustering
@@ -375,7 +379,9 @@ private:
   /*
    * The flat clustering of node [lo, hi) into at most k = ceil(s / T)
    * lists by integer k-medoids: k-medoids++ seeding, then every member is
-   * assigned to its nearest medoid (ties to the smaller medoid index). The
+   * assigned to its nearest medoid (ties to the smaller medoid index), and
+   * Lloyd-style rounds alternate re-choosing each list's medoid with
+   * reassignment until no assignment changes. The
    * node's range of perm is rearranged so each nonempty list is a
    * contiguous range, in medoid order; empty lists are dropped.
    */
@@ -389,6 +395,12 @@ private:
     node_.assign(perm_.begin() + lo, perm_.begin() + hi);
     seed_medoids(k);
     assign_nearest();
+    for (size_t it = 0; it < BISECT_KMEDOIDS_MAX_ITERATIONS; ++it) {
+      update_medoids();
+      if (!assign_nearest()) {
+        break;
+      }
+    }
 
     // stable counting sort of the node by list
     std::vector<size_t> start(med_.size() + 1, 0);
@@ -444,6 +456,48 @@ private:
       for (size_t i = 0; i < s; ++i) {
         best_[i] = std::min(best_[i], q.emb_body(rows_[node_[i]]));
       }
+    }
+  }
+
+  /*
+   * Replaces the medoid of every nonempty list by its member with the least
+   * sum of squared distances to the list's members, ties by the smaller
+   * local row index; empty lists keep theirs. O(|list|^2) kernel calls per
+   * list.
+   */
+  void update_medoids() {
+    const size_t k = med_.size();
+    std::vector<size_t> start(k + 1, 0);
+    for (const uint32_t l: of_) {
+      ++start[l + 1];
+    }
+    std::partial_sum(start.begin(), start.end(), start.begin());
+    members_.resize(node_.size());
+    {
+      std::vector<size_t> at(start.begin(), start.end() - 1);
+      for (size_t i = 0; i < node_.size(); ++i) {
+        members_[at[of_[i]]++] = static_cast<uint32_t>(i);
+      }
+    }
+    for (size_t l = 0; l < k; ++l) {
+      if (start[l] == start[l + 1]) {
+        continue;
+      }
+      uint32_t best = med_[l];
+      uint64_t best_s = UINT64_MAX;
+      for (size_t a = start[l]; a < start[l + 1]; ++a) {
+        const uint32_t c = members_[a];
+        const TlshBodyQuery q(rows_[node_[c]]);
+        uint64_t sum = 0;
+        for (size_t b = start[l]; b < start[l + 1] && sum <= best_s; ++b) {
+          sum += q.emb_body(rows_[node_[members_[b]]]);
+        }
+        if (sum < best_s || (sum == best_s && node_[c] < node_[best])) {
+          best = c;
+          best_s = sum;
+        }
+      }
+      med_[l] = best;
     }
   }
 
@@ -537,9 +591,9 @@ private:
   size_t target_, flat_max_;
   std::mt19937_64& rng_;
   // scratch for cluster(): the node's members, the medoids (positions in
-  // node_), each member's squared distance to the nearest seed so far, and
-  // each member's list
-  std::vector<uint32_t> node_, med_, best_, of_;
+  // node_), each member's squared distance to the nearest seed so far,
+  // each member's list, and the members grouped by list
+  std::vector<uint32_t> node_, med_, best_, of_, members_;
 };
 
 /*
