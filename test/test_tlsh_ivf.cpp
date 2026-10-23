@@ -384,6 +384,17 @@ TEST_CASE("tlsh_ivf_bisect_identical_bodies") {
   REQUIRE(ivf.ids.size() == rows.size());
   REQUIRE(ivf.lists() == 1);
   CHECK(ivf.radius2[0] == 0);
+
+  // a cell of one body larger than TLSH_IVF_BISECT_FLAT_MAX: the pivot
+  // split puts every row on one side, so only the median fallback makes the
+  // coarse split terminate; every list has radius 0
+  const auto big = same_body_corpus(TLSH_IVF_BISECT_FLAT_MAX + 1000);
+  const auto b = build_bisect(big, 32);
+  REQUIRE(b.ids.size() == big.size());
+  check_bisect_shape(b, 32);
+  for (size_t l = 0; l < b.lists(); ++l) {
+    CHECK(b.radius2[l] == 0);
+  }
 }
 
 TEST_CASE("tlsh_ivf_bisect_fewer_bodies_than_lists") {
@@ -449,9 +460,10 @@ TEST_CASE("tlsh_ivf_bisect_small_cells") {
 }
 
 TEST_CASE("tlsh_ivf_bisect_one_large_cell") {
-  // a deep tree: ~20k rows in one cell
+  // ~20k rows in one cell, several times TLSH_IVF_BISECT_FLAT_MAX: coarse
+  // splits, then a flat clustering of each node
   const auto rows = one_cell_corpus(71, 20000);
-  REQUIRE(rows.size() > 15000);
+  REQUIRE(rows.size() > 3 * TLSH_IVF_BISECT_FLAT_MAX);
   const auto ivf = build_bisect(rows, 32);
   REQUIRE(ivf.ids.size() == rows.size());
   check_bisect_shape(ivf, 32);
