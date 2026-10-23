@@ -201,6 +201,97 @@ CellLists cluster_cell(
   return out;
 }
 
+/*
+ * The recursive two-way partition of one cell's rows for bisect_cell.
+ * perm holds the cell's local row indexes; a node is a range [lo, hi) of
+ * perm, split in place, so depth-first recursion leaves the leaves
+ * contiguous and in depth-first order. Integer kernel only.
+ */
+class CellBisector {
+public:
+  CellBisector(const TlshDigest* rows, size_t m, size_t leaf_max, std::mt19937_64& rng):
+    rows_(rows), perm_(m), leaf_max_(leaf_max), rng_(rng)
+  {
+    std::iota(perm_.begin(), perm_.end(), 0u);
+  }
+
+  // [lo, hi) ranges of perm, in depth-first order
+  std::vector<std::pair<size_t, size_t>> leaves() {
+    std::vector<std::pair<size_t, size_t>> out;
+    split(0, perm_.size(), out);
+    return out;
+  }
+
+  const std::vector<uint32_t>& perm() const { return perm_; }
+
+private:
+  void split(size_t lo, size_t hi, std::vector<std::pair<size_t, size_t>>& out) {
+    if (hi - lo <= leaf_max_) {
+      out.emplace_back(lo, hi);
+      return;
+    }
+    const size_t mid = lo + (hi - lo) / 2;
+    split(lo, mid, out);
+    split(mid, hi, out);
+  }
+
+  const TlshDigest* rows_;
+  std::vector<uint32_t> perm_;
+  size_t leaf_max_;
+  std::mt19937_64& rng_;
+};
+
+/*
+ * The exact 1-center of rows ids (local indexes into rows): the member
+ * whose max squared distance to the others is smallest, ties by the smaller
+ * index. Returns (medoid, radius2).
+ */
+std::pair<uint32_t, uint32_t> one_center(const TlshDigest* rows, const uint32_t* ids, size_t n) {
+  uint32_t best = ids[0], best_r = UINT32_MAX;
+  for (size_t i = 0; i < n; ++i) {
+    const TlshBodyQuery q(rows[ids[i]]);
+    uint32_t r = 0;
+    for (size_t j = 0; j < n && r <= best_r; ++j) {
+      r = std::max(r, q.emb_body(rows[ids[j]]));
+    }
+    if (r < best_r || (r == best_r && ids[i] < best)) {
+      best = ids[i];
+      best_r = r;
+    }
+  }
+  return { best, best_r };
+}
+
+// Recursive bisection of one cell's rows [beg, end) (TlshIvfBuild::BISECT).
+// Row indexes written to ids are offset by base.
+CellLists bisect_cell(
+  const TlshDigest* beg,
+  const TlshDigest* end,
+  uint64_t base,
+  size_t target_list_size,
+  std::mt19937_64& rng)
+{
+  const size_t m = end - beg;
+  CellBisector bis(beg, m, tlsh_ivf_bisect_leaf_max(target_list_size), rng);
+  const auto leaves = bis.leaves();
+
+  CellLists out;
+  out.ids.reserve(m);
+  std::vector<uint32_t> ids;
+  for (const auto& [lo, hi]: leaves) {
+    ids.assign(bis.perm().begin() + lo, bis.perm().begin() + hi);
+    std::sort(ids.begin(), ids.end());
+    const auto [med, r2] = one_center(beg, ids.data(), ids.size());
+    out.medoids.push_back(beg[med]);
+    out.radius2.push_back(r2);
+    out.sizes.push_back(static_cast<uint32_t>(ids.size()));
+    for (const uint32_t id: ids) {
+      out.ids.push_back(static_cast<uint32_t>(base + id));
+    }
+  }
+  return out;
+}
+
 } // namespace
 
 TlshIvf build_tlsh_ivf(
@@ -208,7 +299,8 @@ TlshIvf build_tlsh_ivf(
   const TlshDigest* end,
   size_t target_list_size,
   uint64_t seed,
-  unsigned threads)
+  unsigned threads,
+  TlshIvfBuild method)
 {
   THROW_IF(target_list_size == 0, "target_list_size must be positive");
   const uint64_t n = end - beg;
@@ -230,7 +322,9 @@ TlshIvf build_tlsh_ivf(
   auto work = [&](size_t i) {
     const uint32_t c = nonempty[i];
     std::mt19937_64 rng(seed ^ (static_cast<uint64_t>(c) * 0x9E3779B97F4A7C15ull));
-    results[i] = cluster_cell(beg + cells[c], beg + cells[c + 1], cells[c], target_list_size, rng);
+    results[i] = method == TlshIvfBuild::BISECT ?
+      bisect_cell(beg + cells[c], beg + cells[c + 1], cells[c], target_list_size, rng) :
+      cluster_cell(beg + cells[c], beg + cells[c + 1], cells[c], target_list_size, rng);
   };
 
   if (threads == 0) {

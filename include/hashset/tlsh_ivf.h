@@ -42,15 +42,48 @@ struct TlshIvf {
   size_t lists() const { return radius2.size(); }
 };
 
-// Builds the index over sorted rows [beg, end). Cells are clustered in
-// parallel on `threads` threads (0 = hardware concurrency); the result does
-// not depend on the thread count.
+/*
+ * How build_tlsh_ivf partitions a cell into lists. Either way every member
+ * of a list lies within the list's radius2 of its medoid, computed with the
+ * integer kernel, so the search is exact; the method changes only the
+ * partition, hence the rows a query scans and the build time.
+ *
+ * KMEANS: k-means++ seeding and Lloyd iterations in float over the cell's
+ *   256-dim body embeddings, k = ceil(m / T) centroids; the medoid of a list
+ *   is its member nearest the centroid. Costs Theta(m^2 / T) per cell of m
+ *   rows, and the float accumulation order makes the index bytes depend on
+ *   the compiler and platform.
+ *
+ * BISECT: recursive two-way splits of the cell with the integer kernel
+ *   only (no floating point, so the index bytes are the same everywhere for
+ *   the same rows and seed). A node of more than tlsh_ivf_bisect_leaf_max(T)
+ *   rows is split around two far-apart member pivots, refined over bounded
+ *   random samples, with a median split when one side would be tiny; O(m)
+ *   kernel calls per tree level, O(m log m) per cell. Lists are the leaves in
+ *   depth-first order, each with its exact 1-center as medoid (the member
+ *   minimizing the max distance to the others, which minimizes radius2).
+ */
+enum class TlshIvfBuild : uint8_t { KMEANS, BISECT };
+
+/*
+ * BISECT leaves hold at most this many rows. A node in (L, 2L] splits into
+ * two in roughly (L/2, L], of mean 3L/4, so L = 4T/3 makes the mean leaf
+ * about T under balanced splits. A quality knob only.
+ */
+constexpr size_t tlsh_ivf_bisect_leaf_max(size_t target_list_size) {
+  return target_list_size < 2 ? 1 : 4 * target_list_size / 3;
+}
+
+// Builds the index over sorted rows [beg, end) with the given method. Cells
+// are clustered in parallel on `threads` threads (0 = hardware concurrency);
+// the result does not depend on the thread count.
 TlshIvf build_tlsh_ivf(
   const TlshDigest* beg,
   const TlshDigest* end,
   size_t target_list_size = TLSH_IVF_TARGET_LIST_SIZE,
   uint64_t seed = 0x7175657279,
-  unsigned threads = 0
+  unsigned threads = 0,
+  TlshIvfBuild method = TlshIvfBuild::KMEANS
 );
 
 // Read-only view over a serialized TIVF payload (pointers into mapped memory).

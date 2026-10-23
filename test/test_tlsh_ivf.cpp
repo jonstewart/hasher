@@ -182,3 +182,65 @@ TEST_CASE("tlsh_ivf_knn_edge_cases") {
   CHECK(r[0].distance == 0);
   CHECK(rows[r[0].index] == rows[123]);
 }
+
+namespace {
+
+// n distinct rows of one header cell, sorted
+std::vector<TlshDigest> one_cell_corpus(uint64_t seed, size_t n) {
+  auto c = make_tlsh_corpus(seed, n);
+  for (auto& d: c) {
+    d.L = 0x40;
+    d.Q = 0x21;
+  }
+  std::sort(c.begin(), c.end());
+  c.erase(std::unique(c.begin(), c.end()), c.end());
+  return c;
+}
+
+TlshIvf build_bisect(const std::vector<TlshDigest>& rows, size_t T, uint64_t seed = 7, unsigned threads = 0) {
+  return build_tlsh_ivf(rows.data(), rows.data() + rows.size(), T, seed, threads, TlshIvfBuild::BISECT);
+}
+
+// max squared body distance from rows[c] over the members of list l
+uint32_t max_dist2_about(const TlshIvf& ivf, const std::vector<TlshDigest>& rows, size_t l, const TlshDigest& c) {
+  uint32_t r = 0;
+  for (uint64_t i = ivf.list_start[l]; i < ivf.list_start[l + 1]; ++i) {
+    r = std::max(r, tlsh_embed_body_dist2(c, rows[ivf.ids[i]]));
+  }
+  return r;
+}
+
+// every list's medoid is a member, radius2 is the attained max distance
+// from it, and no member has a smaller max distance (a 1-center)
+void check_one_centers(const TlshIvf& ivf, const std::vector<TlshDigest>& rows) {
+  for (size_t l = 0; l < ivf.lists(); ++l) {
+    bool member = false;
+    uint32_t best = UINT32_MAX;
+    for (uint64_t i = ivf.list_start[l]; i < ivf.list_start[l + 1]; ++i) {
+      const TlshDigest& r = rows[ivf.ids[i]];
+      member |= r == ivf.medoids[l];
+      best = std::min(best, max_dist2_about(ivf, rows, l, r));
+    }
+    CHECK(member);
+    CHECK(ivf.radius2[l] == max_dist2_about(ivf, rows, l, ivf.medoids[l]));
+    CHECK(ivf.radius2[l] == best);
+  }
+}
+
+} // namespace
+
+TEST_CASE("tlsh_ivf_bisect_leaf_bound") {
+  CHECK(tlsh_ivf_bisect_leaf_max(32) == 42);
+  CHECK(tlsh_ivf_bisect_leaf_max(3) == 4);
+  CHECK(tlsh_ivf_bisect_leaf_max(1) == 1);
+}
+
+TEST_CASE("tlsh_ivf_bisect_lists_are_bounded_one_centers") {
+  const auto rows = one_cell_corpus(21, 2000);
+  const auto ivf = build_bisect(rows, 32);
+  REQUIRE(ivf.ids.size() == rows.size());
+  for (size_t l = 0; l < ivf.lists(); ++l) {
+    CHECK(ivf.list_start[l + 1] - ivf.list_start[l] <= 42);
+  }
+  check_one_centers(ivf, rows);
+}
