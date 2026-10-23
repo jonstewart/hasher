@@ -336,6 +336,13 @@ void coalesce_cell(std::vector<MergeList>& lists, const TlshDigest* rows, uint32
 // log_{8/7} m and guarantees termination. A quality knob only.
 constexpr size_t BISECT_MIN_SIDE_DIVISOR = 8;
 
+// after the farthest-point split, each side's pivot is re-chosen and the
+// node reassigned this many times, choosing among this many candidates
+// scored against a sample of this many members. Quality knobs only.
+constexpr size_t BISECT_REFINE_ROUNDS = 2;
+constexpr size_t BISECT_REFINE_CANDIDATES = 16;
+constexpr size_t BISECT_REFINE_SAMPLE = 64;
+
 /*
  * The recursive two-way partition of one cell's rows for bisect_cell.
  * perm holds the cell's local row indexes; a node is a range [lo, hi) of
@@ -400,12 +407,55 @@ private:
     return mid - perm_.begin();
   }
 
+  // up to n members of [lo, hi): all of them if there are no more than n,
+  // else n draws (with repetition)
+  void sample(size_t lo, size_t hi, size_t n, std::vector<uint32_t>& out) {
+    out.clear();
+    if (hi - lo <= n) {
+      out.assign(perm_.begin() + lo, perm_.begin() + hi);
+    }
+    else {
+      for (size_t i = 0; i < n; ++i) {
+        out.push_back(perm_[lo + draw(hi - lo)]);
+      }
+    }
+  }
+
+  // a new pivot for the side [lo, hi) whose pivot is cur: of cur and a
+  // sample of candidate members, the one with the least sum of squared
+  // distances to a sample of the side's members, ties by the smaller local
+  // index. Bounded samples keep this a constant number of kernel calls.
+  uint32_t central(size_t lo, size_t hi, uint32_t cur) {
+    sample(lo, hi, BISECT_REFINE_CANDIDATES, cand_);
+    cand_.push_back(cur);
+    sample(lo, hi, BISECT_REFINE_SAMPLE, pts_);
+    uint32_t best = cur;
+    uint64_t best_s = UINT64_MAX;
+    for (const uint32_t c: cand_) {
+      const TlshBodyQuery q(rows_[c]);
+      uint64_t sum = 0;
+      for (const uint32_t p: pts_) {
+        sum += q.emb_body(rows_[p]);
+      }
+      if (sum < best_s || (sum == best_s && c < best)) {
+        best = c;
+        best_s = sum;
+      }
+    }
+    return best;
+  }
+
   // splits node [lo, hi) in two in place; returns the boundary
   size_t partition(size_t lo, size_t hi) {
     const uint32_t p0 = perm_[lo + draw(hi - lo)];
-    const uint32_t a = farthest(lo, hi, p0);
-    const uint32_t b = farthest(lo, hi, a);
-    const size_t mid = assign(lo, hi, a, b);
+    uint32_t a = farthest(lo, hi, p0);
+    uint32_t b = farthest(lo, hi, a);
+    size_t mid = assign(lo, hi, a, b);
+    for (size_t round = 0; round < BISECT_REFINE_ROUNDS && mid != lo && mid != hi; ++round) {
+      a = central(lo, mid, a);
+      b = central(mid, hi, b);
+      mid = assign(lo, hi, a, b);
+    }
     if (std::min(mid - lo, hi - mid) * BISECT_MIN_SIDE_DIVISOR < hi - lo) {
       return median_split(lo, hi, a);
     }
@@ -433,6 +483,7 @@ private:
   std::vector<uint32_t> perm_;
   size_t leaf_max_;
   std::mt19937_64& rng_;
+  std::vector<uint32_t> cand_, pts_; // scratch for central()
 };
 
 /*
