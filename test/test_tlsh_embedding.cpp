@@ -200,3 +200,42 @@ TEST_CASE("tlsh_embed_dist2_to_point") {
     }
   }
 }
+
+TEST_CASE("tlsh_embed_body_i8") {
+  // codes 0, 1, 2, 3 repeating: by the table (1, 0), (0, 0), (0, 1),
+  // (-1, 1), squared norms 1 + 0 + 1 + 2 per four buckets, 32 x 4 = 128
+  std::vector<uint8_t> codes(128);
+  for (size_t i = 0; i < 128; ++i) {
+    codes[i] = i % 4;
+  }
+  const int8_t bx[4] = { 1, 0, 0, -1 }, by[4] = { 0, 0, 1, 1 };
+  int8_t v[TLSH_EMBED_BODY_DIMS];
+  CHECK(tlsh_embed_body_i8(digest_with(77, 3, 12, 5, codes), v) == 128);
+  for (size_t i = 0; i < 128; ++i) {
+    CHECK(v[2 * i] == bx[i % 4]);
+    CHECK(v[2 * i + 1] == by[i % 4]);
+  }
+
+  // all code 1: the zero vector
+  CHECK(tlsh_embed_body_i8(digest_with(1, 2, 3, 4, std::vector<uint8_t>(128, 1)), v) == 0);
+  CHECK(std::all_of(v, v + TLSH_EMBED_BODY_DIMS, [](int8_t x) { return x == 0; }));
+
+  // random planes: equals the float embedding, and the returned norm is
+  // the squared distance to the all-code-1 body (the zero vector)
+  std::mt19937_64 rng(3);
+  const auto origin = digest_with(1, 2, 3, 4, std::vector<uint8_t>(128, 1));
+  for (int n = 0; n < 200; ++n) {
+    TlshDigest d = origin;
+    for (size_t b = 0; b < 16; ++b) {
+      d.hi[b] = static_cast<uint8_t>(rng());
+      d.lo[b] = static_cast<uint8_t>(rng());
+    }
+    float f[TLSH_EMBED_BODY_DIMS];
+    tlsh_embed_body(d, f);
+    const uint32_t norm2 = tlsh_embed_body_i8(d, v);
+    for (size_t j = 0; j < TLSH_EMBED_BODY_DIMS; ++j) {
+      REQUIRE(static_cast<float>(v[j]) == f[j]);
+    }
+    CHECK(norm2 == tlsh_embed_body_dist2(d, origin));
+  }
+}

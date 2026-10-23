@@ -62,6 +62,11 @@ constexpr size_t TLSH_EMBED_BODY_DIMS = 256;
 
 void tlsh_embed_body(const TlshDigest& d, float* out);
 
+// The body embedding as integers, each coordinate in {-1, 0, 1}, the same
+// values tlsh_embed_body writes; returns its squared norm (at most 256: 1
+// per bucket of code 0 or 2, 2 per bucket of code 3).
+uint32_t tlsh_embed_body_i8(const TlshDigest& d, int8_t* out);
+
 // squared Euclidean distance between a digest's body embedding and a point
 float tlsh_embed_body_dist2_to_point(const TlshDigest& d, const float* p);
 

@@ -97,6 +97,21 @@ void tlsh_embed_body(const TlshDigest& d, float* out) {
   }
 }
 
+uint32_t tlsh_embed_body_i8(const TlshDigest& d, int8_t* out) {
+  // code -> (x, y) as BODY_X, BODY_Y, and x^2 + y^2
+  static constexpr int8_t X[4] = { 1, 0, 0, -1 };
+  static constexpr int8_t Y[4] = { 0, 0, 1,  1 };
+  static constexpr uint32_t NORM2[4] = { 1, 0, 1, 2 };
+  uint32_t norm2 = 0;
+  for (size_t i = 0; i < 128; ++i) {
+    const uint8_t c = d.bucket(i);
+    out[2 * i] = X[c];
+    out[2 * i + 1] = Y[c];
+    norm2 += NORM2[c];
+  }
+  return norm2;
+}
+
 float tlsh_embed_body_dist2_to_point(const TlshDigest& d, const float* p) {
   float s = 0.f;
   for (size_t i = 0; i < 128; ++i) {
