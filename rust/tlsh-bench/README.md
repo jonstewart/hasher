@@ -138,18 +138,21 @@ for the index. Building the 1M-row hset (sort, dedup, TIVF index) took 1.45 s
 and the file was 40.6 MiB; generating the corpus took 1.4 s.
 
 Rerun with BISECT (2026-10-23, Apple M5 Pro, plain `cargo bench`, 2 min
-10 s for every group, on a loaded machine: compare within the table):
+for every group, after the fresh BISECT build stopped coalescing small
+lists; compare within the table):
 
 | rows      | `naive_brute_ffi` | `hset_knn_brute` | `hset_knn_index` | `hset_knn_default` | naive / index | brute / index |
 |-----------|-------------------|------------------|------------------|--------------------|---------------|---------------|
-| 10 000    | 34.0 us           | 7.6 us           | 3.4 us           | 3.3 us             | 10x           | 2.2x          |
-| 100 000   | 335 us            | 62.7 us          | 11.4 us          | 11.4 us            | 29x           | 5.5x          |
-| 1 000 000 | 3.35 ms           | 605 us           | 19.5 us          | 19.5 us            | 171x          | 31x           |
+| 10 000    | 31.5 us           | 7.4 us           | 3.2 us           | 3.2 us             | 10x           | 2.3x          |
+| 100 000   | 309 us            | 61.0 us          | 10.6 us          | 10.4 us            | 29x           | 5.8x          |
+| 1 000 000 | 3.09 ms           | 570 us           | 17.6 us          | 17.7 us            | 176x          | 32x           |
 
-Criterion's figures per iteration of 20 queries: 680 us / 153 us / 67.9 us /
-66.6 us at 10 000 rows, 6.70 ms / 1.25 ms / 229 us / 228 us at 100 000 and
-67.0 ms / 12.1 ms / 391 us / 391 us at 1 000 000. Building the 1M-row hset
-took 0.44 s (k-means: 1.45 s) and the file was 40.3 MiB.
+Criterion's figures per iteration of 20 queries: 630 us / 148 us / 63.9 us /
+63.8 us at 10 000 rows, 6.18 ms / 1.22 ms / 212 us / 208 us at 100 000 and
+61.8 ms / 11.4 ms / 352 us / 353 us at 1 000 000. Building the 1M-row hset
+took 0.43 s (k-means: 1.45 s) and the file was 40.6 MiB. (The earlier
+BISECT run, whose fresh build coalesced, on a loaded machine: index 3.4 /
+11.4 / 19.5 us, 40.3 MiB.)
 
 ### Incremental merge
 
@@ -169,15 +172,17 @@ Rerun with BISECT (same run as above):
 
 | benchmark           | per iteration     | note                                                        |
 |---------------------|-------------------|-------------------------------------------------------------|
-| `incremental_union` | 38.6 ms           | output 40.9 MiB                                             |
-| `rebuild_union`     | 346 ms            | output 41.1 MiB                                             |
-| `knn_merged`        | 449 us (22.5 us/query) | index carried through the merge, coalesced             |
-| `knn_rebuilt`       | 410 us (20.5 us/query) | fresh BISECT index                                     |
+| `incremental_union` | 41.5 ms           | output 40.9 MiB                                             |
+| `rebuild_union`     | 309 ms            | output 41.3 MiB                                             |
+| `knn_merged`        | 392 us (19.6 us/query) | index carried through the merge, coalesced             |
+| `knn_rebuilt`       | 373 us (18.7 us/query) | fresh BISECT index                                     |
 
 With k-means the incremental union was 35x cheaper than the rebuild and
 its index answered within 4% of the rebuilt one's time; with BISECT the
-rebuild is 4x cheaper than before, the union 9x cheaper than the rebuild,
-and the merged index answers within 10% of the rebuilt one. Either way the
+rebuild is 4.7x cheaper than before, the union 7.4x cheaper than the
+rebuild, and the merged index answers within 5% of the rebuilt one. (The
+earlier, coalescing BISECT run: union 38.6 ms, rebuild 346 ms, kNN 22.5
+against 20.5 us per query.) Either way the
 merged file is slightly smaller (fewer, fuller lists). The C++ sweep over T and C, hourly and daily batch
 sizes and 24 or 7 successive merges is in `docs/TLSH_EMBEDDING.md`
 section 5 ("Incremental merge").
