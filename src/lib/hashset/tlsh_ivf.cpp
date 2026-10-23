@@ -507,6 +507,13 @@ std::pair<uint32_t, uint32_t> one_center(const TlshDigest* rows, const uint32_t*
   return { best, best_r };
 }
 
+// gives list l (local ids into rows) its exact 1-center and radius
+void center_list(MergeList& l, const TlshDigest* rows) {
+  const auto [med, r2] = one_center(rows, l.ids.data(), l.ids.size());
+  l.medoid = rows[med];
+  l.radius2 = r2;
+}
+
 // Recursive bisection of one cell's rows [beg, end) (TlshIvfBuild::BISECT).
 // Row indexes written to ids are offset by base.
 CellLists bisect_cell(
@@ -527,9 +534,7 @@ CellLists bisect_cell(
     MergeList l;
     l.ids.assign(bis.perm().begin() + lo, bis.perm().begin() + hi);
     std::sort(l.ids.begin(), l.ids.end());
-    const auto [med, r2] = one_center(beg, l.ids.data(), l.ids.size());
-    l.medoid = beg[med];
-    l.radius2 = r2;
+    center_list(l, beg);
     lists.push_back(std::move(l));
   }
 
@@ -548,9 +553,7 @@ CellLists bisect_cell(
     coalesce_cell(lists, beg, half);
     for (MergeList& l: lists) {
       if (l.ids.size() != leaf_size[leaf_of[l.ids.front()]]) {
-        const auto [med, r2] = one_center(beg, l.ids.data(), l.ids.size());
-        l.medoid = beg[med];
-        l.radius2 = r2;
+        center_list(l, beg);
       }
     }
   }
