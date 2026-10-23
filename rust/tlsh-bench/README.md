@@ -64,7 +64,7 @@ its place; `otool -L` / `ldd` on the bench binary should not list libhasher.
 | `hset_knn`       | `hset_knn_index`   | `sfhash_hashset_tlsh_knn_with(..., SFHASH_TLSH_KNN_INDEX)`: the TIVF inverted-file index over the lower-bound embedding (`docs/TLSH_EMBEDDING.md`) |
 | `hset_knn`       | `hset_knn_default` | `sfhash_hashset_tlsh_knn`, which picks the index when the file has one   |
 | `hset_incremental_merge` | `incremental_union` | `sfhash_hashset_merge(UNION)` of an 18,000-row batch into a 1,000,000-row master hset: rows merged, the TIVF index carried through and its small lists coalesced (`docs/TLSH_EMBEDDING.md` section 3); the output file is written each iteration |
-| `hset_incremental_merge` | `rebuild_union`     | the alternative: one from-scratch build of the same 1,018,000 rows through the builder API (sort, dedup, k-means index, file write) |
+| `hset_incremental_merge` | `rebuild_union`     | the alternative: one from-scratch build of the same 1,018,000 rows through the builder API (sort, dedup, index build with the library's default method, file write) |
 | `hset_incremental_merge` | `knn_merged`, `knn_rebuilt` | `sfhash_hashset_tlsh_knn_with(..., INDEX)` over the merged and over the rebuilt file, 20 queries as in `hset_knn` |
 
 `hset_knn` runs for N in {10 000, 100 000, 1 000 000} rows by default. Each
@@ -115,6 +115,10 @@ rate.
 
 ## Results
 
+The tables below were measured with the float k-means index build, the
+library default until 2026-10-23; the rerun with the current default
+(BISECT, integer clustering) follows each.
+
 Apple M-series, `cargo bench -- hset_knn --warm-up-time 1 --measurement-time 3`,
 20 queries per iteration, k = 10, max_distance = 144, include_length = true.
 Times are per query (the Criterion iteration time divided by 20).
@@ -133,6 +137,20 @@ Criterion's own figures for the same run (per iteration of 20 queries) were
 for the index. Building the 1M-row hset (sort, dedup, TIVF index) took 1.45 s
 and the file was 40.6 MiB; generating the corpus took 1.4 s.
 
+Rerun with BISECT (2026-10-23, Apple M5 Pro, plain `cargo bench`, 2 min
+10 s for every group, on a loaded machine: compare within the table):
+
+| rows      | `naive_brute_ffi` | `hset_knn_brute` | `hset_knn_index` | `hset_knn_default` | naive / index | brute / index |
+|-----------|-------------------|------------------|------------------|--------------------|---------------|---------------|
+| 10 000    | 34.0 us           | 7.6 us           | 3.4 us           | 3.3 us             | 10x           | 2.2x          |
+| 100 000   | 335 us            | 62.7 us          | 11.4 us          | 11.4 us            | 29x           | 5.5x          |
+| 1 000 000 | 3.35 ms           | 605 us           | 19.5 us          | 19.5 us            | 171x          | 31x           |
+
+Criterion's figures per iteration of 20 queries: 680 us / 153 us / 67.9 us /
+66.6 us at 10 000 rows, 6.70 ms / 1.25 ms / 229 us / 228 us at 100 000 and
+67.0 ms / 12.1 ms / 391 us / 391 us at 1 000 000. Building the 1M-row hset
+took 0.44 s (k-means: 1.45 s) and the file was 40.3 MiB.
+
 ### Incremental merge
 
 Apple M5 Pro, `cargo bench -- hset_incremental_merge` (default coalescing
@@ -147,9 +165,20 @@ rows:
 | `knn_merged`        | 397 us (19.8 us/query) | index carried through the merge, coalesced             |
 | `knn_rebuilt`       | 381 us (19.0 us/query) | fresh k-means index                                    |
 
-The incremental union is 35x cheaper than the rebuild and its index answers
-within 4% of the rebuilt one's time; the merged file is slightly smaller
-(fewer, fuller lists). The C++ sweep over T and C, hourly and daily batch
+Rerun with BISECT (same run as above):
+
+| benchmark           | per iteration     | note                                                        |
+|---------------------|-------------------|-------------------------------------------------------------|
+| `incremental_union` | 38.6 ms           | output 40.9 MiB                                             |
+| `rebuild_union`     | 346 ms            | output 41.1 MiB                                             |
+| `knn_merged`        | 449 us (22.5 us/query) | index carried through the merge, coalesced             |
+| `knn_rebuilt`       | 410 us (20.5 us/query) | fresh BISECT index                                     |
+
+With k-means the incremental union was 35x cheaper than the rebuild and
+its index answered within 4% of the rebuilt one's time; with BISECT the
+rebuild is 4x cheaper than before, the union 9x cheaper than the rebuild,
+and the merged index answers within 10% of the rebuilt one. Either way the
+merged file is slightly smaller (fewer, fuller lists). The C++ sweep over T and C, hourly and daily batch
 sizes and 24 or 7 successive merges is in `docs/TLSH_EMBEDDING.md`
 section 5 ("Incremental merge").
 
