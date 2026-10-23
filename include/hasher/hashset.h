@@ -236,13 +236,15 @@ enum {
   SFHASH_HSET_TLSH_VECTORS = 1,
   SFHASH_HSET_TLSH_INDEX = 2,
   /* sfhash_hashset_merge only: write each optional section iff every input
-   * that has a TLSH hashset has it; VECTORS and INDEX are ignored, but
-   * INDEX_KMEANS still applies to an index the merge rebuilds */
+   * that has a TLSH hashset has it; the other bits are ignored (an index
+   * is then always carried through the merge, never rebuilt, so
+   * INDEX_KMEANS has nothing to select) */
   SFHASH_HSET_TLSH_INHERIT = 4,
   /* build the TIVF index with the float k-means clustering instead of the
    * default integer build; the index is equally exact, builds in time
    * quadratic in the largest header cell, and its bytes depend on compiler
-   * and platform */
+   * and platform. Applies wherever an index is built from scratch: by the
+   * builder, and by a merge that writes an index when an input lacks one */
   SFHASH_HSET_TLSH_INDEX_KMEANS = 8
 };
 

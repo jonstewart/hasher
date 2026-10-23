@@ -1016,3 +1016,41 @@ TEST_CASE("hset_builder_setops_write_flags") {
     sfhash_free_error(err);
   }
 }
+
+TEST_CASE("hset_merge_rebuild_honours_index_kmeans") {
+  // 4000 rows in one header cell, where the two build methods give
+  // different lists; b has no index, so the union's index is rebuilt
+  auto one_cell = make_tlsh_corpus(41, 4000);
+  for (auto& d: one_cell) {
+    d.L = 0x40;
+    d.Q = 0x21;
+  }
+  const Loaded a = build_input("test/merge_method_a.hset", one_cell, 0, 2500, { SFHASH_TLSH }, false, true, SFHASH_HSET_TLSH_INDEX);
+  const Loaded b = build_input("test/merge_method_b.hset", one_cell, 1500, 4000, { SFHASH_TLSH }, false, true, SFHASH_HSET_TLSH_VECTORS);
+
+  for (const bool kmeans: { false, true }) {
+    const uint32_t opts = SFHASH_HSET_TLSH_INDEX | (kmeans ? uint32_t(SFHASH_HSET_TLSH_INDEX_KMEANS) : 0u);
+    const Loaded o = merge(a, b, SFHASH_HSET_OP_UNION, "test/merge_method_out.hset", opts);
+    // rows, radii and kNN by index == brute force
+    check_output(o, a, b, SFHASH_HSET_OP_UNION, false, true);
+    const int tidx = sfhash_hashset_index_for_type(o.get(), SFHASH_TLSH);
+    REQUIRE(tidx >= 0);
+    const auto& hs = o.get()->holder.hsets[tidx];
+    const uint64_t n = std::get<HashsetHeader>(hs).hash_count;
+    const auto* rows = static_cast<const TlshDigest*>(std::get<ConstHashsetData>(hs).beg);
+    const TlshIvfView& v = std::get<TlshIvfView>(hs);
+    REQUIRE(!v.empty());
+
+    const auto same_as = [&](TlshIvfBuild method) {
+      const TlshIvf e = build_tlsh_ivf(rows, rows + n, TLSH_IVF_TARGET_LIST_SIZE, TLSH_IVF_DEFAULT_SEED, 0, method);
+      return v.lists == e.lists() && v.n == e.n &&
+        std::equal(e.cell_lists.begin(), e.cell_lists.end(), v.cell_lists) &&
+        std::equal(e.medoids.begin(), e.medoids.end(), v.medoids) &&
+        std::equal(e.radius2.begin(), e.radius2.end(), v.radius2) &&
+        std::equal(e.list_start.begin(), e.list_start.end(), v.list_start) &&
+        std::equal(e.ids.begin(), e.ids.end(), v.ids);
+    };
+    CHECK(same_as(kmeans ? TlshIvfBuild::KMEANS : TlshIvfBuild::BISECT));
+    CHECK(!same_as(kmeans ? TlshIvfBuild::BISECT : TlshIvfBuild::KMEANS));
+  }
+}

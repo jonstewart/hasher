@@ -515,8 +515,15 @@ uint64_t write_merged_hset(
             );
           }
           else {
-            // a side lacks an index: cluster the merged rows from scratch
-            s.ivf = build_tlsh_ivf(rows.data(), rows.data() + rows.size(), TLSH_IVF_TARGET_LIST_SIZE);
+            // a side lacks an index: cluster the merged rows from scratch,
+            // with the method SFHASH_HSET_TLSH_INDEX_KMEANS selects. Only
+            // explicit options get here: with SFHASH_HSET_TLSH_INHERIT the
+            // output has an index only when every side has one, which is
+            // merged above, so the method bit has nothing to rebuild
+            s.ivf = build_tlsh_ivf(
+              rows.data(), rows.data() + rows.size(), TLSH_IVF_TARGET_LIST_SIZE,
+              TLSH_IVF_DEFAULT_SEED, 0, tlsh_ivf_build_of(tlsh_options)
+            );
           }
         }
       }
