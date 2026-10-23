@@ -1,4 +1,5 @@
 #include <catch2/catch_test_macros.hpp>
+#include <catch2/generators/catch_generators.hpp>
 
 #include <algorithm>
 #include <random>
@@ -35,8 +36,9 @@ bool same_matches(const std::vector<SFHASH_TlshMatch>& a, const std::vector<SFHA
 } // namespace
 
 TEST_CASE("tlsh_ivf_build_invariants") {
+  const auto method = GENERATE(TlshIvfBuild::KMEANS, TlshIvfBuild::BISECT);
   const auto rows = sorted_corpus(1, 5000);
-  const auto ivf = build_tlsh_ivf(rows.data(), rows.data() + rows.size(), 64);
+  const auto ivf = build_tlsh_ivf(rows.data(), rows.data() + rows.size(), 64, 0x7175657279, 0, method);
 
   REQUIRE(ivf.n == rows.size());
   REQUIRE(ivf.lists() > 1);
@@ -92,10 +94,11 @@ TEST_CASE("tlsh_ivf_build_invariants") {
 }
 
 TEST_CASE("tlsh_ivf_build_is_deterministic_across_threads") {
+  const auto method = GENERATE(TlshIvfBuild::KMEANS, TlshIvfBuild::BISECT);
   const auto rows = sorted_corpus(9, 6000);
-  const auto a = build_tlsh_ivf(rows.data(), rows.data() + rows.size(), 32, 1, 1);
-  const auto b = build_tlsh_ivf(rows.data(), rows.data() + rows.size(), 32, 1, 4);
-  const auto c = build_tlsh_ivf(rows.data(), rows.data() + rows.size(), 32, 1, 0);
+  const auto a = build_tlsh_ivf(rows.data(), rows.data() + rows.size(), 32, 1, 1, method);
+  const auto b = build_tlsh_ivf(rows.data(), rows.data() + rows.size(), 32, 1, 4, method);
+  const auto c = build_tlsh_ivf(rows.data(), rows.data() + rows.size(), 32, 1, 0, method);
   CHECK(a.cell_lists == b.cell_lists);
   CHECK(a.medoids == b.medoids);
   CHECK(a.radius2 == b.radius2);
@@ -103,11 +106,21 @@ TEST_CASE("tlsh_ivf_build_is_deterministic_across_threads") {
   CHECK(a.ids == b.ids);
   CHECK(a.ids == c.ids);
   CHECK(a.medoids == c.medoids);
+  CHECK(a.radius2 == c.radius2);
+  CHECK(a.list_start == c.list_start);
+
+  // the same build again
+  const auto d = build_tlsh_ivf(rows.data(), rows.data() + rows.size(), 32, 1, 1, method);
+  CHECK(a.medoids == d.medoids);
+  CHECK(a.radius2 == d.radius2);
+  CHECK(a.list_start == d.list_start);
+  CHECK(a.ids == d.ids);
 }
 
 TEST_CASE("tlsh_ivf_serialization_round_trip") {
+  const auto method = GENERATE(TlshIvfBuild::KMEANS, TlshIvfBuild::BISECT);
   const auto rows = sorted_corpus(2, 2000);
-  const auto ivf = build_tlsh_ivf(rows.data(), rows.data() + rows.size(), 32);
+  const auto ivf = build_tlsh_ivf(rows.data(), rows.data() + rows.size(), 32, 0x7175657279, 0, method);
 
   std::vector<char> buf(length_tivf_data(ivf.lists(), ivf.n));
   REQUIRE(write_tivf_data(ivf, buf.data()) == buf.size());
@@ -132,8 +145,9 @@ TEST_CASE("tlsh_ivf_serialization_round_trip") {
 }
 
 TEST_CASE("tlsh_ivf_knn_matches_brute_force") {
+  const auto method = GENERATE(TlshIvfBuild::KMEANS, TlshIvfBuild::BISECT);
   const auto rows = sorted_corpus(3, 20000);
-  const auto ivf = build_tlsh_ivf(rows.data(), rows.data() + rows.size(), 128);
+  const auto ivf = build_tlsh_ivf(rows.data(), rows.data() + rows.size(), 128, 0x7175657279, 0, method);
   const auto view = make_tlsh_ivf_view(ivf);
 
   std::mt19937 rng(11);
@@ -153,8 +167,9 @@ TEST_CASE("tlsh_ivf_knn_matches_brute_force") {
 }
 
 TEST_CASE("tlsh_ivf_knn_is_exact_beyond_144") {
+  const auto method = GENERATE(TlshIvfBuild::KMEANS, TlshIvfBuild::BISECT);
   const auto rows = sorted_corpus(4, 3000);
-  const auto ivf = build_tlsh_ivf(rows.data(), rows.data() + rows.size(), 64);
+  const auto ivf = build_tlsh_ivf(rows.data(), rows.data() + rows.size(), 64, 0x7175657279, 0, method);
   const auto view = make_tlsh_ivf_view(ivf);
 
   const auto q = perturb_tlsh_corpus(6, rows, 1, 0.2).front();
@@ -169,8 +184,9 @@ TEST_CASE("tlsh_ivf_knn_is_exact_beyond_144") {
 }
 
 TEST_CASE("tlsh_ivf_knn_edge_cases") {
+  const auto method = GENERATE(TlshIvfBuild::KMEANS, TlshIvfBuild::BISECT);
   const auto rows = sorted_corpus(8, 500);
-  const auto ivf = build_tlsh_ivf(rows.data(), rows.data() + rows.size(), 64);
+  const auto ivf = build_tlsh_ivf(rows.data(), rows.data() + rows.size(), 64, 0x7175657279, 0, method);
   const auto view = make_tlsh_ivf_view(ivf);
 
   CHECK(tlsh_knn_ivf(view, rows.data(), rows[0], 0, 100, true).empty());
