@@ -415,8 +415,8 @@ void check_tlsh_section(const Loaded& o, size_t tidx, bool want_vec, bool want_i
       }
     }
     // a merged index is coalesced at TLSH_IVF_DEFAULT_COALESCE; a fresh
-    // build need not satisfy the invariant at that threshold (BISECT
-    // coalesces at T, KMEANS list sizes are whatever the clustering gives)
+    // build is not coalesced (its list sizes are whatever the clustering
+    // gives), so it need not satisfy the invariant
     if (merged_index) {
       CHECK(tlsh_ivf_check_invariant(ivf, TLSH_IVF_DEFAULT_COALESCE));
     }

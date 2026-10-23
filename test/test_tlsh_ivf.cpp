@@ -244,24 +244,21 @@ void check_one_centers(const TlshIvf& ivf, const std::vector<TlshDigest>& rows) 
 }
 
 /*
- * List counts of a BISECT build with coalescing threshold T, F =
- * TLSH_IVF_BISECT_FLAT_MAX, per cell of m rows:
+ * List counts of a BISECT build with target list size T, F =
+ * TLSH_IVF_BISECT_FLAT_MAX, per nonempty cell of m rows:
  *
  * - The cell is split into flat nodes of s_i <= F rows, each clustered into
- *   at most ceil(s_i / T) lists, and coalescing only removes lists, so a
- *   cell has at most sum_i ceil(s_i / T) lists. A cell of m <= F rows is one
- *   flat node: at most ceil(m / T) lists.
+ *   at most ceil(s_i / T) lists (the nonempty k-means groups), so a cell has
+ *   at least one and at most sum_i ceil(s_i / T) lists. A cell of m <= F
+ *   rows is one flat node: at most ceil(m / T) lists.
  * - A larger cell is split only while a node has more than F rows, and a
  *   split leaves at least 1/8 of the node on each side (else it is a median
  *   split, half on each side), so every flat node has more than F / 8 rows
  *   and there are fewer than 8m / F of them. Since ceil(s / T) <=
  *   (s + T - 1) / T, lists * T <= m + (8m / F) (T - 1).
- * - Coalescing leaves at most one list below T / 2, so (lists - 1) (T / 2)
- *   <= m: at most 2m / T + 1 lists.
  */
 void check_bisect_shape(const TlshIvf& ivf, size_t T) {
   const uint64_t F = TLSH_IVF_BISECT_FLAT_MAX;
-  const size_t half = T / 2;
   for (uint32_t c = 0; c < TLSH_CELL_COUNT; ++c) {
     const uint32_t fl = ivf.cell_lists[c], el = ivf.cell_lists[c + 1];
     if (fl == el) {
@@ -275,7 +272,10 @@ void check_bisect_shape(const TlshIvf& ivf, size_t T) {
     else {
       CHECK(lists * T * F <= m * F + 8 * m * (T - 1));
     }
-    CHECK((lists - 1) * half <= m);
+    // every list nonempty (the nonempty k-means groups), so 1 <= lists <= m
+    for (uint32_t l = fl; l < el; ++l) {
+      CHECK(ivf.list_start[l] < ivf.list_start[l + 1]);
+    }
   }
 }
 
@@ -414,15 +414,43 @@ TEST_CASE("tlsh_ivf_bisect_fewer_bodies_than_lists") {
   }
 }
 
-TEST_CASE("tlsh_ivf_bisect_coalesces_small_lists") {
-  // lists below T / 2 are coalesced pairwise as merge_tlsh_ivf does, so the
-  // coalescing invariant holds at threshold T
-  for (const size_t T: { 16u, 32u }) {
-    const auto one = one_cell_corpus(41, 3000);
-    CHECK(tlsh_ivf_check_invariant(make_tlsh_ivf_view(build_bisect(one, T)), static_cast<uint32_t>(T)));
-    const auto many = sorted_corpus(42, 20000);
-    CHECK(tlsh_ivf_check_invariant(make_tlsh_ivf_view(build_bisect(many, T)), static_cast<uint32_t>(T)));
+TEST_CASE("tlsh_ivf_bisect_keeps_small_groups_apart") {
+  /*
+   * Four distinct bodies with 70, 70, 10 and 10 copies (differing in the
+   * checksum) in one flat node, T = 32: s = 160, k = ceil(160 / 32) = 5.
+   * k-means++ seeding finds only four distinct bodies, so four centroids,
+   * each a body, and every row sits at distance 0 from its own: four lists
+   * of 70, 70, 10 and 10 rows, each of radius 0. The two lists of 10 are far
+   * apart and stay two lists; a fresh build does not coalesce them (with
+   * coalescing below T / 2 = 16 they would be paired into one list of 20).
+   */
+  const auto bodies = one_cell_corpus(33, 4);
+  REQUIRE(bodies.size() == 4);
+  for (size_t i = 0; i < 4; ++i) {
+    for (size_t j = i + 1; j < 4; ++j) {
+      REQUIRE(tlsh_embed_body_dist2(bodies[i], bodies[j]) > 0);
+    }
   }
+  const size_t copies[4] = { 70, 70, 10, 10 };
+  std::vector<TlshDigest> rows;
+  for (size_t b = 0; b < 4; ++b) {
+    TlshDigest d = bodies[b];
+    for (size_t i = 0; i < copies[b]; ++i) {
+      d.checksum = static_cast<uint8_t>(i);
+      rows.push_back(d);
+    }
+  }
+  std::sort(rows.begin(), rows.end());
+
+  const auto ivf = build_bisect(rows, 32);
+  REQUIRE(ivf.ids.size() == rows.size());
+  REQUIRE(ivf.lists() == 4);
+  std::multiset<uint64_t> sizes;
+  for (size_t l = 0; l < 4; ++l) {
+    sizes.insert(ivf.list_start[l + 1] - ivf.list_start[l]);
+    CHECK(ivf.radius2[l] == 0);
+  }
+  CHECK(sizes == std::multiset<uint64_t>{ 10, 10, 70, 70 });
 }
 
 TEST_CASE("tlsh_ivf_bisect_list_sizes_and_counts") {
@@ -461,7 +489,6 @@ TEST_CASE("tlsh_ivf_bisect_one_large_cell") {
   const auto ivf = build_bisect(rows, 32);
   REQUIRE(ivf.ids.size() == rows.size());
   check_bisect_shape(ivf, 32);
-  CHECK(tlsh_ivf_check_invariant(make_tlsh_ivf_view(ivf), 32));
   for (size_t l = 0; l < ivf.lists(); ++l) {
     for (uint64_t i = ivf.list_start[l]; i < ivf.list_start[l + 1]; ++i) {
       REQUIRE(tlsh_embed_body_dist2(ivf.medoids[l], rows[ivf.ids[i]]) <= ivf.radius2[l]);
@@ -572,8 +599,7 @@ TEST_CASE("tlsh_ivf_bisect_assigns_to_the_nearest_mean") {
    * not: every member of P is at 4 from t, f at 3. {P + t}, {Q} is the
    * only fixed point k-means reaches from any k-means++ seeding of this
    * node (checked exhaustively over the seed pairs of nonzero weight by a
-   * model of the algorithm); nearest-medoid reaches it from none. The
-   * lists, 7 and 16 rows, have one below T / 2, so nothing is coalesced.
+   * model of the algorithm); nearest-medoid reaches it from none.
    */
   std::vector<TlshDigest> rows;
   for (size_t i = 0; i < 6; ++i) {

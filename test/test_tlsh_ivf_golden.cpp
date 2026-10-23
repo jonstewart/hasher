@@ -208,6 +208,6 @@ TEST_CASE("tlsh_ivf_golden_bisect_large") {
     const TlshIvf ivf = build_tlsh_ivf(rows.data(), rows.data() + rows.size());
     REQUIRE(max_cell_rows(ivf) > TLSH_IVF_BISECT_FLAT_MAX);
   }
-  check_golden(rows, { 10400, 337, "772bd17e536a2d8940c8b8adea1ee8a4c8b7e6fa5d960600ffa4258af88b1e86" });
+  check_golden(rows, { 10400, 343, "b1bb7a6d494bef04007ac04832f89aa00552c11f2d1eb01d6c085d5f0bfe55bb" });
   check_kmeans_exact(rows);
 }

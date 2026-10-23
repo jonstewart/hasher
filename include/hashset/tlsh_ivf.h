@@ -70,12 +70,14 @@ struct TlshIvf {
  *   integer coordinate sum and count of its members' body embeddings and
  *   distances to it are compared exactly (tlsh_ivf_nearer); O(s / T) dot
  *   products of 256 coordinates per row and round, so linear in m for a
- *   fixed TLSH_IVF_BISECT_FLAT_MAX. Lists are in depth-first order of the
- *   nodes, each with its exact 1-center as medoid (the member minimizing
- *   the max distance to the others, which minimizes radius2). Lists smaller
- *   than C / 2, C = TLSH_IVF_BISECT_COALESCE_FACTOR * T, are then coalesced
- *   pairwise exactly as merge_tlsh_ivf does, so
- *   tlsh_ivf_check_invariant(index, C) holds.
+ *   fixed TLSH_IVF_BISECT_FLAT_MAX. The lists are exactly the nonempty
+ *   k-means groups of the flat nodes, in depth-first order of the nodes,
+ *   ids ascending, each with its exact 1-center as medoid (the member
+ *   minimizing the max distance to the others, which minimizes radius2).
+ *   A fresh build does not coalesce small lists: pairing unrelated small
+ *   groups widens lists (more rows scanned per query) and costs time
+ *   quadratic in a cell's small lists. Only merge_tlsh_ivf coalesces, so
+ *   tlsh_ivf_check_invariant need not hold for a fresh build.
  */
 enum class TlshIvfBuild : uint8_t { KMEANS, BISECT };
 
@@ -109,10 +111,6 @@ static_assert(TLSH_IVF_BISECT_FLAT_MAX <= 8192);
 constexpr bool tlsh_ivf_nearer(uint64_t N_a, uint64_t n_a, uint64_t N_b, uint64_t n_b) {
   return N_a * n_b * n_b < N_b * n_a * n_a;
 }
-
-// the coalescing threshold of a BISECT build in units of T: C = factor * T,
-// so lists below T / 2 are coalesced. 0 disables coalescing.
-constexpr size_t TLSH_IVF_BISECT_COALESCE_FACTOR = 1;
 
 // Builds the index over sorted rows [beg, end) with the given method
 // (BISECT by default, KMEANS the float alternative). Cells

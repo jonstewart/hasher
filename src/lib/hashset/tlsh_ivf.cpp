@@ -691,26 +691,6 @@ CellLists bisect_cell(
     lists.push_back(std::move(l));
   }
 
-  const uint32_t half = static_cast<uint32_t>(TLSH_IVF_BISECT_COALESCE_FACTOR * target_list_size / 2);
-  if (half > 0 && lists.size() > 1) {
-    // a coalesced list keeps the better of its two medoids; give it its
-    // exact 1-center instead. A list is a coalesced one iff it is larger
-    // than the leaf its first id came from.
-    std::vector<uint32_t> leaf_of(m), leaf_size(lists.size());
-    for (size_t i = 0; i < lists.size(); ++i) {
-      leaf_size[i] = static_cast<uint32_t>(lists[i].ids.size());
-      for (const uint32_t id: lists[i].ids) {
-        leaf_of[id] = static_cast<uint32_t>(i);
-      }
-    }
-    coalesce_cell(lists, beg, half);
-    for (MergeList& l: lists) {
-      if (l.ids.size() != leaf_size[leaf_of[l.ids.front()]]) {
-        center_list(l, beg);
-      }
-    }
-  }
-
   CellLists out;
   out.ids.reserve(m);
   for (const MergeList& l: lists) {
