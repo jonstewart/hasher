@@ -4,7 +4,8 @@
  *   TLSH_BENCH_N=10000,100000 ./test/bench_tlsh
  *
  * TLSH_BENCH_LIST sets the IVF target list size (default 32) and
- * TLSH_BENCH_BUILD=kmeans|bisect the IVF build method (default kmeans).
+ * TLSH_BENCH_BUILD=bisect|kmeans the IVF build method (default bisect, the
+ * library's default; kmeans is the float alternative).
  *
  * Compares k-nearest-neighbour search strategies over a sorted corpus (as an
  * hset stores it): brute force with the reference implementation
@@ -50,7 +51,7 @@ constexpr uint32_t MAX_DISTANCE = 144;
 const size_t IVF_LIST_SIZE = std::getenv("TLSH_BENCH_LIST") ? std::stoull(std::getenv("TLSH_BENCH_LIST")) : 32;
 const TlshIvfBuild IVF_BUILD = [] {
   const char* env = std::getenv("TLSH_BENCH_BUILD");
-  const std::string s = env ? env : "kmeans";
+  const std::string s = env && *env ? env : "bisect";
   if (s == "kmeans") {
     return TlshIvfBuild::KMEANS;
   }
