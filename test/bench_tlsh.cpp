@@ -3,6 +3,9 @@
  *
  *   TLSH_BENCH_N=10000,100000 ./test/bench_tlsh
  *
+ * TLSH_BENCH_LIST sets the IVF target list size (default 32) and
+ * TLSH_BENCH_BUILD=kmeans|bisect the IVF build method (default kmeans).
+ *
  * Compares k-nearest-neighbour search strategies over a sorted corpus (as an
  * hset stores it): brute force with the reference implementation
  * (Tlsh::totalDiff), brute force with libhasher's popcount kernel, the cell
@@ -45,6 +48,17 @@ namespace {
 constexpr size_t K = 10;
 constexpr uint32_t MAX_DISTANCE = 144;
 const size_t IVF_LIST_SIZE = std::getenv("TLSH_BENCH_LIST") ? std::stoull(std::getenv("TLSH_BENCH_LIST")) : 32;
+const TlshIvfBuild IVF_BUILD = [] {
+  const char* env = std::getenv("TLSH_BENCH_BUILD");
+  const std::string s = env ? env : "kmeans";
+  if (s == "kmeans") {
+    return TlshIvfBuild::KMEANS;
+  }
+  if (s == "bisect") {
+    return TlshIvfBuild::BISECT;
+  }
+  throw std::invalid_argument("TLSH_BENCH_BUILD must be kmeans or bisect, not " + s);
+}();
 constexpr size_t NUM_QUERIES = 20;
 constexpr uint64_t CORPUS_SEED = 0x7a5b;
 constexpr uint64_t QUERY_SEED = 0x51e;
@@ -219,7 +233,9 @@ TEST_CASE("tlsh_knn") {
     const auto cells = make_tlsh_cell_index(corpus.data(), corpus.data() + corpus.size());
 
     const auto t0 = std::chrono::steady_clock::now();
-    const TlshIvf ivf = build_tlsh_ivf(corpus.data(), corpus.data() + corpus.size(), IVF_LIST_SIZE);
+    const TlshIvf ivf = build_tlsh_ivf(
+      corpus.data(), corpus.data() + corpus.size(), IVF_LIST_SIZE, 0x7175657279, 0, IVF_BUILD
+    );
     const auto t1 = std::chrono::steady_clock::now();
     const double ivf_build_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
     const TlshIvfView view = make_tlsh_ivf_view(ivf);
