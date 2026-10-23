@@ -623,7 +623,8 @@ void center_list(MergeList& l, const TlshDigest* rows) {
   l.radius2 = r2;
 }
 
-// Recursive bisection of one cell's rows [beg, end) (TlshIvfBuild::BISECT).
+// Coarse bisection and flat k-medoids of one cell's rows [beg, end)
+// (TlshIvfBuild::BISECT).
 // Row indexes written to ids are offset by base.
 CellLists bisect_cell(
   const TlshDigest* beg,

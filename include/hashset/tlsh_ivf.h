@@ -54,32 +54,28 @@ struct TlshIvf {
  *   rows, and the float accumulation order makes the index bytes depend on
  *   the compiler and platform.
  *
- * BISECT: recursive two-way splits of the cell with the integer kernel
- *   only (no floating point, so the index bytes are the same everywhere for
- *   the same rows and seed). A node of more than tlsh_ivf_bisect_leaf_max(T)
- *   rows is split around two far-apart member pivots, with a median split when one side would be tiny; O(m)
- *   kernel calls per tree level, O(m log m) per cell. Lists are the leaves in
- *   depth-first order, each with its exact 1-center as medoid (the member
- *   minimizing the max distance to the others, which minimizes radius2).
- *   Lists smaller than C / 2, C = TLSH_IVF_BISECT_COALESCE_FACTOR * T, are
- *   then coalesced pairwise exactly as merge_tlsh_ivf does, so
+ * BISECT: integer kernel only (no floating point, so the index bytes are
+ *   the same everywhere for the same rows and seed). A node of more than
+ *   TLSH_IVF_BISECT_FLAT_MAX rows is split in two around two far-apart
+ *   member pivots, with a median split when one side would be tiny; O(m)
+ *   kernel calls per level. Each remaining node of s rows is clustered flat
+ *   by k-medoids into at most ceil(s / T) lists: k-medoids++ seeding, then
+ *   up to 10 rounds of nearest-medoid assignment and re-choosing each
+ *   list's medoid as its member of least sum of squared distances; O(s / T
+ *   + T) kernel calls per row and round, so linear in m for a fixed
+ *   TLSH_IVF_BISECT_FLAT_MAX. Lists are in depth-first order of the nodes,
+ *   each with its exact 1-center as medoid (the member minimizing the max
+ *   distance to the others, which minimizes radius2). Lists smaller than
+ *   C / 2, C = TLSH_IVF_BISECT_COALESCE_FACTOR * T, are then coalesced
+ *   pairwise exactly as merge_tlsh_ivf does, so
  *   tlsh_ivf_check_invariant(index, C) holds.
  */
 enum class TlshIvfBuild : uint8_t { KMEANS, BISECT };
 
 /*
- * BISECT leaves hold at most this many rows. A node in (L, 2L] splits into
- * two in roughly (L/2, L], of mean 3L/4, so L = 4T/3 makes the mean leaf
- * about T under balanced splits. A quality knob only.
- */
-constexpr size_t tlsh_ivf_bisect_leaf_max(size_t target_list_size) {
-  return target_list_size < 2 ? 1 : 4 * target_list_size / 3;
-}
-
-/*
  * BISECT splits a node in two only while it has more than this many rows;
  * a node of at most this many rows is clustered flat by integer k-medoids
- * into ceil(s / T) lists. Larger values cut fewer families across a split
+ * into at most ceil(s / T) lists. Larger values cut fewer families across a split
  * boundary (fewer rows scanned) but cost O(s / T) kernel calls per row and
  * iteration in the flat clustering. A quality and build-cost knob only.
  */

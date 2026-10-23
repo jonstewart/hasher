@@ -281,12 +281,6 @@ void check_bisect_shape(const TlshIvf& ivf, size_t T) {
 
 } // namespace
 
-TEST_CASE("tlsh_ivf_bisect_leaf_bound") {
-  CHECK(tlsh_ivf_bisect_leaf_max(32) == 42);
-  CHECK(tlsh_ivf_bisect_leaf_max(3) == 4);
-  CHECK(tlsh_ivf_bisect_leaf_max(1) == 1);
-}
-
 TEST_CASE("tlsh_ivf_bisect_lists_are_one_centers") {
   const auto rows = one_cell_corpus(21, 2000);
   const auto ivf = build_bisect(rows, 32);
