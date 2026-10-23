@@ -175,6 +175,21 @@ class TestTlshHashset(unittest.TestCase):
         self.assertEqual(len(digests), len(ridx))
         self.assertEqual(set(range(len(digests))), set(ridx))
 
+    def test_chunk_sha256(self):
+        # the HDAT payload is the rows the test wrote, in canonical order
+        hdat = hsvectors.tlsh_sections(self.hset_path)[0].hdat
+        want = hashlib.sha256(b''.join(self.rows)).hexdigest()
+        self.assertEqual(want, hsvectors.chunk_sha256(self.hset_path, hdat))
+        # small blocks and a buffer give the same digest
+        self.assertEqual(want, hsvectors.chunk_sha256(self.hset_path, hdat, block_size=7))
+        with open(self.hset_path, 'rb') as f:
+            data = f.read()
+        self.assertEqual(want, hsvectors.chunk_sha256(data, hdat))
+        # every chunk's digest is that of its payload
+        for e in hsvectors.read_toc(data):
+            payload = data[e.offset + 12:e.offset + 12 + e.length]
+            self.assertEqual(hashlib.sha256(payload).hexdigest(), hsvectors.chunk_sha256(data, e))
+
     def test_tlsh_hex(self):
         for d in self.rows:
             hx = hsvectors.tlsh_hex(d)

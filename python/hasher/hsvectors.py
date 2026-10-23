@@ -27,6 +27,7 @@ work everywhere.
 
 from array import array
 from collections import namedtuple
+import hashlib
 import os
 import struct
 import sys
@@ -34,7 +35,7 @@ import sys
 __all__ = [
     'MAGIC', 'TLSH_DIGEST_LENGTH', 'TLSH_EMBEDDING_DIMS',
     'ChunkEntry', 'TlshSection', 'TvecHeader', 'TivfHeader',
-    'read_toc', 'chunk_name', 'hhdr_hash_type',
+    'read_toc', 'chunk_name', 'hhdr_hash_type', 'chunk_sha256',
     'tlsh_sections', 'tvec_header', 'tivf_header',
     'load_tlsh_vectors', 'load_tlsh_digests', 'load_tlsh_record_index',
     'tlsh_vector_rows', 'tlsh_digest_rows', 'tlsh_record_index_rows',
@@ -149,6 +150,33 @@ def read_toc(src):
     if not toc or toc[0] != ChunkEntry(ftoc_off, 'FTOC', flen):
         raise ValueError('FTOC does not list itself first')
     return toc
+
+
+def chunk_sha256(src, entry, block_size=1 << 20):
+    """The SHA-256 hex digest of the payload of a chunk (entry is a
+    ChunkEntry from read_toc). A file is read in blocks of block_size bytes,
+    so a chunk of any size is hashed without holding it in memory."""
+    rd = _Reader(src)
+    h = hashlib.sha256()
+    begin = entry.offset + CHUNK_HEADER_LENGTH
+    end = begin + entry.length
+    if end > rd.size:
+        raise ValueError(
+            f'{entry.length} bytes at offset {begin} run past the end of the hset ({rd.size} bytes)'
+        )
+    if rd.buf is not None:
+        h.update(rd.buf[begin:end])
+        return h.hexdigest()
+    with open(rd.path, 'rb') as f:
+        f.seek(begin)
+        left = entry.length
+        while left:
+            data = f.read(min(block_size, left))
+            if not data:
+                raise ValueError(f'short read at offset {end - left}')
+            h.update(data)
+            left -= len(data)
+    return h.hexdigest()
 
 
 def hhdr_hash_type(ctype):
