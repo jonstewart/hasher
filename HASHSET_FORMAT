@@ -110,8 +110,20 @@ a pointer to it.
 TIVF ("TIVF", 0x54495646): an inverted-file index over the body embedding
 for exact pruned kNN, see docs/TLSH_EMBEDDING.md sections 3-4. Lists are
 grouped by header cell (the same (L, Q) cells as HINT 0x7400); each cell
-is split by k-means over the body embedding into lists of about 32 rows.
-Payload:
+is partitioned into lists of about 32 rows by clustering over the body
+embedding. How a writer partitions a cell is its own choice and not part
+of the format; only the structure below (the lists of a cell partition
+it) and the medoid/radius invariant are normative, and the search is exact
+for any partition that keeps them. libhasher ships two builders: the
+default, a coarse integer bisection of large cells followed by k-means
+over exact integer centroids, and the float k-means selected by
+SFHASH_HSET_TLSH_INDEX_KMEANS (8). The default build uses no floating
+point and draws its random numbers straight from mt19937_64, so for the
+same rows its TIVF payload is meant to be byte-identical on every platform
+and compiler (test/test_tlsh_ivf_golden.cpp checks recorded digests, and
+utils/hschunks.py prints per-chunk SHA-256 to compare real files); the
+k-means build's bytes may differ between platforms (its search results do
+not). docs/TLSH_EMBEDDING.md section 3 describes both. Payload:
 
    0 version     uint16_t, 3
    2 flags       uint16_t, 0
@@ -128,12 +140,14 @@ Payload:
      ids         uint32_t[n], HDAT row indexes, ascending within a list
 
 The medoid of a list is any digest such that every member is within radius2
-of it; the search only relies on that bound. A freshly built index uses a
-member (the one nearest the k-means centroid) with the exact radius, but a
-merged index (below) may keep a medoid whose row is no longer a member, and
-a radius that is merely an upper bound. Lists are never empty, and the lists
-of a cell partition the cell's rows; in particular when a cell has a single
-list its ids are the cell's row range.
+of it; the search only relies on that bound. A freshly built index uses
+a member with the exact radius (the default build: the list's exact
+1-center, the member minimizing the maximum distance to the others; the
+k-means build: the member nearest the centroid), but a merged index (below) may keep a medoid
+whose row is no longer a member, and a radius that is merely an upper
+bound. Lists are never empty, and the lists of a cell partition the cell's
+rows; in particular when a cell has a single list its ids are the cell's
+row range.
 
 A reader checks the version, dims, length, row count, cell and list offsets;
 the ids are not validated at load time. The TIVF payload is only 4-byte
