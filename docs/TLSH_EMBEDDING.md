@@ -127,12 +127,71 @@ TLSH hash set.
 
 Lists are grouped by header cell, the same (L, Q1, Q2) cells the 0x7400
 `HINT` indexes, so the header part of the TLSH distance is exact for every
-list and the embedding only has to bound the body. Each cell is split by
-k-means over the 256-dim body embedding into about
-`ceil(cell_size / target_list_size)` lists (the writer uses a target of 32).
-Every list keeps a *medoid*, the member digest nearest the k-means centroid,
-and the squared body-embedding radius about it; both are exact integers, and
-the bound for a list costs one popcount kernel evaluation.
+list and the embedding only has to bound the body. Each cell is split into
+lists of about T = `target_list_size` rows (the writer uses T = 32) by
+clustering over the 256-dim body embedding. Every list keeps a *medoid* and
+the squared body-embedding radius about it; both are exact integers, and the
+bound for a list costs one popcount kernel evaluation. How a cell is
+partitioned is a quality knob only (rows scanned per query, build time):
+the search is exact for any partition in which every member lies within
+its list's `radius2` of the medoid.
+
+The default build (`TlshIvfBuild::BISECT`) uses integer arithmetic only:
+
+- *Coarse bisection.* A node (initially the whole cell) of more than
+  `TLSH_IVF_BISECT_FLAT_MAX` = 4096 rows is split in two around two
+  far-apart member pivots: A, the member farthest from a random member, and
+  B, the member farthest from A; each member goes to the nearer pivot (ties
+  to A). If one side would get fewer than 1/8 of the rows, the node is
+  sorted by (distance to A, row) and cut at the median instead, so every
+  split makes progress (a node of identical bodies included). O(m) kernel
+  calls per level.
+- *Flat k-means.* Each node of s ≤ 4096 rows is clustered into at most
+  ⌈s/T⌉ lists by k-means over exact integer centroids: a centroid is the
+  int32 coordinate sum S and count n of its members' {-1, 0, 1} body
+  embeddings, the squared distance of a row x to it is the rational
+  ‖n x − S‖² / n², and two such distances are compared exactly by
+  cross-multiplying in 64 bits (`tlsh_ivf_nearer`; a static_assert on
+  FLAT_MAX rules out overflow). Seeding is k-means++ with the integer
+  kernel, then at most 10 rounds of update and reassignment (ties to the
+  smaller centroid index); empty centroids are dropped. A node with fewer
+  distinct bodies than ⌈s/T⌉ gets fewer lists, so a node of identical
+  bodies is one list.
+- *Medoid.* Each list's medoid is its exact 1-center, the member whose
+  maximum distance to the other members is smallest, which minimizes
+  `radius2` among members.
+- *Coalescing.* Lists below T/2 rows are then coalesced pairwise as in a
+  merge (below), with C = T, and a coalesced list gets its exact 1-center,
+  so `tlsh_ivf_check_invariant(index, T)` holds for a fresh index.
+- *Order.* A cell's lists are emitted in depth-first order of the
+  bisection, so the lists of one subtree are contiguous; a later TIVF
+  version could add per-subtree bounds without re-clustering.
+
+The clustering work is O(m log m) kernel calls for the splits and O(s/T)
+256-coordinate dot products per row and round in the flat nodes, so close
+to linear in the cell size for a fixed FLAT_MAX; cells are clustered in
+parallel, and the result does not depend on the thread count. (The
+measured wall time is 10-18x below KMEANS's but still grows 3.2x per
+doubling of the rows from 1M to 4M, not yet explained; section 5.)
+
+**Reproducibility.** There is no floating point in the default build;
+integer sums do not depend on evaluation order, and every random draw is
+`rng() % n` straight from `std::mt19937_64` (whose sequence the C++
+standard specifies), never a standard-library distribution. For the same
+rows the `TIVF` bytes are therefore meant to be identical on every
+platform, compiler and standard library. `test/test_tlsh_ivf_golden.cpp`
+checks the SHA-256 of the serialized index of two integer-generated corpora
+against recorded values (a mismatch is a reproducibility bug, not a
+constant to update), and `utils/hschunks.py` prints each chunk's payload
+SHA-256, so two hset files built from the same rows on different machines
+can be compared chunk by chunk (whole-file hashes differ by the FHDR
+timestamp).
+
+The alternative, `TlshIvfBuild::KMEANS` (`SFHASH_HSET_TLSH_INDEX_KMEANS`),
+runs k-means++ and Lloyd iterations in float over each whole cell with
+k = ⌈m/T⌉ and takes as medoid the member nearest each centroid; it costs
+Θ(m²/T) per cell of m rows, and its bytes depend on the platform's float
+arithmetic (its search results do not).
 
 | offset | type        | field       | meaning                                                   |
 |--------|-------------|-------------|-----------------------------------------------------------|
@@ -175,8 +234,8 @@ per cell:
    a member: the search only needs every member within `radius2` of it, and
    the format allows any digest with that property.
 2. *Coalesce*, with threshold C (`coalesce_threshold`; the default is
-   2T = 64, where T = `TLSH_IVF_TARGET_LIST_SIZE` = 32 is the k-means target
-   of a fresh build). While the cell has two lists of fewer than C/2 members
+   2T = 64, where T = `TLSH_IVF_TARGET_LIST_SIZE` = 32 is the target list
+   size of a fresh build). While the cell has two lists of fewer than C/2 members
    each, the pair whose union has the smallest radius is replaced by one
    list: its medoid is whichever of the two medoids gives the smaller
    maximum distance over the union (both computed exactly with the kernel),
@@ -189,7 +248,7 @@ per cell:
 Step 1 is O(lists + ids); step 2 costs, in a cell with s lists below C/2,
 s × (rows in those lists) kernel evaluations and O(s² log s) bookkeeping (a
 heap of candidate pairs with lazy invalidation), and in practice s is a
-handful. No embedding and no k-means are involved, and the result searches
+handful. No embedding and no clustering are involved, and the result searches
 exactly like a fresh index. When one input has no `TIVF` and the output
 wants one, the merge builds it from scratch instead.
 
@@ -204,8 +263,9 @@ has fewer than C/2 members. *Proof.* Step 2 loops while two such lists
 exist, and a list leaves the candidate set exactly when a coalescing brings
 it to C/2 or more; it terminates because every iteration removes one list.
 The invariant is established by the merge for any inputs, whether or not
-they satisfy it (a fresh k-means build need not, its list sizes are whatever
-the clustering gives), so it holds for every merged index.
+they satisfy it (a fresh KMEANS build need not, its list sizes are whatever
+the clustering gives; a fresh BISECT build satisfies it at C = T, not at
+2T), so it holds for every merged index.
 `tlsh_ivf_check_invariant` tests it. ∎
 
 **Lists per cell.** Under the invariant all lists but at most one have at
@@ -213,10 +273,14 @@ least C/2 members (C even; ⌊C/2⌋ in general), so (L − 1) · C/2 ≤ m, i.e
 
   L ≤ 2m/C + 1.
 
-A fresh build splits the cell into k = ⌈m/T⌉ clusters and emits the nonempty
-ones, so it has at most ⌈m/T⌉ lists; it may have fewer. With C = 2T the
-bound reads L ≤ m/T + 1 ≤ ⌈m/T⌉ + 1: **a merged index has at most one list
-more per nonempty cell than a fresh build over the same rows**, after any
+A fresh KMEANS build splits the cell into k = ⌈m/T⌉ clusters and emits the
+nonempty ones, so it has at most ⌈m/T⌉ lists; it may have fewer. (A fresh
+BISECT build allocates ⌈s/T⌉ per flat node, which can sum to a few more
+than ⌈m/T⌉ in a cell above FLAT_MAX, then coalesces at C = T, so it obeys
+L ≤ 2m/T + 1; in practice it has fewer lists than KMEANS, 31,668 against
+36,820 at 1M rows.) With C = 2T the bound reads L ≤ m/T + 1 ≤ ⌈m/T⌉ + 1:
+**a merged index has at most one list more per nonempty cell than ⌈m/T⌉,
+the most lists a fresh KMEANS build of the same rows has**, after any
 number of incremental merges, in any order. (Cells with no rows have no
 lists in either.) With C = T the bound is L ≤ 2m/T + 1, up to twice the
 lists of a fresh build plus one; with C = 0 there is no bound, lists only
@@ -226,7 +290,7 @@ accumulate.
 `list_start` per list, 48 bytes; everything else (header, `cell_lists`,
 `ids`) depends only on n. With C = 2T, therefore,
 
-  bytes(merged) − bytes(fresh) ≤ 48 B × (nonempty cells) ≤ 48 B × 65536 = 3 MiB,
+  bytes(merged) − bytes(⌈m/T⌉ lists per cell) ≤ 48 B × (nonempty cells) ≤ 48 B × 65536 = 3 MiB,
 
 independent of n and of the number of merges.
 
@@ -234,9 +298,10 @@ independent of n and of the number of merges.
 kernel evaluation `emb_body2(q, medoid)`, per list of every visited cell and
 then scans the lists that pass. The cells visited depend only on q, tau and
 the rows, so with C = 2T the merged index costs **at most one bound
-evaluation more per visited cell** than a fresh index over the same rows.
+evaluation more per visited cell** than an index of ⌈m/T⌉ lists per cell
+over the same rows.
 The rows scanned have no formal bound: a coalesced list has the radius of a
-pair that k-means might have kept apart, so its bound can be looser than a
+pair that the clustering might have kept apart, so its bound can be looser than a
 fresh list's and more of its rows may be scanned. This is what the
 incremental-merge measurements of section 5 quantify.
 
@@ -279,7 +344,8 @@ embedding, which the index never uses: within a cell L is constant.
 ## 5. Measurements
 
 See `test/bench_tlsh.cpp` (Catch2) and `rust/tlsh-bench` (Criterion). On an
-Apple M-series core with a synthetic family corpus (k = 10, T = 144):
+Apple M-series core with a synthetic family corpus (k = 10, T = 144), with
+the float KMEANS index build (the default until 2026-10-23):
 
 | rows      | reference brute | kernel brute | cell index | IVF (this section) | IVF build |
 |-----------|-----------------|--------------|------------|--------------------|-----------|
@@ -305,10 +371,33 @@ query is dominated by scanning a few thousand rows at ~0.5 ns each plus a few
 hundred list bounds; the remaining lever is tighter lists at the cost of
 build time and index size.
 
+With the default BISECT build (`TLSH_BENCH_BUILD`, 2026-10-23, M5 Pro, a
+loaded machine on which the KMEANS figures also came out 30–40% slower than
+above, so compare within this table; `docs/BENCHMARKS.md` §9 has all of
+it):
+
+| rows      | method | IVF build | lists   | bounds/query | rows scanned/query | IVF query |
+|-----------|--------|-----------|---------|--------------|--------------------|-----------|
+| 100,000   | BISECT | 5.5 ms    | 7,788   | 346          | 6,724              | 10.2 us   |
+| 100,000   | KMEANS | 18.5 ms   | 7,853   | 352          | 6,757              | 10.2 us   |
+| 1,000,000 | BISECT | 152 ms    | 31,668  | 501          | 5,110              | 11.6 us   |
+| 1,000,000 | KMEANS | 1,587 ms  | 36,820  | 618          | 4,848              | 11.9 us   |
+| 4,000,000 | BISECT | 1,618 ms  | 76,993  | 839          | 7,501              | 22.8 us   |
+| 4,000,000 | KMEANS | 28,580 ms | 129,872 | 1,463        | 4,631              | 17.6 us   |
+
+Up to 1M rows the integer build matches k-means' pruning within 6% at a
+tenth of the build time. At 4M rows its lists average 52 rows against the
+target of 32 and it scans 62% more rows per query, an open issue
+(`docs/DESIGN_DECISIONS.md`). The intermediate designs (pure bisection:
+13,533 rows scanned at 1M; flat k-medoids: 11,627) and the BISECT T sweep
+(T = 32 still the minimum) are in `docs/BENCHMARKS.md` §9. Through the C
+API (Criterion, BISECT) the index answers in 19.5 us at 1M rows and the
+1M-row hset builds in 0.44 s instead of 1.45 s.
+
 ### Incremental merge
 
 `test/bench_hset_merge` (Catch2; `MERGE_BENCH_N`, `MERGE_BENCH_T`,
-`MERGE_BENCH_C`) measures the "Incremental merge" scheme of section 3
+`MERGE_BENCH_C`, `MERGE_BENCH_BUILD=bisect|kmeans`) measures the "Incremental merge" scheme of section 3
 against a from-scratch rebuild, and `rust/tlsh-bench` (`cargo bench --
 hset_incremental_merge`) the default configuration through the C API. The
 scenario is VirusShare's rate of ~5 samples/s: a master of N rows absorbs
@@ -321,7 +410,7 @@ row of plain I/O that kNN never reads and would hide the index cost both in
 the merge (a copy) and in the build (an embedding pass). The master and the
 batches are built with the target list size T under test; C is the
 coalescing threshold. "Rebuild" is one from-scratch build of the final rows
-through the builder (sort, dedup, parallel k-means, file write); the merge is
+through the builder (sort, dedup, parallel index build, file write); the merge is
 single-threaded. Queries: k = 10, max_distance = 144, 50 fixed queries, time
 per query and rows scanned per query on the merged and on the rebuilt index.
 The lists bound of section 3 (merged ≤ rebuilt + nonempty cells) held in
@@ -329,8 +418,8 @@ every configuration with C ≥ 2T, as proven, and in all but one of the C = T
 runs, where it is not implied (N = 100,000, T = 16); TIVF sizes are the
 payloads.
 
-Apple M5 Pro (15 cores, 48 GiB), N = 1,000,000, 8.5 minutes for the whole
-sweep. Hourly: 24 × 18,000 rows, final set 1,431,931 rows, 9,704 nonempty
+The tables below were measured with the KMEANS build. Apple M5 Pro (15
+cores, 48 GiB), N = 1,000,000, 8.5 minutes for the whole sweep. Hourly: 24 × 18,000 rows, final set 1,431,931 rows, 9,704 nonempty
 cells.
 
 | T  | C   | 24 merges | rebuild | TIVF merged | TIVF rebuilt | lists merged | lists rebuilt | kNN merged | kNN rebuilt | rows/q merged | rows/q rebuilt |
@@ -415,6 +504,36 @@ when the rows scanned per query matter, a rebuild (any merge with
 `SFHASH_HSET_TLSH_INDEX` against an input without an index, or
 `build_tlsh_ivf`) restores the fresh profile and the incremental merges
 resume from it.
+
+**With BISECT** (`MERGE_BENCH_BUILD=bisect`, the default; 2026-10-23, same
+machine but loaded, 2.9 minutes for the whole sweep against 10.3 for a
+KMEANS rerun in the same session, which reproduced the list counts and
+rows scanned above exactly with 20–35% longer times). The full table is in
+`docs/BENCHMARKS.md` §7; the default configuration, T = 32, C = 64:
+
+| batches     | method | merges  | rebuild | lists merged | lists rebuilt | kNN merged | kNN rebuilt | rows/q merged | rows/q rebuilt |
+|-------------|--------|---------|---------|--------------|---------------|------------|-------------|---------------|----------------|
+| 24 × 18,000 | BISECT | 1038 ms | 491 ms  | 39,849       | 41,274        | 37.3 us    | 30.3 us     | 16,941        | 12,986         |
+| 24 × 18,000 | KMEANS | 1040 ms | 4497 ms | 40,197       | 50,378        | 36.7 us    | 32.3 us     | 16,916        | 12,586         |
+| 7 × 432,000 | BISECT | 780 ms  | 2971 ms | 93,042       | 103,570       | 165.4 us   | 128.6 us    | 56,916        | 35,917         |
+| 7 × 432,000 | KMEANS | 881 ms  | 31.3 s  | 94,042       | 131,172       | 161.4 us   | 120.0 us    | 56,972        | 30,776         |
+
+- The rebuild of the final set costs 0.49–0.53 s at 1.43M rows and
+  2.7–3.0 s at 4.0M (KMEANS: 3.3 s and 24.5 s in the run above), so an
+  hourly rebuild now costs half the 24 merges, and the daily merges are
+  3.5x cheaper than a rebuild instead of 30x. A single merge is still at least
+  10x cheaper than a rebuild.
+- The merged indexes are nearly the same with either build (lists and rows
+  scanned within 1-2%): after 24 or 7 merges most lists come from the
+  batches and from coalescing.
+- The rebuilt BISECT index scans more rows than the KMEANS one: 3% more
+  at 1.43M, 17% more at 4.0M (35,917 against 30,776), with fewer lists
+  (103,570 against 131,172), the same shortfall `bench_tlsh` shows at 4M.
+- The lists bound held in every configuration with C ≥ 2T; at C = T it
+  failed in all six BISECT configurations (it is not implied there, and a
+  BISECT rebuild has fewer lists than ⌈m/T⌉, against which section 3
+  proves the bound). C = 2T remains the query-time minimum of the merged
+  index at T = 32.
 
 ## 6. Using the vectors from Python
 
