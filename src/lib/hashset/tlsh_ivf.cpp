@@ -469,17 +469,48 @@ CellLists bisect_cell(
   CellBisector bis(beg, m, tlsh_ivf_bisect_leaf_max(target_list_size), rng);
   const auto leaves = bis.leaves();
 
+  // the leaves, with local ids
+  std::vector<MergeList> lists;
+  lists.reserve(leaves.size());
+  for (const auto& [lo, hi]: leaves) {
+    MergeList l;
+    l.ids.assign(bis.perm().begin() + lo, bis.perm().begin() + hi);
+    std::sort(l.ids.begin(), l.ids.end());
+    const auto [med, r2] = one_center(beg, l.ids.data(), l.ids.size());
+    l.medoid = beg[med];
+    l.radius2 = r2;
+    lists.push_back(std::move(l));
+  }
+
+  const uint32_t half = static_cast<uint32_t>(TLSH_IVF_BISECT_COALESCE_FACTOR * target_list_size / 2);
+  if (half > 0 && lists.size() > 1) {
+    // a coalesced list keeps the better of its two medoids; give it its
+    // exact 1-center instead. A list is a coalesced one iff it is larger
+    // than the leaf its first id came from.
+    std::vector<uint32_t> leaf_of(m), leaf_size(lists.size());
+    for (size_t i = 0; i < lists.size(); ++i) {
+      leaf_size[i] = static_cast<uint32_t>(lists[i].ids.size());
+      for (const uint32_t id: lists[i].ids) {
+        leaf_of[id] = static_cast<uint32_t>(i);
+      }
+    }
+    coalesce_cell(lists, beg, half);
+    for (MergeList& l: lists) {
+      if (l.ids.size() != leaf_size[leaf_of[l.ids.front()]]) {
+        const auto [med, r2] = one_center(beg, l.ids.data(), l.ids.size());
+        l.medoid = beg[med];
+        l.radius2 = r2;
+      }
+    }
+  }
+
   CellLists out;
   out.ids.reserve(m);
-  std::vector<uint32_t> ids;
-  for (const auto& [lo, hi]: leaves) {
-    ids.assign(bis.perm().begin() + lo, bis.perm().begin() + hi);
-    std::sort(ids.begin(), ids.end());
-    const auto [med, r2] = one_center(beg, ids.data(), ids.size());
-    out.medoids.push_back(beg[med]);
-    out.radius2.push_back(r2);
-    out.sizes.push_back(static_cast<uint32_t>(ids.size()));
-    for (const uint32_t id: ids) {
+  for (const MergeList& l: lists) {
+    out.medoids.push_back(l.medoid);
+    out.radius2.push_back(l.radius2);
+    out.sizes.push_back(static_cast<uint32_t>(l.ids.size()));
+    for (const uint32_t id: l.ids) {
       out.ids.push_back(static_cast<uint32_t>(base + id));
     }
   }

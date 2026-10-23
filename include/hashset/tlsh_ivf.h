@@ -62,6 +62,9 @@ struct TlshIvf {
  *   kernel calls per tree level, O(m log m) per cell. Lists are the leaves in
  *   depth-first order, each with its exact 1-center as medoid (the member
  *   minimizing the max distance to the others, which minimizes radius2).
+ *   Lists smaller than C / 2, C = TLSH_IVF_BISECT_COALESCE_FACTOR * T, are
+ *   then coalesced pairwise exactly as merge_tlsh_ivf does, so
+ *   tlsh_ivf_check_invariant(index, C) holds.
  */
 enum class TlshIvfBuild : uint8_t { KMEANS, BISECT };
 
@@ -73,6 +76,10 @@ enum class TlshIvfBuild : uint8_t { KMEANS, BISECT };
 constexpr size_t tlsh_ivf_bisect_leaf_max(size_t target_list_size) {
   return target_list_size < 2 ? 1 : 4 * target_list_size / 3;
 }
+
+// the coalescing threshold of a BISECT build in units of T: C = factor * T,
+// so lists below T / 2 are coalesced. 0 disables coalescing.
+constexpr size_t TLSH_IVF_BISECT_COALESCE_FACTOR = 1;
 
 // Builds the index over sorted rows [beg, end) with the given method. Cells
 // are clustered in parallel on `threads` threads (0 = hardware concurrency);

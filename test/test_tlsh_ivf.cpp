@@ -322,3 +322,14 @@ TEST_CASE("tlsh_ivf_bisect_one_outlier_does_not_split_off_alone") {
     CHECK(ivf.list_start[l + 1] - ivf.list_start[l] >= 16);
   }
 }
+
+TEST_CASE("tlsh_ivf_bisect_coalesces_small_lists") {
+  // lists below T / 2 are coalesced pairwise as merge_tlsh_ivf does, so the
+  // coalescing invariant holds at threshold T
+  for (const size_t T: { 16u, 32u }) {
+    const auto one = one_cell_corpus(41, 3000);
+    CHECK(tlsh_ivf_check_invariant(make_tlsh_ivf_view(build_bisect(one, T)), static_cast<uint32_t>(T)));
+    const auto many = sorted_corpus(42, 20000);
+    CHECK(tlsh_ivf_check_invariant(make_tlsh_ivf_view(build_bisect(many, T)), static_cast<uint32_t>(T)));
+  }
+}
