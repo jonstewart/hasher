@@ -381,9 +381,9 @@ private:
    * lists by integer k-medoids: k-medoids++ seeding, then every member is
    * assigned to its nearest medoid (ties to the smaller medoid index), and
    * Lloyd-style rounds alternate re-choosing each list's medoid with
-   * reassignment until no assignment changes. The
-   * node's range of perm is rearranged so each nonempty list is a
-   * contiguous range, in medoid order; empty lists are dropped.
+   * reassignment until no assignment changes. The node's range of perm is
+   * rearranged so each nonempty list is a contiguous range, in medoid
+   * order; empty lists are dropped.
    */
   void cluster(size_t lo, size_t hi, std::vector<std::pair<size_t, size_t>>& out) {
     const size_t s = hi - lo;
@@ -402,19 +402,29 @@ private:
       }
     }
 
-    // stable counting sort of the node by list
-    std::vector<size_t> start(med_.size() + 1, 0);
-    for (const uint32_t l: of_) {
-      ++start[l + 1];
-    }
-    std::partial_sum(start.begin(), start.end(), start.begin());
+    group_by_list();
     for (size_t l = 0; l < med_.size(); ++l) {
-      if (start[l] != start[l + 1]) {
-        out.emplace_back(lo + start[l], lo + start[l + 1]);
+      if (start_[l] != start_[l + 1]) {
+        out.emplace_back(lo + start_[l], lo + start_[l + 1]);
       }
     }
     for (size_t i = 0; i < s; ++i) {
-      perm_[lo + start[of_[i]]++] = node_[i];
+      perm_[lo + i] = node_[members_[i]];
+    }
+  }
+
+  // members_ = the positions in node_ grouped by list, ascending within a
+  // list; list l is members_[start_[l], start_[l + 1])
+  void group_by_list() {
+    start_.assign(med_.size() + 1, 0);
+    for (const uint32_t l: of_) {
+      ++start_[l + 1];
+    }
+    std::partial_sum(start_.begin(), start_.end(), start_.begin());
+    members_.resize(node_.size());
+    std::vector<size_t> at(start_.begin(), start_.end() - 1);
+    for (size_t i = 0; i < node_.size(); ++i) {
+      members_[at[of_[i]]++] = static_cast<uint32_t>(i);
     }
   }
 
@@ -466,30 +476,18 @@ private:
    * list.
    */
   void update_medoids() {
-    const size_t k = med_.size();
-    std::vector<size_t> start(k + 1, 0);
-    for (const uint32_t l: of_) {
-      ++start[l + 1];
-    }
-    std::partial_sum(start.begin(), start.end(), start.begin());
-    members_.resize(node_.size());
-    {
-      std::vector<size_t> at(start.begin(), start.end() - 1);
-      for (size_t i = 0; i < node_.size(); ++i) {
-        members_[at[of_[i]]++] = static_cast<uint32_t>(i);
-      }
-    }
-    for (size_t l = 0; l < k; ++l) {
-      if (start[l] == start[l + 1]) {
+    group_by_list();
+    for (size_t l = 0; l < med_.size(); ++l) {
+      if (start_[l] == start_[l + 1]) {
         continue;
       }
       uint32_t best = med_[l];
       uint64_t best_s = UINT64_MAX;
-      for (size_t a = start[l]; a < start[l + 1]; ++a) {
+      for (size_t a = start_[l]; a < start_[l + 1]; ++a) {
         const uint32_t c = members_[a];
         const TlshBodyQuery q(rows_[node_[c]]);
         uint64_t sum = 0;
-        for (size_t b = start[l]; b < start[l + 1] && sum <= best_s; ++b) {
+        for (size_t b = start_[l]; b < start_[l + 1] && sum <= best_s; ++b) {
           sum += q.emb_body(rows_[node_[members_[b]]]);
         }
         if (sum < best_s || (sum == best_s && node_[c] < node_[best])) {
@@ -592,8 +590,9 @@ private:
   std::mt19937_64& rng_;
   // scratch for cluster(): the node's members, the medoids (positions in
   // node_), each member's squared distance to the nearest seed so far,
-  // each member's list, and the members grouped by list
+  // each member's list, and the members grouped by list (from start_)
   std::vector<uint32_t> node_, med_, best_, of_, members_;
+  std::vector<size_t> start_;
 };
 
 /*
