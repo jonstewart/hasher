@@ -9,7 +9,7 @@
 #include "tlsh_embedding.h"
 #include "hashset/tlsh_search.h"
 
-// TIVF lists hold about this many rows each: the k-means target of
+// TIVF lists hold about this many rows each: the clustering target of
 // build_tlsh_ivf (T in docs/TLSH_EMBEDDING.md)
 constexpr size_t TLSH_IVF_TARGET_LIST_SIZE = 32;
 
@@ -22,12 +22,12 @@ constexpr uint32_t TLSH_IVF_DEFAULT_COALESCE = 2 * TLSH_IVF_TARGET_LIST_SIZE;
  * See docs/TLSH_EMBEDDING.md section 3.
  *
  * Rows are grouped by header cell (L, Q1, Q2), which is contiguous in
- * canonical order, and each cell is split by k-means over the 256-dim body
- * embedding into about cell_size / target_list_size lists. The header part of
- * the TLSH distance is therefore exact per cell, and the embedding is used
- * where it carries information: as a lower bound on the body cost. Each list
- * keeps a medoid (the member nearest the k-means centroid) and the squared
- * embedding radius about it, so the bound for a list is one popcount kernel
+ * canonical order, and each cell is split by clustering over the 256-dim
+ * body embedding (TlshIvfBuild) into about cell_size / target_list_size
+ * lists. The header part of the TLSH distance is therefore exact per cell,
+ * and the embedding is used where it carries information: as a lower bound
+ * on the body cost. Each list keeps a medoid (a member central to the list)
+ * and the squared embedding radius about it, so the bound for a list is one popcount kernel
  * evaluation (tlsh_embed_body_dist2) and a triangle inequality. The search
  * is exact for every distance, with or without the length term.
  */
@@ -47,6 +47,8 @@ struct TlshIvf {
  * of a list lies within the list's radius2 of its medoid, computed with the
  * integer kernel, so the search is exact; the method changes only the
  * partition, hence the rows a query scans and the build time.
+ *
+ * BISECT is the default and KMEANS the float alternative.
  *
  * KMEANS: k-means++ seeding and Lloyd iterations in float over the cell's
  *   256-dim body embeddings, k = ceil(m / T) centroids; the medoid of a list
@@ -103,7 +105,8 @@ constexpr bool tlsh_ivf_nearer(uint64_t N_a, uint64_t n_a, uint64_t N_b, uint64_
 // so lists below T / 2 are coalesced. 0 disables coalescing.
 constexpr size_t TLSH_IVF_BISECT_COALESCE_FACTOR = 1;
 
-// Builds the index over sorted rows [beg, end) with the given method. Cells
+// Builds the index over sorted rows [beg, end) with the given method
+// (BISECT by default, KMEANS the float alternative). Cells
 // are clustered in parallel on `threads` threads (0 = hardware concurrency);
 // the result does not depend on the thread count.
 TlshIvf build_tlsh_ivf(
@@ -112,7 +115,7 @@ TlshIvf build_tlsh_ivf(
   size_t target_list_size = TLSH_IVF_TARGET_LIST_SIZE,
   uint64_t seed = 0x7175657279,
   unsigned threads = 0,
-  TlshIvfBuild method = TlshIvfBuild::KMEANS
+  TlshIvfBuild method = TlshIvfBuild::BISECT
 );
 
 // Read-only view over a serialized TIVF payload (pointers into mapped memory).

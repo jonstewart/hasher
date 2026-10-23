@@ -608,3 +608,22 @@ TEST_CASE("tlsh_ivf_bisect_assigns_to_the_nearest_mean") {
     }
   }
 }
+
+TEST_CASE("tlsh_ivf_default_method_is_bisect") {
+  // one cell of 2000 rows, so the two methods give different lists for
+  // the same rows and seed
+  const auto rows = one_cell_corpus(3, 2000);
+  const auto dflt = build_tlsh_ivf(rows.data(), rows.data() + rows.size());
+  const auto bisect = build_tlsh_ivf(
+    rows.data(), rows.data() + rows.size(), TLSH_IVF_TARGET_LIST_SIZE, 0x7175657279, 0, TlshIvfBuild::BISECT
+  );
+  const auto kmeans = build_tlsh_ivf(
+    rows.data(), rows.data() + rows.size(), TLSH_IVF_TARGET_LIST_SIZE, 0x7175657279, 0, TlshIvfBuild::KMEANS
+  );
+  REQUIRE(bisect.ids != kmeans.ids);
+  CHECK(dflt.cell_lists == bisect.cell_lists);
+  CHECK(dflt.medoids == bisect.medoids);
+  CHECK(dflt.radius2 == bisect.radius2);
+  CHECK(dflt.list_start == bisect.list_start);
+  CHECK(dflt.ids == bisect.ids);
+}
