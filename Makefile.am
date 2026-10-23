@@ -172,6 +172,7 @@ test_test_SOURCES = \
 	test/test_tlsh_embedding.cpp \
 	test/test_tlsh_header_order.cpp \
 	test/test_tlsh_ivf.cpp \
+	test/test_tlsh_ivf_golden.cpp \
 	test/test_tlsh_corpus.cpp \
 	test/test_util.cpp \
 	test/tlsh_corpus.cpp
