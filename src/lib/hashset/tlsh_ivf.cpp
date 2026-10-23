@@ -201,6 +201,136 @@ CellLists cluster_cell(
   return out;
 }
 
+// a list of one cell while it is merged
+struct MergeList {
+  TlshDigest medoid;
+  uint32_t radius2;
+  std::vector<uint32_t> ids; // output rows, ascending
+};
+
+/*
+ * Coalesces the lists of one cell in place (see merge_tlsh_ivf): while two
+ * lists have fewer than half members each, the pair whose union has the
+ * smallest exact radius about one of the two medoids becomes one list.
+ * Pairs are ranked through a heap with lazy invalidation, so a cell with s
+ * small lists costs O(s^2 log s) plus s * (rows in small lists) kernel
+ * evaluations. Emptied lists are removed; the order of the rest is kept.
+ */
+void coalesce_cell(std::vector<MergeList>& lists, const TlshDigest* rows, uint32_t half) {
+  std::vector<size_t> small; // indexes into lists
+  for (size_t i = 0; i < lists.size(); ++i) {
+    if (lists[i].ids.size() < half) {
+      small.push_back(i);
+    }
+  }
+  const size_t s = small.size();
+  if (s < 2) {
+    return;
+  }
+
+  // dist[i * s + j]: max squared distance from the medoid of small list i
+  // over the members of small list j; exact, including the diagonal
+  std::vector<uint32_t> dist(s * s);
+  for (size_t i = 0; i < s; ++i) {
+    const TlshBodyQuery q(lists[small[i]].medoid);
+    for (size_t j = 0; j < s; ++j) {
+      uint32_t r = 0;
+      for (const uint32_t id: lists[small[j]].ids) {
+        r = std::max(r, q.emb_body(rows[id]));
+      }
+      dist[i * s + j] = r;
+    }
+  }
+
+  // candidate pair: (radius of the union, i, j, versions of i and j when
+  // pushed); the smallest radius first, ties by (i, j)
+  struct Cand {
+    uint32_t radius2;
+    uint32_t i, j;
+    uint32_t vi, vj;
+    bool operator>(const Cand& o) const {
+      return std::tie(radius2, i, j) > std::tie(o.radius2, o.i, o.j);
+    }
+  };
+  std::priority_queue<Cand, std::vector<Cand>, std::greater<Cand>> heap;
+
+  std::vector<uint32_t> version(s, 0);
+  std::vector<bool> alive(s, true); // still a small list
+  size_t alive_count = s;
+
+  // radius of the union of i and j about the medoid of i
+  const auto about = [&](size_t i, size_t j) {
+    return std::max(dist[i * s + i], dist[i * s + j]);
+  };
+  const auto push = [&](size_t i, size_t j) {
+    heap.push({
+      std::min(about(i, j), about(j, i)),
+      static_cast<uint32_t>(i), static_cast<uint32_t>(j),
+      version[i], version[j]
+    });
+  };
+
+  for (size_t i = 0; i < s; ++i) {
+    for (size_t j = i + 1; j < s; ++j) {
+      push(i, j);
+    }
+  }
+
+  while (alive_count >= 2 && !heap.empty()) {
+    const Cand c = heap.top();
+    heap.pop();
+    if (!alive[c.i] || !alive[c.j] || version[c.i] != c.vi || version[c.j] != c.vj) {
+      continue; // stale
+    }
+    const size_t i = c.i, j = c.j;
+    MergeList& a = lists[small[i]];
+    MergeList& b = lists[small[j]];
+
+    // the medoid giving the smaller radius; a's on ties
+    const bool keep_a = about(i, j) <= about(j, i);
+
+    std::vector<uint32_t> u;
+    u.reserve(a.ids.size() + b.ids.size());
+    std::merge(a.ids.begin(), a.ids.end(), b.ids.begin(), b.ids.end(), std::back_inserter(u));
+    a.ids = std::move(u);
+    if (!keep_a) {
+      a.medoid = b.medoid;
+    }
+    a.radius2 = c.radius2;
+    b.ids.clear();
+    b.ids.shrink_to_fit();
+
+    // distances from the merged list's medoid, and to its members
+    for (size_t k = 0; k < s; ++k) {
+      if (!keep_a) {
+        dist[i * s + k] = dist[j * s + k];
+      }
+      dist[k * s + i] = std::max(dist[k * s + i], dist[k * s + j]);
+    }
+    dist[i * s + i] = c.radius2;
+
+    alive[j] = false;
+    --alive_count;
+    ++version[i];
+    if (a.ids.size() >= half) {
+      alive[i] = false;
+      --alive_count;
+    }
+    else {
+      for (size_t k = 0; k < s; ++k) {
+        if (k != i && alive[k]) {
+          push(std::min(i, k), std::max(i, k));
+        }
+      }
+    }
+  }
+
+  lists.erase(
+    std::remove_if(lists.begin(), lists.end(), [](const MergeList& l) { return l.ids.empty(); }),
+    lists.end()
+  );
+}
+
 // a pivot split leaving fewer than 1 / BISECT_MIN_SIDE_DIVISOR of a node's
 // rows on one side is replaced by a median split; this bounds the depth by
 // log_{8/7} m and guarantees termination. A quality knob only.
@@ -462,13 +592,6 @@ constexpr uint16_t TIVF_VERSION = 3;
 
 namespace {
 
-// a list of one cell while it is merged
-struct MergeList {
-  TlshDigest medoid;
-  uint32_t radius2;
-  std::vector<uint32_t> ids; // output rows, ascending
-};
-
 // exact squared body-embedding radius about m over the rows ids
 uint32_t radius_about(const TlshDigest& m, const std::vector<uint32_t>& ids, const TlshDigest* rows) {
   const TlshBodyQuery q(m);
@@ -477,129 +600,6 @@ uint32_t radius_about(const TlshDigest& m, const std::vector<uint32_t>& ids, con
     r = std::max(r, q.emb_body(rows[id]));
   }
   return r;
-}
-
-/*
- * Coalesces the lists of one cell in place (see merge_tlsh_ivf): while two
- * lists have fewer than half members each, the pair whose union has the
- * smallest exact radius about one of the two medoids becomes one list.
- * Pairs are ranked through a heap with lazy invalidation, so a cell with s
- * small lists costs O(s^2 log s) plus s * (rows in small lists) kernel
- * evaluations. Emptied lists are removed; the order of the rest is kept.
- */
-void coalesce_cell(std::vector<MergeList>& lists, const TlshDigest* rows, uint32_t half) {
-  std::vector<size_t> small; // indexes into lists
-  for (size_t i = 0; i < lists.size(); ++i) {
-    if (lists[i].ids.size() < half) {
-      small.push_back(i);
-    }
-  }
-  const size_t s = small.size();
-  if (s < 2) {
-    return;
-  }
-
-  // dist[i * s + j]: max squared distance from the medoid of small list i
-  // over the members of small list j; exact, including the diagonal
-  std::vector<uint32_t> dist(s * s);
-  for (size_t i = 0; i < s; ++i) {
-    const TlshBodyQuery q(lists[small[i]].medoid);
-    for (size_t j = 0; j < s; ++j) {
-      uint32_t r = 0;
-      for (const uint32_t id: lists[small[j]].ids) {
-        r = std::max(r, q.emb_body(rows[id]));
-      }
-      dist[i * s + j] = r;
-    }
-  }
-
-  // candidate pair: (radius of the union, i, j, versions of i and j when
-  // pushed); the smallest radius first, ties by (i, j)
-  struct Cand {
-    uint32_t radius2;
-    uint32_t i, j;
-    uint32_t vi, vj;
-    bool operator>(const Cand& o) const {
-      return std::tie(radius2, i, j) > std::tie(o.radius2, o.i, o.j);
-    }
-  };
-  std::priority_queue<Cand, std::vector<Cand>, std::greater<Cand>> heap;
-
-  std::vector<uint32_t> version(s, 0);
-  std::vector<bool> alive(s, true); // still a small list
-  size_t alive_count = s;
-
-  // radius of the union of i and j about the medoid of i
-  const auto about = [&](size_t i, size_t j) {
-    return std::max(dist[i * s + i], dist[i * s + j]);
-  };
-  const auto push = [&](size_t i, size_t j) {
-    heap.push({
-      std::min(about(i, j), about(j, i)),
-      static_cast<uint32_t>(i), static_cast<uint32_t>(j),
-      version[i], version[j]
-    });
-  };
-
-  for (size_t i = 0; i < s; ++i) {
-    for (size_t j = i + 1; j < s; ++j) {
-      push(i, j);
-    }
-  }
-
-  while (alive_count >= 2 && !heap.empty()) {
-    const Cand c = heap.top();
-    heap.pop();
-    if (!alive[c.i] || !alive[c.j] || version[c.i] != c.vi || version[c.j] != c.vj) {
-      continue; // stale
-    }
-    const size_t i = c.i, j = c.j;
-    MergeList& a = lists[small[i]];
-    MergeList& b = lists[small[j]];
-
-    // the medoid giving the smaller radius; a's on ties
-    const bool keep_a = about(i, j) <= about(j, i);
-
-    std::vector<uint32_t> u;
-    u.reserve(a.ids.size() + b.ids.size());
-    std::merge(a.ids.begin(), a.ids.end(), b.ids.begin(), b.ids.end(), std::back_inserter(u));
-    a.ids = std::move(u);
-    if (!keep_a) {
-      a.medoid = b.medoid;
-    }
-    a.radius2 = c.radius2;
-    b.ids.clear();
-    b.ids.shrink_to_fit();
-
-    // distances from the merged list's medoid, and to its members
-    for (size_t k = 0; k < s; ++k) {
-      if (!keep_a) {
-        dist[i * s + k] = dist[j * s + k];
-      }
-      dist[k * s + i] = std::max(dist[k * s + i], dist[k * s + j]);
-    }
-    dist[i * s + i] = c.radius2;
-
-    alive[j] = false;
-    --alive_count;
-    ++version[i];
-    if (a.ids.size() >= half) {
-      alive[i] = false;
-      --alive_count;
-    }
-    else {
-      for (size_t k = 0; k < s; ++k) {
-        if (k != i && alive[k]) {
-          push(std::min(i, k), std::max(i, k));
-        }
-      }
-    }
-  }
-
-  lists.erase(
-    std::remove_if(lists.begin(), lists.end(), [](const MergeList& l) { return l.ids.empty(); }),
-    lists.end()
-  );
 }
 
 } // namespace
