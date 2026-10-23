@@ -160,19 +160,27 @@ The default build (`TlshIvfBuild::BISECT`) uses integer arithmetic only:
 - *Medoid.* Each list's medoid is its exact 1-center, the member whose
   maximum distance to the other members is smallest, which minimizes
   `radius2` among members.
-- *Coalescing.* Lists below T/2 rows are then coalesced pairwise as in a
-  merge (below), with C = T, and a coalesced list gets its exact 1-center,
-  so `tlsh_ivf_check_invariant(index, T)` holds for a fresh index.
+- *No coalescing.* The lists are exactly the nonempty k-means groups of
+  the flat nodes; small lists are not coalesced (only a merge coalesces,
+  below), so a fresh index need not satisfy `tlsh_ivf_check_invariant`.
+  Coalescing at C = T in the fresh build was tried and rejected: at 4M
+  rows it paired unrelated small families into wide lists (76,993 lists
+  and 7,501 rows scanned per query against 129,948 and 4,752 without it)
+  and cost time quadratic in a cell's small lists.
 - *Order.* A cell's lists are emitted in depth-first order of the
-  bisection, so the lists of one subtree are contiguous; a later TIVF
+  bisection, ids ascending within a list, so the lists of one subtree are contiguous; a later TIVF
   version could add per-subtree bounds without re-clustering.
 
-The clustering work is O(m log m) kernel calls for the splits and O(s/T)
-256-coordinate dot products per row and round in the flat nodes, so close
-to linear in the cell size for a fixed FLAT_MAX; cells are clustered in
-parallel, and the result does not depend on the thread count. (The
-measured wall time is 10-18x below KMEANS's but still grows 3.2x per
-doubling of the rows from 1M to 4M, not yet explained; section 5.)
+The clustering work is O(m log m) kernel calls for the splits and ⌈s/T⌉
+256-coordinate dot products per row and round in a flat node of s rows;
+cells are clustered in parallel, and the result does not depend on the
+thread count. The cost per row therefore grows with the cell size until
+the cells exceed FLAT_MAX (at most 128 centroids at T = 32), and is
+constant after that. On the synthetic corpus, whose ~9,000-9,600 cells
+fill linearly with n, the row-weighted mean of min(⌈m/T⌉, 128) is 21.2,
+39.8 and 63.5 at 1M, 2M and 4M rows, and the build took 136, 437 and
+1,264 ms (3.2x and 2.9x per doubling; KMEANS: 1,481 ms and 25.7 s at 1M
+and 4M); section 5.
 
 **Reproducibility.** There is no floating point in the default build;
 integer sums do not depend on evaluation order, and every random draw is
@@ -263,9 +271,9 @@ has fewer than C/2 members. *Proof.* Step 2 loops while two such lists
 exist, and a list leaves the candidate set exactly when a coalescing brings
 it to C/2 or more; it terminates because every iteration removes one list.
 The invariant is established by the merge for any inputs, whether or not
-they satisfy it (a fresh KMEANS build need not, its list sizes are whatever
-the clustering gives; a fresh BISECT build satisfies it at C = T, not at
-2T), so it holds for every merged index.
+they satisfy it (a fresh build need not, with either method: its list
+sizes are whatever the clustering gives), so it holds for every merged
+index.
 `tlsh_ivf_check_invariant` tests it. ∎
 
 **Lists per cell.** Under the invariant all lists but at most one have at
@@ -275,10 +283,11 @@ least C/2 members (C even; ⌊C/2⌋ in general), so (L − 1) · C/2 ≤ m, i.e
 
 A fresh KMEANS build splits the cell into k = ⌈m/T⌉ clusters and emits the
 nonempty ones, so it has at most ⌈m/T⌉ lists; it may have fewer. (A fresh
-BISECT build allocates ⌈s/T⌉ per flat node, which can sum to a few more
-than ⌈m/T⌉ in a cell above FLAT_MAX, then coalesces at C = T, so it obeys
-L ≤ 2m/T + 1; in practice it has fewer lists than KMEANS, 31,668 against
-36,820 at 1M rows.) With C = 2T the bound reads L ≤ m/T + 1 ≤ ⌈m/T⌉ + 1:
+BISECT build emits the nonempty groups of ⌈s/T⌉ centroids per flat node,
+so at most ⌈m/T⌉ lists in a cell of at most FLAT_MAX rows and at most
+Σ ⌈s_i/T⌉, a few more than ⌈m/T⌉, above it; in practice as many as
+KMEANS, 36,823 against 36,820 at 1M rows and 129,948 against 129,872 at
+4M.) With C = 2T the bound reads L ≤ m/T + 1 ≤ ⌈m/T⌉ + 1:
 **a merged index has at most one list more per nonempty cell than ⌈m/T⌉,
 the most lists a fresh KMEANS build of the same rows has**, after any
 number of incremental merges, in any order. (Cells with no rows have no
@@ -371,28 +380,30 @@ query is dominated by scanning a few thousand rows at ~0.5 ns each plus a few
 hundred list bounds; the remaining lever is tighter lists at the cost of
 build time and index size.
 
-With the default BISECT build (`TLSH_BENCH_BUILD`, 2026-10-23, M5 Pro, a
-loaded machine on which the KMEANS figures also came out 30–40% slower than
-above, so compare within this table; `docs/BENCHMARKS.md` §9 has all of
-it):
+With the default BISECT build (`TLSH_BENCH_BUILD`, 2026-10-23, M5 Pro,
+second round, after the fresh build stopped coalescing; a quieter machine
+than the first round's but short of memory; `docs/BENCHMARKS.md` §9 has
+all of it):
 
 | rows      | method | IVF build | lists   | bounds/query | rows scanned/query | IVF query |
 |-----------|--------|-----------|---------|--------------|--------------------|-----------|
-| 100,000   | BISECT | 5.5 ms    | 7,788   | 346          | 6,724              | 10.2 us   |
-| 100,000   | KMEANS | 18.5 ms   | 7,853   | 352          | 6,757              | 10.2 us   |
-| 1,000,000 | BISECT | 152 ms    | 31,668  | 501          | 5,110              | 11.6 us   |
-| 1,000,000 | KMEANS | 1,587 ms  | 36,820  | 618          | 4,848              | 11.9 us   |
-| 4,000,000 | BISECT | 1,618 ms  | 76,993  | 839          | 7,501              | 22.8 us   |
-| 4,000,000 | KMEANS | 28,580 ms | 129,872 | 1,463        | 4,631              | 17.6 us   |
+| 1,000,000 | BISECT | 136 ms    | 36,823  | 618          | 4,659              | 8.3 us    |
+| 1,000,000 | KMEANS | 1,481 ms  | 36,820  | 618          | 4,848              | 8.4 us    |
+| 2,000,000 | BISECT | 437 ms    | 67,728  | 866          | 4,557              | 10.1 us   |
+| 4,000,000 | BISECT | 1,264 ms  | 129,948 | 1,464        | 4,752              | 14.2 us   |
+| 4,000,000 | KMEANS | 25,743 ms | 129,872 | 1,463        | 4,631              | 11.9 us   |
 
-Up to 1M rows the integer build matches k-means' pruning within 6% at a
-tenth of the build time. At 4M rows its lists average 52 rows against the
-target of 32 and it scans 62% more rows per query, an open issue
-(`docs/DESIGN_DECISIONS.md`). The intermediate designs (pure bisection:
-13,533 rows scanned at 1M; flat k-medoids: 11,627) and the BISECT T sweep
-(T = 32 still the minimum) are in `docs/BENCHMARKS.md` §9. Through the C
-API (Criterion, BISECT) the index answers in 19.5 us at 1M rows and the
-1M-row hset builds in 0.44 s instead of 1.45 s.
+The integer build has k-means' lists at every size and scans 4% fewer
+rows at 1M and 2.6% more at 4M, at a tenth to a twentieth of the build
+time. Its 4M query time came out 13.5-14.2 us against 11.9 us in the
+summary's minimum and 11.3-11.5 against 11.0 us in Catch2's mean, so the
+gap is mostly noise. The first BISECT round coalesced small lists in the
+fresh build and had 31,668 / 76,993 lists and 5,110 / 7,501 rows scanned
+at 1M / 4M; that was rejected (section 3). The intermediate designs (pure
+bisection: 13,533 rows scanned at 1M; flat k-medoids: 11,627) and the
+BISECT T sweep (T = 16 and 32 within 4%) are in `docs/BENCHMARKS.md` §9.
+Through the C API (Criterion, BISECT) the index answers in 17.6 us at 1M
+rows and the 1M-row hset builds in 0.43 s instead of 1.45 s.
 
 ### Incremental merge
 
@@ -505,35 +516,36 @@ when the rows scanned per query matter, a rebuild (any merge with
 `build_tlsh_ivf`) restores the fresh profile and the incremental merges
 resume from it.
 
-**With BISECT** (`MERGE_BENCH_BUILD=bisect`, the default; 2026-10-23, same
-machine but loaded, 2.9 minutes for the whole sweep against 10.3 for a
-KMEANS rerun in the same session, which reproduced the list counts and
-rows scanned above exactly with 20–35% longer times). The full table is in
-`docs/BENCHMARKS.md` §7; the default configuration, T = 32, C = 64:
+**With BISECT** (`MERGE_BENCH_BUILD=bisect`, the default; 2026-10-23,
+second round, the fresh build no longer coalescing; the KMEANS rows are a
+rerun of the first BISECT round, on a loaded machine, which reproduced the
+list counts and rows scanned above exactly with 20–35% longer times). The
+full table is in `docs/BENCHMARKS.md` §7; the default configuration,
+T = 32, C = 64:
 
 | batches     | method | merges  | rebuild | lists merged | lists rebuilt | kNN merged | kNN rebuilt | rows/q merged | rows/q rebuilt |
 |-------------|--------|---------|---------|--------------|---------------|------------|-------------|---------------|----------------|
-| 24 × 18,000 | BISECT | 1038 ms | 491 ms  | 39,849       | 41,274        | 37.3 us    | 30.3 us     | 16,941        | 12,986         |
+| 24 × 18,000 | BISECT | 995 ms  | 440 ms  | 40,094       | 50,381        | 29.6 us    | 28.9 us     | 16,855        | 12,386         |
 | 24 × 18,000 | KMEANS | 1040 ms | 4497 ms | 40,197       | 50,378        | 36.7 us    | 32.3 us     | 16,916        | 12,586         |
-| 7 × 432,000 | BISECT | 780 ms  | 2971 ms | 93,042       | 103,570       | 165.4 us   | 128.6 us    | 56,916        | 35,917         |
+| 7 × 432,000 | BISECT | 782 ms  | 2525 ms | 93,946       | 131,274       | 127.6 us   | 94.7 us     | 56,676        | 31,668         |
 | 7 × 432,000 | KMEANS | 881 ms  | 31.3 s  | 94,042       | 131,172       | 161.4 us   | 120.0 us    | 56,972        | 30,776         |
 
-- The rebuild of the final set costs 0.49–0.53 s at 1.43M rows and
-  2.7–3.0 s at 4.0M (KMEANS: 3.3 s and 24.5 s in the run above), so an
-  hourly rebuild now costs half the 24 merges, and the daily merges are
-  3.5x cheaper than a rebuild instead of 30x. A single merge is still at least
-  10x cheaper than a rebuild.
+- The rebuild of the final set costs 0.44–0.45 s at 1.43M rows and
+  2.2–2.5 s at 4.0M (KMEANS: 3.3 s and 24.5 s in the run above), so an
+  hourly rebuild costs less than half the 24 merges, and the daily merges
+  are 3x cheaper than a rebuild instead of 30x. A single merge is still
+  about 10x cheaper than a rebuild.
 - The merged indexes are nearly the same with either build (lists and rows
-  scanned within 1-2%): after 24 or 7 merges most lists come from the
+  scanned within 1%): after 24 or 7 merges most lists come from the
   batches and from coalescing.
-- The rebuilt BISECT index scans more rows than the KMEANS one: 3% more
-  at 1.43M, 17% more at 4.0M (35,917 against 30,776), with fewer lists
-  (103,570 against 131,172), the same shortfall `bench_tlsh` shows at 4M.
-- The lists bound held in every configuration with C ≥ 2T; at C = T it
-  failed in all six BISECT configurations (it is not implied there, and a
-  BISECT rebuild has fewer lists than ⌈m/T⌉, against which section 3
-  proves the bound). C = 2T remains the query-time minimum of the merged
-  index at T = 32.
+- The rebuilt BISECT index has KMEANS's list counts (50,381 against
+  50,378 at 1.43M, 131,274 against 131,172 at 4.0M) and scans 1.6% fewer
+  rows at 1.43M and 2.9% more at 4.0M (31,668 against 30,776).
+- The lists bound (merged ≤ rebuilt + nonempty cells) held in every
+  configuration with C > 0, C = T included. (In the first BISECT round,
+  whose fresh build coalesced and so had fewer lists than ⌈m/T⌉, it failed
+  in all six C = T configurations.) C = 2T remains the query-time minimum
+  of the merged index at T = 32 (29.6 us; C = T 32.3, 4T 34.2).
 
 ## 6. Using the vectors from Python
 
