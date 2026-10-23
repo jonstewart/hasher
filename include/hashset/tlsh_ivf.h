@@ -76,6 +76,15 @@ constexpr size_t tlsh_ivf_bisect_leaf_max(size_t target_list_size) {
   return target_list_size < 2 ? 1 : 4 * target_list_size / 3;
 }
 
+/*
+ * BISECT splits a node in two only while it has more than this many rows;
+ * a node of at most this many rows is clustered flat by integer k-medoids
+ * into ceil(s / T) lists. Larger values cut fewer families across a split
+ * boundary (fewer rows scanned) but cost O(s / T) kernel calls per row and
+ * iteration in the flat clustering. A quality and build-cost knob only.
+ */
+constexpr size_t TLSH_IVF_BISECT_FLAT_MAX = 4096;
+
 // the coalescing threshold of a BISECT build in units of T: C = factor * T,
 // so lists below T / 2 are coalesced. 0 disables coalescing.
 constexpr size_t TLSH_IVF_BISECT_COALESCE_FACTOR = 1;

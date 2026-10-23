@@ -337,15 +337,17 @@ void coalesce_cell(std::vector<MergeList>& lists, const TlshDigest* rows, uint32
 constexpr size_t BISECT_MIN_SIDE_DIVISOR = 8;
 
 /*
- * The recursive two-way partition of one cell's rows for bisect_cell.
- * perm holds the cell's local row indexes; a node is a range [lo, hi) of
- * perm, split in place, so depth-first recursion leaves the leaves
- * contiguous and in depth-first order. Integer kernel only.
+ * The partition of one cell's rows for bisect_cell: recursive two-way
+ * splits while a node has more than flat_max rows, then a flat clustering
+ * of each node into ceil(s / T) lists. perm holds the cell's local row
+ * indexes; a node is a range [lo, hi) of perm, rearranged in place, so the
+ * lists are contiguous ranges of perm in depth-first order, the lists of
+ * one flat node together. Integer kernel only.
  */
 class CellBisector {
 public:
-  CellBisector(const TlshDigest* rows, size_t m, size_t leaf_max, std::mt19937_64& rng):
-    rows_(rows), perm_(m), leaf_max_(leaf_max), rng_(rng)
+  CellBisector(const TlshDigest* rows, size_t m, size_t target_list_size, size_t flat_max, std::mt19937_64& rng):
+    rows_(rows), perm_(m), target_(target_list_size), flat_max_(flat_max), rng_(rng)
   {
     std::iota(perm_.begin(), perm_.end(), 0u);
   }
@@ -361,13 +363,114 @@ public:
 
 private:
   void split(size_t lo, size_t hi, std::vector<std::pair<size_t, size_t>>& out) {
-    if (hi - lo <= leaf_max_) {
-      out.emplace_back(lo, hi);
+    if (hi - lo <= flat_max_) {
+      cluster(lo, hi, out);
       return;
     }
     const size_t mid = partition(lo, hi);
     split(lo, mid, out);
     split(mid, hi, out);
+  }
+
+  /*
+   * The flat clustering of node [lo, hi) into at most k = ceil(s / T)
+   * lists by integer k-medoids: k-medoids++ seeding, then every member is
+   * assigned to its nearest medoid (ties to the smaller medoid index). The
+   * node's range of perm is rearranged so each nonempty list is a
+   * contiguous range, in medoid order; empty lists are dropped.
+   */
+  void cluster(size_t lo, size_t hi, std::vector<std::pair<size_t, size_t>>& out) {
+    const size_t s = hi - lo;
+    const size_t k = (s + target_ - 1) / target_;
+    if (k <= 1) {
+      out.emplace_back(lo, hi);
+      return;
+    }
+    node_.assign(perm_.begin() + lo, perm_.begin() + hi);
+    seed_medoids(k);
+    assign_nearest();
+
+    // stable counting sort of the node by list
+    std::vector<size_t> start(med_.size() + 1, 0);
+    for (const uint32_t l: of_) {
+      ++start[l + 1];
+    }
+    std::partial_sum(start.begin(), start.end(), start.begin());
+    for (size_t l = 0; l < med_.size(); ++l) {
+      if (start[l] != start[l + 1]) {
+        out.emplace_back(lo + start[l], lo + start[l + 1]);
+      }
+    }
+    for (size_t i = 0; i < s; ++i) {
+      perm_[lo + start[of_[i]]++] = node_[i];
+    }
+  }
+
+  /*
+   * k-medoids++ over node_: the first medoid is a random member, each next
+   * one a member drawn with probability proportional to its squared
+   * distance to the nearest medoid so far (best_). When every member
+   * coincides with a medoid's body there are fewer than k distinct bodies
+   * and seeding stops early. med_ holds positions in node_; O(s k) kernel
+   * calls.
+   */
+  void seed_medoids(size_t k) {
+    const size_t s = node_.size();
+    med_.assign(1, static_cast<uint32_t>(draw(s)));
+    best_.resize(s);
+    {
+      const TlshBodyQuery q(rows_[node_[med_[0]]]);
+      for (size_t i = 0; i < s; ++i) {
+        best_[i] = q.emb_body(rows_[node_[i]]);
+      }
+    }
+    while (med_.size() < k) {
+      uint64_t sum = 0;
+      for (const uint32_t b: best_) {
+        sum += b;
+      }
+      if (sum == 0) {
+        break;
+      }
+      // the first member at which the prefix sum of best_ exceeds r; a
+      // member with best_ 0 (a medoid, among others) is never chosen
+      uint64_t r = rng_() % sum;
+      size_t next = 0;
+      for (; r >= best_[next]; ++next) {
+        r -= best_[next];
+      }
+      med_.push_back(static_cast<uint32_t>(next));
+      const TlshBodyQuery q(rows_[node_[next]]);
+      for (size_t i = 0; i < s; ++i) {
+        best_[i] = std::min(best_[i], q.emb_body(rows_[node_[i]]));
+      }
+    }
+  }
+
+  // of_[i] = the index of the medoid nearest node_[i], ties to the smaller
+  // index; returns whether any assignment changed
+  bool assign_nearest() {
+    std::vector<TlshBodyQuery> qs;
+    qs.reserve(med_.size());
+    for (const uint32_t m: med_) {
+      qs.emplace_back(rows_[node_[m]]);
+    }
+    of_.resize(node_.size(), UINT32_MAX);
+    bool changed = false;
+    for (size_t i = 0; i < node_.size(); ++i) {
+      const TlshDigest& r = rows_[node_[i]];
+      uint32_t best = 0, best_d = qs[0].emb_body(r);
+      for (uint32_t j = 1; j < qs.size(); ++j) {
+        const uint32_t d = qs[j].emb_body(r);
+        if (d < best_d) {
+          best = j;
+          best_d = d;
+        }
+      }
+      changed |= of_[i] != best;
+      of_[i] = best;
+    }
+    return changed;
   }
 
   // a uniform-ish draw in [0, n) straight from the engine: the standard
@@ -431,8 +534,12 @@ private:
 
   const TlshDigest* rows_;
   std::vector<uint32_t> perm_;
-  size_t leaf_max_;
+  size_t target_, flat_max_;
   std::mt19937_64& rng_;
+  // scratch for cluster(): the node's members, the medoids (positions in
+  // node_), each member's squared distance to the nearest seed so far, and
+  // each member's list
+  std::vector<uint32_t> node_, med_, best_, of_;
 };
 
 /*
@@ -473,7 +580,7 @@ CellLists bisect_cell(
   std::mt19937_64& rng)
 {
   const size_t m = end - beg;
-  CellBisector bis(beg, m, tlsh_ivf_bisect_leaf_max(target_list_size), rng);
+  CellBisector bis(beg, m, target_list_size, TLSH_IVF_BISECT_FLAT_MAX, rng);
   const auto leaves = bis.leaves();
 
   // the leaves, with local ids

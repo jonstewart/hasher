@@ -243,6 +243,42 @@ void check_one_centers(const TlshIvf& ivf, const std::vector<TlshDigest>& rows) 
   }
 }
 
+/*
+ * List counts of a BISECT build with coalescing threshold T, F =
+ * TLSH_IVF_BISECT_FLAT_MAX, per cell of m rows:
+ *
+ * - The cell is split into flat nodes of s_i <= F rows, each clustered into
+ *   at most ceil(s_i / T) lists, and coalescing only removes lists, so a
+ *   cell has at most sum_i ceil(s_i / T) lists. A cell of m <= F rows is one
+ *   flat node: at most ceil(m / T) lists.
+ * - A larger cell is split only while a node has more than F rows, and a
+ *   split leaves at least 1/8 of the node on each side (else it is a median
+ *   split, half on each side), so every flat node has more than F / 8 rows
+ *   and there are fewer than 8m / F of them. Since ceil(s / T) <=
+ *   (s + T - 1) / T, lists * T <= m + (8m / F) (T - 1).
+ * - Coalescing leaves at most one list below T / 2, so (lists - 1) (T / 2)
+ *   <= m: at most 2m / T + 1 lists.
+ */
+void check_bisect_shape(const TlshIvf& ivf, size_t T) {
+  const uint64_t F = TLSH_IVF_BISECT_FLAT_MAX;
+  const size_t half = T / 2;
+  for (uint32_t c = 0; c < TLSH_CELL_COUNT; ++c) {
+    const uint32_t fl = ivf.cell_lists[c], el = ivf.cell_lists[c + 1];
+    if (fl == el) {
+      continue;
+    }
+    const uint64_t m = ivf.list_start[el] - ivf.list_start[fl];
+    const uint64_t lists = el - fl;
+    if (m <= F) {
+      CHECK(lists <= (m + T - 1) / T);
+    }
+    else {
+      CHECK(lists * T * F <= m * F + 8 * m * (T - 1));
+    }
+    CHECK((lists - 1) * half <= m);
+  }
+}
+
 } // namespace
 
 TEST_CASE("tlsh_ivf_bisect_leaf_bound") {
@@ -251,13 +287,11 @@ TEST_CASE("tlsh_ivf_bisect_leaf_bound") {
   CHECK(tlsh_ivf_bisect_leaf_max(1) == 1);
 }
 
-TEST_CASE("tlsh_ivf_bisect_lists_are_bounded_one_centers") {
+TEST_CASE("tlsh_ivf_bisect_lists_are_one_centers") {
   const auto rows = one_cell_corpus(21, 2000);
   const auto ivf = build_bisect(rows, 32);
   REQUIRE(ivf.ids.size() == rows.size());
-  for (size_t l = 0; l < ivf.lists(); ++l) {
-    CHECK(ivf.list_start[l + 1] - ivf.list_start[l] <= 42);
-  }
+  check_bisect_shape(ivf, 32);
   check_one_centers(ivf, rows);
 }
 
@@ -311,31 +345,35 @@ std::vector<TlshDigest> same_body_corpus(size_t n) {
 } // namespace
 
 TEST_CASE("tlsh_ivf_bisect_identical_bodies") {
+  // one distinct body, k = ceil(200 / 32) = 7: seeding finds no second
+  // medoid, so the node is one list of radius 0
   const auto rows = same_body_corpus(200);
   const auto ivf = build_bisect(rows, 32);
   REQUIRE(ivf.ids.size() == rows.size());
-  CHECK(ivf.lists() >= 5); // ceil(200 / 42)
-  for (size_t l = 0; l < ivf.lists(); ++l) {
-    CHECK(ivf.list_start[l + 1] - ivf.list_start[l] <= 42);
-    CHECK(ivf.radius2[l] == 0);
-  }
+  REQUIRE(ivf.lists() == 1);
+  CHECK(ivf.radius2[0] == 0);
 }
 
-TEST_CASE("tlsh_ivf_bisect_one_outlier_does_not_split_off_alone") {
-  // 99 rows of one body and one far row: the pivot split puts the outlier
-  // alone, which the fallback rejects (a side below 1/8) for a median split
-  auto rows = same_body_corpus(99);
-  TlshDigest far = rows.front();
-  for (size_t b = 0; b < 16; ++b) {
-    far.hi[b] = static_cast<uint8_t>(~far.hi[b]);
-    far.lo[b] = static_cast<uint8_t>(~far.lo[b]);
+TEST_CASE("tlsh_ivf_bisect_fewer_bodies_than_lists") {
+  // three distinct bodies, 70 rows each (differing in the checksum), in a
+  // node with k = ceil(210 / 32) = 7: one list per body, each of radius 0
+  std::vector<TlshDigest> rows;
+  const auto bodies = one_cell_corpus(32, 3);
+  REQUIRE(bodies.size() == 3);
+  for (TlshDigest d: bodies) {
+    for (size_t i = 0; i < 70; ++i) {
+      d.checksum = static_cast<uint8_t>(i);
+      rows.push_back(d);
+    }
   }
-  rows.push_back(far);
   std::sort(rows.begin(), rows.end());
 
   const auto ivf = build_bisect(rows, 32);
-  for (size_t l = 0; l < ivf.lists(); ++l) {
-    CHECK(ivf.list_start[l + 1] - ivf.list_start[l] >= 16);
+  REQUIRE(ivf.ids.size() == rows.size());
+  REQUIRE(ivf.lists() == 3);
+  for (size_t l = 0; l < 3; ++l) {
+    CHECK(ivf.list_start[l + 1] - ivf.list_start[l] == 70);
+    CHECK(ivf.radius2[l] == 0);
   }
 }
 
@@ -349,37 +387,6 @@ TEST_CASE("tlsh_ivf_bisect_coalesces_small_lists") {
     CHECK(tlsh_ivf_check_invariant(make_tlsh_ivf_view(build_bisect(many, T)), static_cast<uint32_t>(T)));
   }
 }
-
-namespace {
-
-/*
- * List sizes and counts of a BISECT build with coalescing threshold T.
- * Leaves hold at most L = 4T/3 rows and a coalesced pair fewer than
- * 2 (T / 2) <= T <= L, so every list has at most L rows and a cell of m rows
- * has at least ceil(m / L) lists. Coalescing leaves at most one list per
- * cell below T / 2, so the other lists hold at least T / 2 rows each and
- * (lists - 1) (T / 2) <= m: at most 2m / T + 1 lists, about twice
- * ceil(m / T) in the worst case.
- */
-void check_bisect_shape(const TlshIvf& ivf, size_t T) {
-  const size_t L = tlsh_ivf_bisect_leaf_max(T);
-  const size_t half = T / 2;
-  for (uint32_t c = 0; c < TLSH_CELL_COUNT; ++c) {
-    const uint32_t fl = ivf.cell_lists[c], el = ivf.cell_lists[c + 1];
-    if (fl == el) {
-      continue;
-    }
-    const uint64_t m = ivf.list_start[el] - ivf.list_start[fl];
-    const uint64_t lists = el - fl;
-    for (uint32_t l = fl; l < el; ++l) {
-      CHECK(ivf.list_start[l + 1] - ivf.list_start[l] <= L);
-    }
-    CHECK(lists * L >= m);
-    CHECK((lists - 1) * half <= m);
-  }
-}
-
-} // namespace
 
 TEST_CASE("tlsh_ivf_bisect_list_sizes_and_counts") {
   for (const size_t T: { 8u, 32u, 64u }) {
