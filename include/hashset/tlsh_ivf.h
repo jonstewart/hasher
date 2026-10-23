@@ -54,19 +54,21 @@ struct TlshIvf {
  *   rows, and the float accumulation order makes the index bytes depend on
  *   the compiler and platform.
  *
- * BISECT: integer kernel only (no floating point, so the index bytes are
+ * BISECT: integer arithmetic only (no floating point, so the index bytes are
  *   the same everywhere for the same rows and seed). A node of more than
  *   TLSH_IVF_BISECT_FLAT_MAX rows is split in two around two far-apart
  *   member pivots, with a median split when one side would be tiny; O(m)
  *   kernel calls per level. Each remaining node of s rows is clustered flat
- *   by k-medoids into at most ceil(s / T) lists: k-medoids++ seeding, then
- *   up to 10 rounds of nearest-medoid assignment and re-choosing each
- *   list's medoid as its member of least sum of squared distances; O(s / T
- *   + T) kernel calls per row and round, so linear in m for a fixed
- *   TLSH_IVF_BISECT_FLAT_MAX. Lists are in depth-first order of the nodes,
- *   each with its exact 1-center as medoid (the member minimizing the max
- *   distance to the others, which minimizes radius2). Lists smaller than
- *   C / 2, C = TLSH_IVF_BISECT_COALESCE_FACTOR * T, are then coalesced
+ *   by k-means into at most ceil(s / T) lists: k-means++ seeding with the
+ *   kernel, then up to 10 rounds of assigning each row to its nearest
+ *   centroid and recomputing the centroids, where a centroid is the exact
+ *   integer coordinate sum and count of its members' body embeddings and
+ *   distances to it are compared exactly (tlsh_ivf_nearer); O(s / T) dot
+ *   products of 256 coordinates per row and round, so linear in m for a
+ *   fixed TLSH_IVF_BISECT_FLAT_MAX. Lists are in depth-first order of the
+ *   nodes, each with its exact 1-center as medoid (the member minimizing
+ *   the max distance to the others, which minimizes radius2). Lists smaller
+ *   than C / 2, C = TLSH_IVF_BISECT_COALESCE_FACTOR * T, are then coalesced
  *   pairwise exactly as merge_tlsh_ivf does, so
  *   tlsh_ivf_check_invariant(index, C) holds.
  */
@@ -74,9 +76,9 @@ enum class TlshIvfBuild : uint8_t { KMEANS, BISECT };
 
 /*
  * BISECT splits a node in two only while it has more than this many rows;
- * a node of at most this many rows is clustered flat by integer k-medoids
+ * a node of at most this many rows is clustered flat by integer k-means
  * into at most ceil(s / T) lists. Larger values cut fewer families across a split
- * boundary (fewer rows scanned) but cost O(s / T) kernel calls per row and
+ * boundary (fewer rows scanned) but cost O(s / T) dot products per row and
  * iteration in the flat clustering. A quality and build-cost knob only.
  */
 constexpr size_t TLSH_IVF_BISECT_FLAT_MAX = 4096;

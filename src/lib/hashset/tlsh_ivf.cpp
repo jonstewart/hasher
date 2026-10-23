@@ -347,7 +347,7 @@ constexpr size_t BISECT_KMEANS_MAX_ITERATIONS = 10;
  * of each node into ceil(s / T) lists. perm holds the cell's local row
  * indexes; a node is a range [lo, hi) of perm, rearranged in place, so the
  * lists are contiguous ranges of perm in depth-first order, the lists of
- * one flat node together. Integer kernel only.
+ * one flat node together. Integer arithmetic only.
  */
 class CellBisector {
 public:
@@ -395,7 +395,7 @@ private:
     }
     node_.assign(perm_.begin() + lo, perm_.begin() + hi);
     embed_node();
-    seed_medoids(k);
+    seed_rows(k);
     seed_centroids();
     assign_nearest();
     for (size_t it = 0; it < BISECT_KMEANS_MAX_ITERATIONS; ++it) {
@@ -432,24 +432,24 @@ private:
   }
 
   /*
-   * k-medoids++ over node_: the first medoid is a random member, each next
-   * one a member drawn with probability proportional to its squared
-   * distance to the nearest medoid so far (best_). When every member
-   * coincides with a medoid's body there are fewer than k distinct bodies
-   * and seeding stops early. med_ holds positions in node_; O(s k) kernel
-   * calls.
+   * k-means++ seeding over node_: the first seed is a random member, each
+   * next one a member drawn with probability proportional to its squared
+   * distance to the nearest seed so far (best_). When every member
+   * coincides with a seed's body there are fewer than k distinct bodies
+   * and seeding stops early. seeds_ holds positions in node_; O(s k)
+   * kernel calls.
    */
-  void seed_medoids(size_t k) {
+  void seed_rows(size_t k) {
     const size_t s = node_.size();
-    med_.assign(1, static_cast<uint32_t>(draw(s)));
+    seeds_.assign(1, static_cast<uint32_t>(draw(s)));
     best_.resize(s);
     {
-      const TlshBodyQuery q(rows_[node_[med_[0]]]);
+      const TlshBodyQuery q(rows_[node_[seeds_[0]]]);
       for (size_t i = 0; i < s; ++i) {
         best_[i] = q.emb_body(rows_[node_[i]]);
       }
     }
-    while (med_.size() < k) {
+    while (seeds_.size() < k) {
       uint64_t sum = 0;
       for (const uint32_t b: best_) {
         sum += b;
@@ -458,13 +458,13 @@ private:
         break;
       }
       // the first member at which the prefix sum of best_ exceeds r; a
-      // member with best_ 0 (a medoid, among others) is never chosen
+      // member with best_ 0 (a seed, among others) is never chosen
       uint64_t r = rng_() % sum;
       size_t next = 0;
       for (; r >= best_[next]; ++next) {
         r -= best_[next];
       }
-      med_.push_back(static_cast<uint32_t>(next));
+      seeds_.push_back(static_cast<uint32_t>(next));
       const TlshBodyQuery q(rows_[node_[next]]);
       for (size_t i = 0; i < s; ++i) {
         best_[i] = std::min(best_[i], q.emb_body(rows_[node_[i]]));
@@ -482,15 +482,15 @@ private:
     }
   }
 
-  // centroid c is the seed row med_[c] alone: (x, 1)
+  // centroid c is the seed row seeds_[c] alone: (x, 1)
   void seed_centroids() {
-    const size_t k = med_.size();
+    const size_t k = seeds_.size();
     sum_.assign(k * BD, 0);
     cnt_.assign(k, 1);
     sum2_.resize(k);
     for (size_t c = 0; c < k; ++c) {
-      std::copy_n(&emb_[med_[c] * BD], BD, &sum_[c * BD]);
-      sum2_[c] = norm2_[med_[c]];
+      std::copy_n(&emb_[seeds_[c] * BD], BD, &sum_[c * BD]);
+      sum2_[c] = norm2_[seeds_[c]];
     }
   }
 
@@ -629,7 +629,7 @@ private:
   // each member's list, the members grouped by list (from start_), the
   // members' embeddings and squared norms, and per centroid the
   // coordinate sum S, the member count n and ||S||^2
-  std::vector<uint32_t> node_, med_, best_, of_, members_;
+  std::vector<uint32_t> node_, seeds_, best_, of_, members_;
   std::vector<size_t> start_;
   std::vector<int8_t> emb_;
   std::vector<uint32_t> norm2_;
@@ -666,7 +666,7 @@ void center_list(MergeList& l, const TlshDigest* rows) {
   l.radius2 = r2;
 }
 
-// Coarse bisection and flat k-medoids of one cell's rows [beg, end)
+// Coarse bisection and flat integer k-means of one cell's rows [beg, end)
 // (TlshIvfBuild::BISECT).
 // Row indexes written to ids are offset by base.
 CellLists bisect_cell(
