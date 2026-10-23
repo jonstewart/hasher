@@ -5,8 +5,13 @@
  *
  *   MERGE_BENCH_N=1000000 ./test/bench_hset_merge
  *   MERGE_BENCH_N=100000,1000000 MERGE_BENCH_T=32 MERGE_BENCH_C=0,2 ./test/bench_hset_merge
+ *   MERGE_BENCH_BUILD=kmeans MERGE_BENCH_N=100000 ./test/bench_hset_merge
  *
- * For each master size N (MERGE_BENCH_N, default 1000000), each k-means
+ * MERGE_BENCH_BUILD (bisect, the default, or kmeans) selects the TIVF
+ * build method of every from-scratch build, through the builder's
+ * SFHASH_HSET_TLSH_INDEX_KMEANS option bit.
+ *
+ * For each master size N (MERGE_BENCH_N, default 1000000), each clustering
  * target list size T (MERGE_BENCH_T, default 16,32,64; the master and the
  * batches are built with it), each coalescing threshold C as a multiple of
  * T (MERGE_BENCH_C, default 0,1,2,4 for C in {0, T, 2T, 4T}) and two batch
@@ -40,6 +45,7 @@
 #include <iostream>
 #include <memory>
 #include <sstream>
+#include <stdexcept>
 #include <string>
 #include <tuple>
 #include <vector>
@@ -86,6 +92,22 @@ std::vector<size_t> env_list(const char* name, const std::string& dflt) {
 constexpr size_t K = 10;
 constexpr uint32_t MAX_DISTANCE = 144;
 constexpr size_t NUM_QUERIES = 50;
+
+// MERGE_BENCH_BUILD: the TIVF build method of every from-scratch build
+// (master, batches, rebuild), through the builder's tlsh_options
+const char* const BUILD_NAME = [] {
+  const char* env = std::getenv("MERGE_BENCH_BUILD");
+  const std::string s = env && *env ? env : "bisect";
+  if (s == "bisect") {
+    return "bisect";
+  }
+  if (s == "kmeans") {
+    return "kmeans";
+  }
+  throw std::invalid_argument("MERGE_BENCH_BUILD must be kmeans or bisect, not " + s);
+}();
+const uint32_t BUILD_OPTIONS = SFHASH_HSET_TLSH_INDEX |
+  (std::string(BUILD_NAME) == "kmeans" ? uint32_t(SFHASH_HSET_TLSH_INDEX_KMEANS) : 0u);
 constexpr uint64_t CORPUS_SEED = 0x6d61737465;
 constexpr uint64_t QUERY_SEED = 0x71;
 
@@ -135,7 +157,7 @@ clock_type::duration build_file(const std::string& path, const TlshDigest* beg, 
     sfhash_hashset_builder_destroy
   );
   REQUIRE(!err);
-  sfhash_hashset_builder_set_tlsh_options(bctx.get(), SFHASH_HSET_TLSH_INDEX);
+  sfhash_hashset_builder_set_tlsh_options(bctx.get(), BUILD_OPTIONS);
   bctx->tlsh_ivf_target_list_size = T;
   for (const TlshDigest* d = beg; d != end; ++d) {
     sfhash_hashset_builder_add_hash(bctx.get(), d, sizeof(*d));
@@ -338,7 +360,7 @@ TEST_CASE("bench_hset_merge_incremental") {
   }
 
   // summary
-  std::cout << "\nIncremental merge vs from-scratch rebuild (TIVF only, no TVEC; k = " << K
+  std::cout << "\nIncremental merge vs from-scratch rebuild (TIVF only, no TVEC; build " << BUILD_NAME << "; k = " << K
             << ", max_distance = " << MAX_DISTANCE << ", " << NUM_QUERIES << " queries)\n\n"
             << "| N | batches | T | C | merge total ms | rebuild ms | rows | TIVF merged KiB | TIVF rebuilt KiB | lists merged | lists rebuilt | cells | bound | kNN merged us | kNN rebuilt us | rows/q merged | rows/q rebuilt |\n"
             << "|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|\n";
