@@ -707,7 +707,7 @@ TEST_CASE("hset_tlsh_index_kmeans_option_selects_the_build_method") {
       // the TIVF payload is the serialized build_tlsh_ivf of the HDAT rows
       // with the selected method, and not that of the other method
       const auto bytes_of = [&](TlshIvfBuild method) {
-        const TlshIvf ivf = build_tlsh_ivf(rows, rows + n, TLSH_IVF_TARGET_LIST_SIZE, 0x7175657279, 0, method);
+        const TlshIvf ivf = build_tlsh_ivf(rows, rows + n, TLSH_IVF_TARGET_LIST_SIZE, TLSH_IVF_DEFAULT_SEED, 0, method);
         std::vector<char> buf(length_tivf_data(ivf.lists(), ivf.n));
         REQUIRE(write_tivf_data(ivf, buf.data()) == buf.size());
         return buf;

@@ -234,7 +234,7 @@ TEST_CASE("tlsh_knn") {
 
     const auto t0 = std::chrono::steady_clock::now();
     const TlshIvf ivf = build_tlsh_ivf(
-      corpus.data(), corpus.data() + corpus.size(), IVF_LIST_SIZE, 0x7175657279, 0, IVF_BUILD
+      corpus.data(), corpus.data() + corpus.size(), IVF_LIST_SIZE, TLSH_IVF_DEFAULT_SEED, 0, IVF_BUILD
     );
     const auto t1 = std::chrono::steady_clock::now();
     const double ivf_build_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();

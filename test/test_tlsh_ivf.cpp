@@ -38,7 +38,7 @@ bool same_matches(const std::vector<SFHASH_TlshMatch>& a, const std::vector<SFHA
 TEST_CASE("tlsh_ivf_build_invariants") {
   const auto method = GENERATE(TlshIvfBuild::KMEANS, TlshIvfBuild::BISECT);
   const auto rows = sorted_corpus(1, 5000);
-  const auto ivf = build_tlsh_ivf(rows.data(), rows.data() + rows.size(), 64, 0x7175657279, 0, method);
+  const auto ivf = build_tlsh_ivf(rows.data(), rows.data() + rows.size(), 64, TLSH_IVF_DEFAULT_SEED, 0, method);
 
   REQUIRE(ivf.n == rows.size());
   REQUIRE(ivf.lists() > 1);
@@ -120,7 +120,7 @@ TEST_CASE("tlsh_ivf_build_is_deterministic_across_threads") {
 TEST_CASE("tlsh_ivf_serialization_round_trip") {
   const auto method = GENERATE(TlshIvfBuild::KMEANS, TlshIvfBuild::BISECT);
   const auto rows = sorted_corpus(2, 2000);
-  const auto ivf = build_tlsh_ivf(rows.data(), rows.data() + rows.size(), 32, 0x7175657279, 0, method);
+  const auto ivf = build_tlsh_ivf(rows.data(), rows.data() + rows.size(), 32, TLSH_IVF_DEFAULT_SEED, 0, method);
 
   std::vector<char> buf(length_tivf_data(ivf.lists(), ivf.n));
   REQUIRE(write_tivf_data(ivf, buf.data()) == buf.size());
@@ -147,7 +147,7 @@ TEST_CASE("tlsh_ivf_serialization_round_trip") {
 TEST_CASE("tlsh_ivf_knn_matches_brute_force") {
   const auto method = GENERATE(TlshIvfBuild::KMEANS, TlshIvfBuild::BISECT);
   const auto rows = sorted_corpus(3, 20000);
-  const auto ivf = build_tlsh_ivf(rows.data(), rows.data() + rows.size(), 128, 0x7175657279, 0, method);
+  const auto ivf = build_tlsh_ivf(rows.data(), rows.data() + rows.size(), 128, TLSH_IVF_DEFAULT_SEED, 0, method);
   const auto view = make_tlsh_ivf_view(ivf);
 
   std::mt19937 rng(11);
@@ -169,7 +169,7 @@ TEST_CASE("tlsh_ivf_knn_matches_brute_force") {
 TEST_CASE("tlsh_ivf_knn_is_exact_beyond_144") {
   const auto method = GENERATE(TlshIvfBuild::KMEANS, TlshIvfBuild::BISECT);
   const auto rows = sorted_corpus(4, 3000);
-  const auto ivf = build_tlsh_ivf(rows.data(), rows.data() + rows.size(), 64, 0x7175657279, 0, method);
+  const auto ivf = build_tlsh_ivf(rows.data(), rows.data() + rows.size(), 64, TLSH_IVF_DEFAULT_SEED, 0, method);
   const auto view = make_tlsh_ivf_view(ivf);
 
   const auto q = perturb_tlsh_corpus(6, rows, 1, 0.2).front();
@@ -186,7 +186,7 @@ TEST_CASE("tlsh_ivf_knn_is_exact_beyond_144") {
 TEST_CASE("tlsh_ivf_knn_edge_cases") {
   const auto method = GENERATE(TlshIvfBuild::KMEANS, TlshIvfBuild::BISECT);
   const auto rows = sorted_corpus(8, 500);
-  const auto ivf = build_tlsh_ivf(rows.data(), rows.data() + rows.size(), 64, 0x7175657279, 0, method);
+  const auto ivf = build_tlsh_ivf(rows.data(), rows.data() + rows.size(), 64, TLSH_IVF_DEFAULT_SEED, 0, method);
   const auto view = make_tlsh_ivf_view(ivf);
 
   CHECK(tlsh_knn_ivf(view, rows.data(), rows[0], 0, 100, true).empty());
@@ -615,10 +615,10 @@ TEST_CASE("tlsh_ivf_default_method_is_bisect") {
   const auto rows = one_cell_corpus(3, 2000);
   const auto dflt = build_tlsh_ivf(rows.data(), rows.data() + rows.size());
   const auto bisect = build_tlsh_ivf(
-    rows.data(), rows.data() + rows.size(), TLSH_IVF_TARGET_LIST_SIZE, 0x7175657279, 0, TlshIvfBuild::BISECT
+    rows.data(), rows.data() + rows.size(), TLSH_IVF_TARGET_LIST_SIZE, TLSH_IVF_DEFAULT_SEED, 0, TlshIvfBuild::BISECT
   );
   const auto kmeans = build_tlsh_ivf(
-    rows.data(), rows.data() + rows.size(), TLSH_IVF_TARGET_LIST_SIZE, 0x7175657279, 0, TlshIvfBuild::KMEANS
+    rows.data(), rows.data() + rows.size(), TLSH_IVF_TARGET_LIST_SIZE, TLSH_IVF_DEFAULT_SEED, 0, TlshIvfBuild::KMEANS
   );
   REQUIRE(bisect.ids != kmeans.ids);
   CHECK(dflt.cell_lists == bisect.cell_lists);

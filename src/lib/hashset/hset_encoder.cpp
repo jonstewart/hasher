@@ -212,7 +212,7 @@ void count_hashes_and_build_indexes(
       std::sort(rows.begin(), rows.end());
       ivfs[f] = build_tlsh_ivf(
         rows.data(), rows.data() + rows.size(), target_list_size,
-        0x7175657279, 0, tlsh_ivf_build_of(tlsh_options)
+        TLSH_IVF_DEFAULT_SEED, 0, tlsh_ivf_build_of(tlsh_options)
       );
       rows.clear();
       rows.shrink_to_fit();
@@ -1065,7 +1065,7 @@ uint64_t hashset_builder_write(SFHASH_HashsetBuildCtx* bctx) {
           const auto* tbeg = reinterpret_cast<const TlshDigest*>(out);
           bctx->tlsh_ivfs[i] = build_tlsh_ivf(
             tbeg, tbeg + hhdr.hash_count, bctx->tlsh_ivf_target_list_size,
-            0x7175657279, 0, tlsh_ivf_build_of(bctx->tlsh_options)
+            TLSH_IVF_DEFAULT_SEED, 0, tlsh_ivf_build_of(bctx->tlsh_options)
           );
         }
       }

@@ -13,6 +13,9 @@
 // build_tlsh_ivf (T in docs/TLSH_EMBEDDING.md)
 constexpr size_t TLSH_IVF_TARGET_LIST_SIZE = 32;
 
+// the default seed of build_tlsh_ivf's random draws
+constexpr uint64_t TLSH_IVF_DEFAULT_SEED = 0x7175657279;
+
 // default coalescing threshold of merge_tlsh_ivf (C in the docs): two lists
 // of a cell are coalesced while both have fewer than C / 2 members
 constexpr uint32_t TLSH_IVF_DEFAULT_COALESCE = 2 * TLSH_IVF_TARGET_LIST_SIZE;
@@ -119,7 +122,7 @@ TlshIvf build_tlsh_ivf(
   const TlshDigest* beg,
   const TlshDigest* end,
   size_t target_list_size = TLSH_IVF_TARGET_LIST_SIZE,
-  uint64_t seed = 0x7175657279,
+  uint64_t seed = TLSH_IVF_DEFAULT_SEED,
   unsigned threads = 0,
   TlshIvfBuild method = TlshIvfBuild::BISECT
 );
