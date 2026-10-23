@@ -58,7 +58,9 @@ and `docs/TLSH_EMBEDDING.md`.
   A list bound becomes one popcount kernel call and 40 bytes instead of ~1 KiB
   and 256 float ops; query time fell from 44 µs to 26 µs at 1M.
 - **Target list size T = 32** (sweep in BENCHMARKS §4; the BISECT sweep,
-  §9, has its query-time minimum at 32 too).
+  §9, puts T = 16 and 32 within 4% of each other, 32 ahead by the
+  summary's minimum and 16 by Criterion-style means; 32 builds in half
+  the time with half the lists).
 - **Vectors are optional and the index does not need them.** TIVF embeds
   digests on the fly, so very large sets can carry the index without the
   1 KiB/row TVEC.
@@ -71,12 +73,14 @@ and `docs/TLSH_EMBEDDING.md`.
   nearest centroid by cross-multiplying the rational squared distances in
   64 bits, `tlsh_ivf_nearer`, overflow excluded by a static_assert on
   FLAT_MAX; k-means++ seeding with the kernel; ≤ 10 rounds, none needed
-  more than 7). 1M rows: 5,110 rows scanned/query vs 4,848 for the float
-  k-means, mean list radius 7.12 vs 7.13, 31,668 lists vs 36,820, build
-  135 ms vs 1,467 ms, query time equal within noise. O(m) kernel calls
-  per bisection level and linear flat work for a fixed FLAT_MAX (the wall
-  time is not yet linear, and the quality gap widens at 4M rows; see "Open
-  issues"). Decision (Jon, 2026-10-23): BISECT is the default.
+  more than 7). Without coalescing (below; `bench_tlsh`, T = 32): at 1M
+  rows 4,659 rows scanned/query vs 4,848 for the float k-means, 36,823
+  lists vs 36,820, build 136 ms vs 1,481 ms; at 4M 4,752 vs 4,631 rows,
+  129,948 vs 129,872 lists, build 1.26–1.41 s vs 25.7 s; query time
+  within noise at 1M, 4–14% above KMEANS at 4M. O(m) kernel calls per
+  bisection level and a flat cost per row that grows with the cell size
+  up to FLAT_MAX ("Rebuild scaling"). Decision (Jon, 2026-10-23): BISECT
+  is the default.
 - **Rejected on the way** (1M rows, rows scanned/query; k-means 4,848):
   pure recursive bisection down to lists of ≤ 4T/3 (13,533; 22 ms build;
   a hard two-way split cuts families across the boundary); refinement
@@ -90,9 +94,21 @@ and `docs/TLSH_EMBEDDING.md`.
   bounds a flat node's k-means to ⌈4096/T⌉ centroids (128 at T = 32), and
   `tlsh_ivf_nearer`'s 64-bit products stay exact up to 2^13 rows.
 - **Medoid = exact 1-center** (the member minimizing the max distance to
-  the others, so the smallest member radius2), for leaves and for lists the
-  build coalesces. The build coalesces at C = T (lists below T/2), so
-  `tlsh_ivf_check_invariant(index, T)` holds for a fresh index.
+  the others, so the smallest member radius2) of every list.
+- **No coalescing in a fresh build.** A fresh BISECT index's lists are
+  exactly the nonempty k-means groups of its flat nodes, so a cell has at
+  most Σ ⌈s_i/T⌉ lists (⌈m/T⌉ below FLAT_MAX) and need not satisfy
+  `tlsh_ivf_check_invariant` at any threshold. The first BISECT round
+  coalesced lists below T/2 per cell (C = T) so that it would; in a fresh
+  build that pairs unrelated small families into wide lists, and the
+  pairing costs O(s²) in a cell's small lists. At 4M rows (`bench_tlsh`,
+  T = 32) coalescing gave 76,993 lists, 839 bounds and 7,501 rows
+  scanned per query, 22.8 µs, build 1,618 ms; without it 129,948 lists,
+  1,464 bounds, 4,752 rows, 12.5 µs, 1,263 ms (controller's run,
+  2026-10-23; this round 13.5–14.2 µs, 1,264–1,409 ms). Removed with
+  `TLSH_IVF_BISECT_COALESCE_FACTOR`. The merge path's coalescing (C = 2T,
+  "Set operations") is unchanged: there the small lists come from small
+  batches, and the bound on lists depends on it.
 - **Lists in depth-first order of the bisection.** A cell's lists are
   contiguous by subtree, so a later TIVF version can add per-subtree bounds
   without re-clustering.
@@ -152,21 +168,22 @@ and `docs/TLSH_EMBEDDING.md`.
 
 ## Open issues
 
-- **BISECT's lists fall short of ⌈m/T⌉ as density grows.** At 4M rows
-  they average 52 rows against T = 32 (not yet diagnosed; empty flat
-  k-means centroids are dropped and k-means++ seeding stops at the number
-  of distinct bodies, so either may be the cause): at 4M rows
-  (`bench_tlsh`) 76,993 lists against KMEANS's 129,872, 7,501 rows
-  scanned per query against 4,631, 22.8 µs against 17.6 µs (at 1M the
-  gap is 5,110 against 4,848). In the merge sweep's rebuilt 4.0M index
-  (T = 32): 103,570 lists against 131,172, 35,917 rows scanned against
-  30,776. Fine at 1M; to be fixed before large corpora.
-- **BISECT build time is still superlinear** in n (above).
+- **Resolved: BISECT degraded at 4M rows** (76,993 lists, 7,501 rows
+  scanned against KMEANS's 129,872 and 4,631). The cause was the
+  coalescing of the fresh build (see "Index"); without it, 129,948 lists
+  and 4,752 rows. The merge sweep's rebuilt 4.0M index (T = 32) now has
+  131,274 lists (KMEANS 131,172) and scans 31,668 rows (KMEANS 30,776).
+- **Resolved: BISECT's build "not linear in n".** Part of the growth was
+  the fresh build's `coalesce_cell` (1,618 ms at 4M with it, 1,263 ms
+  without); the rest is the cost model, not a bug ("Rebuild scaling").
+  A NEON int8 × int16 dot product for the centroid distances is a
+  possible follow-up if the 120M build needs it.
 - **`coalesce_cell` is O(s²) in the small lists of a cell** (distance
-  matrix + heap), in the build and in the merge. Negligible at 1M (9.9 ms
-  summed over threads, 0.10 ms max per cell), but a 10M-row cell with a few
-  percent of small lists would need gigabytes; a windowed or per-subtree
-  variant is needed before the 120M corpus.
+  matrix + heap), now on the merge path only. Negligible at 1M (9.9 ms
+  summed over threads, 0.10 ms max per cell, measured when the fresh build
+  still coalesced), but a 10M-row cell with a few percent of small lists
+  would need gigabytes; a windowed or per-subtree variant is needed before
+  the 120M corpus is merged incrementally.
 - **BISECT depends only weakly on the seed** (the farthest-point pivots
   and k-means++ often come out the same on small corpora).
 - **A node of identical bodies is one list**, however large (up to
@@ -228,15 +245,28 @@ kNN == brute force for whatever partition the builder produces, and
 5. *Locality-order partition:* moot; the integer build is already
    bit-reproducible and of k-means quality.
 
-**Observed, BISECT** (T = 32, 15 threads, same corpus, 2026-10-23;
-`test/bench_hset_merge` "rebuild" = sort, dedup, index build and file write
-through the builder): 0.44 s at 1.0M rows (KMEANS 1.45 s), 0.49–0.53 s at
-1.43M (3.3 s), 2.7–3.0 s at 4.0M (24.5 s); T = 16: 4.2–4.5 s at 4.0M
-(48 s); T = 64: 1.5 s (8.5 s). Index build alone (`test/bench_tlsh`):
-152 ms at 1M, 498 ms at 2M, 1.62 s at 4M, against KMEANS's 1.59 s and
-28.6 s at 1M and 4M: the index build 10–18x faster, the whole rebuild
-3–9x; but still not linear in n (3.2x per doubling from 1M to 4M); not yet explained (per-cell parallelism with a
-few dominant cells, `coalesce_cell`, the O(s²) 1-center of large lists
-are the candidates). Same-session KMEANS reruns took 2.0 / 4.5–5.1 /
-29.8–33.0 s for the three sizes: the machine was loaded during this
-round, so the older KMEANS figures above are the cleaner ones.
+**Observed, BISECT without coalescing** (T = 32, 15 threads, same corpus,
+2026-10-23, second round; `test/bench_hset_merge` "rebuild" = sort, dedup,
+index build and file write through the builder): 0.41–0.43 s at 1.0M rows
+(the master build; KMEANS 1.45 s), 0.44–0.45 s at 1.43M (3.3 s),
+2.2–2.5 s at 4.0M (24.5 s); T = 16: 3.7–4.3 s at 4.0M (48 s); T = 64:
+1.4–1.5 s (8.5 s). Index build alone (`test/bench_tlsh`): 136 ms at 1M,
+437 ms at 2M, 1.26–1.41 s at 4M, against KMEANS's 1.48 s and 25.7 s at 1M
+and 4M (same session).
+
+**BISECT's cost per row grows with the cell size, up to FLAT_MAX.** A row
+costs one 256-coordinate dot product per centroid of its flat node per
+k-means round, and a flat node of s rows has ⌈s/T⌉ centroids, at most
+⌈4096/32⌉ = 128. The synthetic corpus has about 9,000–9,600 nonempty
+cells at every size (8,975 at 1M, 9,607 at 4M), so rows per cell grow
+linearly with n; the row-weighted mean of min(⌈m_c/T⌉, 128) over the
+cells is 21.2 at 1M, 39.8 at 2M and 63.5 at 4M (an upper estimate of the
+centroids per row: a cell above FLAT_MAX is split into nodes of fewer
+than 4096 rows; 0.6%, 4.6% and 22.8% of the rows are in such cells).
+That predicts 3.8x and 3.2x per doubling; the build took 3.2x (136 →
+437 ms) and 2.9x (437 → 1,264 ms). Once a corpus's cells exceed 4096
+rows the cost per row is constant and the build linear in n. The
+k-means++ seeding (k passes over the node, one kernel call per row) and
+the 1-center of each list (O(list²) kernel calls) add terms of the same
+or smaller order. A NEON int8 × int16 dot product is the possible
+follow-up if the 120M build needs it.
