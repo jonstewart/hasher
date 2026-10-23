@@ -295,36 +295,68 @@ TEST_CASE("tlsh_ivf_bisect_lists_are_one_centers") {
   check_one_centers(ivf, rows);
 }
 
-TEST_CASE("tlsh_ivf_bisect_separates_two_clusters") {
-  // two clusters of 30 rows in one cell: random leading body bytes, and the
-  // trailing 8 bytes of both planes all 0 (codes 0) or all 1 (codes 3), so
-  // sorted order interleaves the clusters while cross-cluster distances
-  // exceed within-cluster ones by 64 buckets x 5
+namespace {
+
+/*
+ * nf families of `per` rows in one cell: random leading 4 body bytes of
+ * both planes (32 noise buckets), and three 4-byte blocks of the trailing
+ * 12 bytes of which family f has block f all 1 (codes 3) and the others all
+ * 0 (codes 0). Two families then differ in 2 x 32 buckets by codes 0 vs 3,
+ * a squared distance of 2 x 32 x 5 = 320 on top of the noise, while two
+ * members of one family differ in the 32 noise buckets only, at most
+ * 32 x 5 = 160. Sorted order interleaves the families.
+ */
+std::vector<TlshDigest> family_cell_corpus(size_t nf, size_t per) {
   std::mt19937_64 rng(5);
   std::vector<TlshDigest> rows;
-  for (int c = 0; c < 2; ++c) {
-    for (int i = 0; i < 30; ++i) {
+  for (size_t f = 0; f < nf; ++f) {
+    for (size_t i = 0; i < per; ++i) {
       TlshDigest d{};
       d.L = 3;
       d.Q = 0x45;
-      for (int b = 0; b < 8; ++b) {
+      for (int b = 0; b < 4; ++b) {
         d.hi[b] = static_cast<uint8_t>(rng());
         d.lo[b] = static_cast<uint8_t>(rng());
-        d.hi[8 + b] = d.lo[8 + b] = c ? 0xFF : 0x00;
+      }
+      for (int b = 4; b < 16; ++b) {
+        d.hi[b] = d.lo[b] = (b - 4) / 4 == static_cast<int>(f) ? 0xFF : 0x00;
       }
       rows.push_back(d);
     }
   }
   std::sort(rows.begin(), rows.end());
+  return rows;
+}
 
-  const auto ivf = build_bisect(rows, 32);
-  REQUIRE(ivf.lists() == 2);
-  for (size_t l = 0; l < 2; ++l) {
-    CHECK(ivf.list_start[l + 1] - ivf.list_start[l] == 30);
-    const int side = rows[ivf.ids[ivf.list_start[l]]].hi[8];
-    for (uint64_t i = ivf.list_start[l]; i < ivf.list_start[l + 1]; ++i) {
-      CHECK(int(rows[ivf.ids[i]].hi[8]) == side);
+// the family of a family_cell_corpus row
+size_t family_of(const TlshDigest& d) {
+  for (size_t f = 0; f < 3; ++f) {
+    if (d.hi[4 + 4 * f]) {
+      return f;
     }
+  }
+  return 0;
+}
+
+} // namespace
+
+TEST_CASE("tlsh_ivf_bisect_separates_families") {
+  // nf families of 30 rows in one flat node, T = 32: k = nf lists, and each
+  // comes out as one pure list
+  for (const size_t nf: { 2u, 3u }) {
+    const auto rows = family_cell_corpus(nf, 30);
+    const auto ivf = build_bisect(rows, 32);
+    REQUIRE(ivf.lists() == nf);
+    std::set<size_t> seen;
+    for (size_t l = 0; l < nf; ++l) {
+      CHECK(ivf.list_start[l + 1] - ivf.list_start[l] == 30);
+      const size_t f = family_of(rows[ivf.ids[ivf.list_start[l]]]);
+      seen.insert(f);
+      for (uint64_t i = ivf.list_start[l]; i < ivf.list_start[l + 1]; ++i) {
+        CHECK(family_of(rows[ivf.ids[i]]) == f);
+      }
+    }
+    CHECK(seen.size() == nf);
   }
 }
 
