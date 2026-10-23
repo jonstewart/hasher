@@ -510,3 +510,29 @@ TEST_CASE("tlsh_ivf_merge_of_bisect_builds_is_exact") {
     }
   }
 }
+
+TEST_CASE("tlsh_ivf_nearer") {
+  // N_a / n_a^2 < N_b / n_b^2, exactly
+  CHECK(tlsh_ivf_nearer(3, 2, 1, 1));     // 3/4 < 1
+  CHECK_FALSE(tlsh_ivf_nearer(1, 1, 3, 2));
+  CHECK(tlsh_ivf_nearer(0, 5, 1, 1));
+  CHECK_FALSE(tlsh_ivf_nearer(0, 5, 0, 1)); // 0 == 0
+  CHECK(tlsh_ivf_nearer(1, 4096, 1, 4095));
+  CHECK_FALSE(tlsh_ivf_nearer(1, 4095, 1, 4096));
+  CHECK_FALSE(tlsh_ivf_nearer(1, 4096, 0, 1));
+
+  // equal distances with different denominators: 4 / 2^2 == 1 / 1^2, so
+  // neither is nearer (the caller keeps the smaller index)
+  CHECK_FALSE(tlsh_ivf_nearer(4, 2, 1, 1));
+  CHECK_FALSE(tlsh_ivf_nearer(1, 1, 4, 2));
+  CHECK_FALSE(tlsh_ivf_nearer(9 * 50, 3 * 10, 50, 10)); // 450 / 900 == 50 / 100
+
+  // at the bound N = 2^34, n = 4096: 2^34 / 2^24 == 1024 / 1, and one unit
+  // less in N is nearer, which a 32-bit or float product would not see
+  const uint64_t N = uint64_t{1} << 34;
+  CHECK_FALSE(tlsh_ivf_nearer(N, 4096, 1024, 1));
+  CHECK_FALSE(tlsh_ivf_nearer(1024, 1, N, 4096));
+  CHECK(tlsh_ivf_nearer(N - 1, 4096, 1024, 1));
+  CHECK(tlsh_ivf_nearer(N - 1, 4096, N, 4096));
+  CHECK_FALSE(tlsh_ivf_nearer(N, 4096, N - 1, 4096));
+}

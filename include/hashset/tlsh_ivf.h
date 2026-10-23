@@ -81,6 +81,22 @@ enum class TlshIvfBuild : uint8_t { KMEANS, BISECT };
  */
 constexpr size_t TLSH_IVF_BISECT_FLAT_MAX = 4096;
 
+/*
+ * Exact comparison of two squared distances N_a / n_a^2 and N_b / n_b^2:
+ * whether the first is strictly smaller. In BISECT's flat k-means the
+ * squared distance from a row x to a centroid of n members with coordinate
+ * sum S is ||x - S / n||^2 = N / n^2, N = ||n x - S||^2. With x and every
+ * member in {-1, 0, 1}^256, |n x_j - S_j| <= 2n, so N <= 256 * 4n^2 =
+ * 2^10 n^2; for n <= TLSH_IVF_BISECT_FLAT_MAX = 2^12, N <= 2^34 and n^2 <=
+ * 2^24, and both products are at most 2^58. The static_assert keeps them in
+ * 64 bits (2^10 * 2^26 * 2^26 = 2^62 for 2^13 rows).
+ */
+static_assert(TLSH_IVF_BISECT_FLAT_MAX <= 8192);
+
+constexpr bool tlsh_ivf_nearer(uint64_t N_a, uint64_t n_a, uint64_t N_b, uint64_t n_b) {
+  return N_a * n_b * n_b < N_b * n_a * n_a;
+}
+
 // the coalescing threshold of a BISECT build in units of T: C = factor * T,
 // so lists below T / 2 are coalesced. 0 disables coalescing.
 constexpr size_t TLSH_IVF_BISECT_COALESCE_FACTOR = 1;
