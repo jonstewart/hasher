@@ -277,3 +277,48 @@ TEST_CASE("tlsh_ivf_bisect_separates_two_clusters") {
     }
   }
 }
+
+namespace {
+
+// n rows of one cell sharing one body, differing in the checksum only
+std::vector<TlshDigest> same_body_corpus(size_t n) {
+  TlshDigest d = one_cell_corpus(31, 1).front();
+  std::vector<TlshDigest> rows;
+  for (size_t i = 0; i < n; ++i) {
+    d.checksum = static_cast<uint8_t>(i);
+    rows.push_back(d);
+  }
+  std::sort(rows.begin(), rows.end());
+  return rows;
+}
+
+} // namespace
+
+TEST_CASE("tlsh_ivf_bisect_identical_bodies") {
+  const auto rows = same_body_corpus(200);
+  const auto ivf = build_bisect(rows, 32);
+  REQUIRE(ivf.ids.size() == rows.size());
+  CHECK(ivf.lists() >= 5); // ceil(200 / 42)
+  for (size_t l = 0; l < ivf.lists(); ++l) {
+    CHECK(ivf.list_start[l + 1] - ivf.list_start[l] <= 42);
+    CHECK(ivf.radius2[l] == 0);
+  }
+}
+
+TEST_CASE("tlsh_ivf_bisect_one_outlier_does_not_split_off_alone") {
+  // 99 rows of one body and one far row: the pivot split puts the outlier
+  // alone, which the fallback rejects (a side below 1/8) for a median split
+  auto rows = same_body_corpus(99);
+  TlshDigest far = rows.front();
+  for (size_t b = 0; b < 16; ++b) {
+    far.hi[b] = static_cast<uint8_t>(~far.hi[b]);
+    far.lo[b] = static_cast<uint8_t>(~far.lo[b]);
+  }
+  rows.push_back(far);
+  std::sort(rows.begin(), rows.end());
+
+  const auto ivf = build_bisect(rows, 32);
+  for (size_t l = 0; l < ivf.lists(); ++l) {
+    CHECK(ivf.list_start[l + 1] - ivf.list_start[l] >= 16);
+  }
+}

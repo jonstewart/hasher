@@ -201,6 +201,11 @@ CellLists cluster_cell(
   return out;
 }
 
+// a pivot split leaving fewer than 1 / BISECT_MIN_SIDE_DIVISOR of a node's
+// rows on one side is replaced by a median split; this bounds the depth by
+// log_{8/7} m and guarantees termination. A quality knob only.
+constexpr size_t BISECT_MIN_SIDE_DIVISOR = 8;
+
 /*
  * The recursive two-way partition of one cell's rows for bisect_cell.
  * perm holds the cell's local row indexes; a node is a range [lo, hi) of
@@ -270,7 +275,28 @@ private:
     const uint32_t p0 = perm_[lo + draw(hi - lo)];
     const uint32_t a = farthest(lo, hi, p0);
     const uint32_t b = farthest(lo, hi, a);
-    return assign(lo, hi, a, b);
+    const size_t mid = assign(lo, hi, a, b);
+    if (std::min(mid - lo, hi - mid) * BISECT_MIN_SIDE_DIVISOR < hi - lo) {
+      return median_split(lo, hi, a);
+    }
+    return mid;
+  }
+
+  // sorts [lo, hi) by (distance to a, local index) and cuts it in half: the
+  // fallback when the pivots split off too few rows (or none, when every
+  // body in the node is the same), so every split makes progress
+  size_t median_split(size_t lo, size_t hi, uint32_t a) {
+    const TlshBodyQuery q(rows_[a]);
+    std::vector<std::pair<uint32_t, uint32_t>> keyed;
+    keyed.reserve(hi - lo);
+    for (size_t i = lo; i < hi; ++i) {
+      keyed.emplace_back(q.emb_body(rows_[perm_[i]]), perm_[i]);
+    }
+    std::sort(keyed.begin(), keyed.end());
+    for (size_t i = lo; i < hi; ++i) {
+      perm_[i] = keyed[i - lo].second;
+    }
+    return lo + (hi - lo) / 2;
   }
 
   const TlshDigest* rows_;
