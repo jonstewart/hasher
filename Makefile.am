@@ -145,6 +145,12 @@ bench_bench_eval_SOURCES = bench/eval.cpp src/lib/hashset/util.cpp
 bench_bench_eval_CPPFLAGS = -Iinclude -Ibench -Ivendors/parallel-hashmap
 bench_bench_eval_CXXFLAGS = $(AM_CXXFLAGS) -O3 -march=native
 
+# hash set lookup eval driver (bench/README.md, "vs_lookup_eval")
+check_PROGRAMS += bench/vs_lookup_eval
+bench_vs_lookup_eval_SOURCES = bench/vs_lookup_eval.cpp
+bench_vs_lookup_eval_CPPFLAGS = $(AM_CPPFLAGS) $(CATCH2_CFLAGS)
+bench_vs_lookup_eval_LDADD = $(HASHER_LIB) $(PROJECT_LIBS) $(CATCH2_LIBS)
+
 TESTS = \
 	test/test \
 	python/test.sh

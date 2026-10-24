@@ -67,6 +67,7 @@ bench/bench_lookup
 bench/bench_eval
 bench/bench_eval_pg
 bench/bench_eval_probe
+bench/vs_lookup_eval
 bench/gmon.out
 bench/perf.data
 bench/perf.data.old
