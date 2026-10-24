@@ -10,6 +10,14 @@ AC_CONFIG_SRCDIR([src/lib/hasher/hasher.cpp])
 AC_CONFIG_HEADERS([config.h])
 
 AM_INIT_AUTOMAKE([1.12 subdir-objects foreign])
+
+# AC_PROG_CXX sets CXXFLAGS to "-g -O2" when the user leaves it unset, and
+# automake puts CXXFLAGS after AM_CXXFLAGS on the compile line, so that -O2
+# would override PROJECT_CXXFLAGS's -O3. Default it to empty; a CXXFLAGS the
+# user gives still comes last and wins. This must precede LT_INIT, which can
+# expand AC_PROG_CXX.
+: ${CXXFLAGS=""}
+
 LT_INIT
 
 AM_PROG_AS
@@ -32,6 +40,16 @@ AH_BOTTOM([#endif])
 #
 # AC_CANONICAL_HOST is needed to access the 'host_os' variable
 AC_CANONICAL_HOST
+
+# std::popcount compiles to a call to libgcc's __popcountdi2 unless the target
+# has the POPCNT instruction, and baseline x86-64 does not. Every x86 CPU since
+# Nehalem and Barcelona (2008) has it; --disable-popcnt builds for older ones.
+AC_ARG_ENABLE([popcnt],
+  [AS_HELP_STRING([--disable-popcnt], [do not use the x86 POPCNT instruction])],
+  [], [enable_popcnt=yes])
+AS_CASE([$host_cpu], [x86_64|i?86],
+  [AS_IF([test "x$enable_popcnt" != xno],
+     [AX_APPEND_COMPILE_FLAGS([-mpopcnt], [PROJECT_CXXFLAGS])])])
 
 # Detect the system being targeted (hilarously, not $target_*)
 case "$host_os" in
