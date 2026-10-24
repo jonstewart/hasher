@@ -348,11 +348,13 @@ for the chunk table). Compatibility details:
   by the C++ encoder load here and their hints are used.
 * Version-1 files (fixed 4 KiB header, no chunks) are not supported by either
   implementation; this crate reports them explicitly.
-* The C++ encoder writes incorrect `RIDX` (record index) chunks: in the
-  repository's `test/md5_sha1_*.hset` fixtures most indices point at records
-  that do not contain the hash. `hset verify` reports this; the Rust encoder
-  writes correct indices, and the interop tests compare everything except
-  those chunks.
+* The C++ encoder wrote incorrect `RIDX` (record index) chunks, most indices
+  pointing at records that do not contain the hash, until its sort was fixed
+  (300ace3). `hset verify` reports such files. The interop tests now require
+  the `test/md5_sha1_*.hset` fixtures to verify cleanly and re-encode byte for
+  byte, `RIDX` and digest included.
+* TLSH hash sets and record fields (type 2^15), which the C++ library writes,
+  are not read yet; the fixture tests skip such files.
 
 ### Hint type `0x68xx` layout
 

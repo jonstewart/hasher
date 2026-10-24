@@ -85,8 +85,10 @@ fn all_fixtures_decode_and_verify() {
         // Skip macOS AppleDouble sidecar files that may accompany the fixtures.
         if p.extension().is_some_and(|e| e == "hset") && !name.starts_with("._") {
             let bytes = std::fs::read(&p).unwrap();
-            if name == "bogus.hset" {
-                assert!(Hashset::load(&bytes).is_err(), "bogus.hset should not load");
+            // tlsh_bad.hset is what the C++ hset_tlsh_bad_digest_throws test
+            // leaves behind when the writer throws partway through
+            if name == "bogus.hset" || name == "tlsh_bad.hset" {
+                assert!(Hashset::load(&bytes).is_err(), "{name} should not load");
                 continue;
             }
             let hs = match Hashset::load(&bytes) {
@@ -94,18 +96,16 @@ fn all_fixtures_decode_and_verify() {
                 // 0123456789_*.hset and test1.hset are version-1 files, which
                 // neither this crate nor the C++ decoder reads.
                 Err(e) if e.to_string().contains("version 1") => continue,
+                // The C++ suite also writes files with TLSH (2^15) hash sets
+                // or record fields, which this crate does not read yet.
+                Err(e) if e.to_string().ends_with("type 2^15") => continue,
                 Err(e) => panic!("{name}: {e}"),
             };
             let report = hs.verify();
-            // The reference encoder's record-index (RIDX) chunks are known to
-            // be wrong (its proxy-iterator sort scrambles them); every other
-            // invariant must hold, including soundness of its legacy hints.
-            let real: Vec<&String> = report
-                .problems
-                .iter()
-                .filter(|p| !p.contains("record indices"))
-                .collect();
-            assert!(real.is_empty(), "{name}: {real:?}");
+            // Every invariant must hold, including soundness of the legacy
+            // hints and the record indices (the C++ encoder scrambled RIDX
+            // until tlsh-embedding's 300ace3 fixed its proxy-iterator sort).
+            assert!(report.problems.is_empty(), "{name}: {:?}", report.problems);
             assert!(report.digest_ok, "{name}: digest");
             for (i, s) in hs.sections().iter().enumerate() {
                 for j in 0..s.len() {
@@ -119,10 +119,24 @@ fn all_fixtures_decode_and_verify() {
 }
 
 #[test]
-fn reference_record_indices_are_detected_as_broken() {
-    // Documents the C++ bug: in md5_sha1_a.hset most RIDX entries do not
-    // point at a record containing the hash. Our verifier must notice.
-    let bytes = fixture("md5_sha1_a.hset");
+fn scrambled_record_indices_are_detected() {
+    // Reverse the first section's RIDX entries in md5_sha1_a.hset, as the
+    // C++ encoder's sort once scrambled them: most entries then point at a
+    // record that does not contain the hash, and the verifier must notice.
+    let mut bytes = fixture("md5_sha1_a.hset");
+    let (off, len) = {
+        let f = decode(&bytes).unwrap();
+        let ridx = f.sections[0].ridx.unwrap();
+        (ridx.as_ptr() as usize - bytes.as_ptr() as usize, ridx.len())
+    };
+    let entries: Vec<[u8; 8]> = bytes[off..off + len]
+        .as_chunks::<8>()
+        .0
+        .iter()
+        .rev()
+        .copied()
+        .collect();
+    bytes[off..off + len].copy_from_slice(entries.as_flattened());
     let hs = Hashset::load(&bytes).unwrap();
     let report = hs.verify();
     assert!(
@@ -175,7 +189,7 @@ fn text_input_reproduces_fixture_records() {
     );
     for (a, b) in ours.sections.iter().zip(&theirs.sections) {
         assert_eq!(a.data, b.data);
-        assert_eq!(a.ridx.map(<[u8]>::len), b.ridx.map(<[u8]>::len));
+        assert_eq!(a.ridx, b.ridx);
     }
     assert!(Hashset::load(&built).unwrap().verify().is_ok());
 }
@@ -192,27 +206,14 @@ fn reencoding_with_the_legacy_hint_is_byte_exact() {
     let opts = BuildOptions::new(f.fhdr.name.clone(), f.fhdr.desc.clone())
         .timestamp(f.fhdr.time.clone())
         .hint(HintSpec::LEGACY);
-    let mut ours = b.build(&opts).unwrap();
+    let ours = b.build(&opts).unwrap();
     assert_eq!(ours.len(), theirs.len());
     assert_eq!(decode(&ours).unwrap().toc, f.toc, "chunk layout differs");
-    let toc = f.toc.clone();
-    drop(f);
-    // The reference RIDX contents are wrong (see above) and the digest covers
-    // them, so compare everything else byte for byte.
-    let mut theirs = theirs;
-    for &(off, ty) in &toc {
-        if ty == hset::format::chunk::RIDX {
-            let off = off as usize + 12;
-            let len = u64::from_le_bytes(theirs[off - 8..off].try_into().unwrap()) as usize;
-            ours[off..off + len].fill(0);
-            theirs[off..off + len].fill(0);
-        }
-    }
-    ours[8..40].fill(0);
-    theirs[8..40].fill(0);
+    // RIDX and the digest that covers it included, since the C++ encoder's
+    // RIDX fix (tlsh-embedding's 300ace3)
     assert!(
         ours == theirs,
-        "re-encoded file differs from the C++ fixture outside RIDX"
+        "re-encoded file differs from the C++ fixture"
     );
 }
 
