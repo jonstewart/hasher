@@ -226,6 +226,35 @@ test_bench_hset_merge_SOURCES = \
 test_bench_hset_merge_CPPFLAGS = $(AM_CPPFLAGS) $(CATCH2_CFLAGS)
 test_bench_hset_merge_LDADD = $(HASHER_LIB) $(TEST_LIBS) $(CATCH2_LIBS)
 
+# vsscan: hash password-protected zips (VirusShare) into per-zip TSVs and
+# build an hset from them (utils/VIRUSSHARE_HOWTO); needs libarchive
+if HAVE_LIBARCHIVE
+bin_PROGRAMS += src/vsscan/vsscan
+
+src_vsscan_vsscan_SOURCES = \
+	src/vsscan/vsscan.h \
+	src/vsscan/vsscan_build.cpp \
+	src/vsscan/vsscan_main.cpp \
+	src/vsscan/vsscan_record.cpp \
+	src/vsscan/vsscan_record.h \
+	src/vsscan/vsscan_scan.cpp
+
+src_vsscan_vsscan_CPPFLAGS = $(AM_CPPFLAGS) $(LIBARCHIVE_CFLAGS)
+src_vsscan_vsscan_LDADD = $(HASHER_LIB) $(PROJECT_LIBS) $(LIBARCHIVE_LIBS) -lpthread
+
+check_PROGRAMS += test/test_vsscan
+TESTS += test/test_vsscan
+
+test_test_vsscan_SOURCES = \
+	test/test_vsscan.cpp \
+	src/vsscan/vsscan_build.cpp \
+	src/vsscan/vsscan_record.cpp \
+	src/vsscan/vsscan_scan.cpp
+
+test_test_vsscan_CPPFLAGS = $(AM_CPPFLAGS) $(LIBARCHIVE_CFLAGS) $(CATCH2_CFLAGS) -I$(srcdir)/src/vsscan
+test_test_vsscan_LDADD = $(HASHER_LIB) $(TEST_LIBS) $(LIBARCHIVE_LIBS) $(CATCH2_LIBS) -lpthread
+endif
+
 FORMAT_COMMAND := tools/git-clang-format -f --style=file
 
 format:

@@ -39,12 +39,15 @@
 /src/hsetop/hsetop
 /src/lib/hasher.pc
 /src/mkhashset/mkhashset
+/src/vsscan/vsscan
 /stamp-h1
 /test/bench_hex
 /test/bench_hsd
 /test/bench_tlsh
 /test/bench_hset_merge
 /test/test
+/test/test_vsscan
+/test/vsscan_out/
 /test-suite.log
 /test/*.log
 /test/*.trs

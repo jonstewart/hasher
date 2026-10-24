@@ -116,6 +116,15 @@ else
 fi
 
 #
+# Optional dependencies
+#
+
+# libarchive, for vsscan (src/vsscan); vsscan is not built without it
+PKG_CHECK_MODULES([LIBARCHIVE], [libarchive >= 3.1],
+                  [have_libarchive=yes], [have_libarchive=no])
+AM_CONDITIONAL([HAVE_LIBARCHIVE], [test "x$have_libarchive" = 'xyes'])
+
+#
 # Test Dependencies
 #
 
