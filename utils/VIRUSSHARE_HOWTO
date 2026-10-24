@@ -9,3 +9,113 @@ sed -e '/^#/d' VirusShare_* | sort -u >vs_hashes
 mkhashset 'VirusShare 0-457' 'VirusShare 0-457' MD5 false true vs_hashes virusshare-457.hset
 
 3. Upload the hashset to the E2E testdata bucket in S3.
+
+
+Hashing the VirusShare sample archives (vsscan)
+===============================================
+
+The VirusShare_NNNNN.zip archives hold the samples themselves, encrypted
+with the password "infected" (ZipCrypto, deflate). src/vsscan/vsscan (built
+when configure finds libarchive) hashes every member in memory -- nothing
+from an archive is written to disk or executed -- and builds an hset from
+the results.
+
+1. Scan. One zip at a time, 8 libarchive readers per zip, one hashing
+thread per CPU; outputs go to OUTDIR:
+
+  vsscan scan -o OUTDIR /data/VirusShare/VirusShare_000*.zip
+
+  OUTDIR/VirusShare_NNNNN.tsv          one row per sample (header line first):
+      zip index member size md5 sha1 sha256 tlsh ssdeep entropy
+      tlsh is "T1" + 70 hex digits or TNULL (under 50 bytes, too little
+      variety); member names are backslash-escaped (\t \n \r \\)
+  OUTDIR/VirusShare_NNNNN.errors.tsv   per-entry errors and warnings:
+      zip index member stage message
+      stages: open, header, data (bad password, bad CRC, unsupported
+      method), data-fatal (corrupt stream; the zip is reopened and the scan
+      resumes after the entry), name-md5-mismatch (a warning: the member is
+      named VirusShare_<md5> and its md5 differs), not-regular
+  OUTDIR/VirusShare_NNNNN.summary.tsv  written last, when the zip is done:
+      zip status entries rows errors name_md5_mismatches bytes zip_bytes
+      seconds finished;  status is complete, partial (--limit or
+      --time-limit) or failed
+
+Each zip's TSV and errors file are written as *.partial and renamed when the
+zip is finished. Rerunning the same command skips every zip whose summary
+says "complete" (--force rescans), so an interrupted scan resumes at the
+first unfinished zip. Progress goes to stderr every 10 s (-P): entries/s,
+MB/s through the zip files and of hashed (uncompressed) data, CPU, bytes
+buffered for hashing, errors. vsscan exits 1 if any zip failed.
+
+Run it under nohup or tmux, e.g.
+
+  nohup vsscan scan -o /work/vs-eval/scan /data/VirusShare/VirusShare_000*.zip \
+    > /work/vs-eval/scan.log 2>&1 &
+
+Useful options: -n N / -T SECS stop each zip after N entries / the scan
+after SECS seconds (a quick check that an archive decrypts); -r N readers
+per zip; -j N zips at once; -t N hashing threads; -m MiB of sample data
+buffered between the readers and the hashing threads (default 2048; a
+sample larger than that is read and hashed alone); --streaming reads a zip
+without its central directory (a truncated copy), with one reader and no
+recovery after a corrupt entry.
+
+Why these defaults. On the virgil VM (16 vCPU Westmere E5645, no SHA-NI or
+AVX; RAID5 over virtiofs) the scan is CPU-bound at about 130-140 MB/s of
+sample data (90-115 MB/s through the zips). A third of the CPU goes to the
+readers: libarchive decrypts ZipCrypto one byte at a time through zlib's
+crc32, which costs more than the inflate, and does both on the thread that
+reads the entry. So each zip has several readers (-r), each with its own
+libarchive handle taking every r-th entry and seeking over the others; they
+move through the file together and a prefetch thread reads 512 MiB ahead
+of them with large reads, so the disk sees one sequential stream. The rest
+goes to hashing (TLSH and ssdeep about a quarter each, SHA-256 8%). Two
+zips at once (-j 2) were slower than one (about 70 MB/s against 95-113
+MB/s through the zips): the RAID streams one file at 300-450 MB/s but
+seeks between two.
+
+vsscan sets TZ=UTC when TZ is unset: libarchive calls mktime for every
+entry's timestamp, and with no TZ and no /etc/localtime (as on the VM)
+glibc tries to open /etc/localtime on every call under its global lock,
+which serialized the readers (131,072 failed opens per zip and reader).
+
+The 72 zips hold 9,437,183 samples, 3.82 TB uncompressed in 2.88 TB of
+zips; the first, VirusShare_00000.zip (131,072 samples, 21.6 GB in a 14.6
+GB zip), scans in 165 s with no errors.
+
+2. Build the hset. The hset record format stores fixed-length hash types
+only, so a record holds md5, sha1, sha256, tlsh and size (TNULL: field
+absent, no TLSH row); the file gets the md5, sha1, sha2_256, tlsh and sizes
+hash sections, and the TLSH section its TVEC embedding vectors and TIVF
+kNN index. ssdeep, entropy, zip and member name are not representable in
+the hset and stay in the TSVs, which are the full-fidelity sidecar (join on
+sha256 or md5).
+
+  vsscan build --name 'VirusShare 0-71' --desc 'VirusShare_00000-00071 samples' \
+    OUTDIR/virusshare-0-71.hset OUTDIR
+
+An INPUT directory means its data TSVs (not *.errors.tsv or *.summary.tsv);
+TSV files can also be listed. Identical records collapse to one.
+HSET_TLSH_OPTIONS or --tlsh-options select the TLSH sections as for
+mkhashset (default 3, both).
+
+Build cost, measured at full scale on the VM (9,437,184 synthetic rows: the
+131,072 real TLSH digests of VirusShare_00000 in 72 copies with a few body
+nibbles mutated per copy, random md5/sha1/sha256): 411 s in all, 103 s of it
+parsing the TSVs; then the builder sorts the records, builds the TIVF index
+on all CPUs and writes the hash sections, RIDX, TVEC, TIVF and the file
+SHA-256. The file is 12.5 GB (TVEC is 9.9 GB of it). The builder works in a
+shared mapping of the output file: its anonymous memory peaked at 420 MB,
+and the 12 GB of file pages it touched (maxrss 12.4 GB) are page cache that
+the kernel writes back and can reclaim (MemAvailable stayed above 30 GB),
+so the whole set builds in one pass in 31 GB of RAM, with no per-zip hsets
+or merges. The output's file system needs room for the file and nothing
+else (no temp files with records).
+
+The same records can be built with mkhashset from the TSVs (size must be
+the last column: mkhashset parses a size to the end of the line):
+
+  for f in OUTDIR/VirusShare_000*[0-9].tsv ; do tail -n +2 $f ; done |
+    awk -F'\t' '{print $5, $6, $7, $8, $4}' >vs.txt
+  mkhashset 'VirusShare 0-71' 'VirusShare_00000-00071 samples' \
+    md5 sha1 sha2256 tlsh size true true vs.txt virusshare-0-71.hset
