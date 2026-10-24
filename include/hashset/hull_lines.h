@@ -63,25 +63,28 @@ inline void collect_slopes(const std::vector<Point<double>>& hull,
 
 } // namespace hull_detail
 
-// Compute per-block supporting-line slab parameters for every leading-byte
-// block.  For each block with at least one stored hash, gathers points
+// Compute per-block supporting-line slab parameters for every block, a block
+// being the hashes whose leading byte has the same top BlockBits bits (the
+// block BlockLinearLookupStrategy<L, BlockBits> looks up).  For each block with at least one stored hash, gathers points
 // (e_i, d_i) where e_i = expected_index and d_i = i - e_i, builds convex
 // hulls to enumerate candidate slopes, picks the min-width slab, stores it as
 // float, then verifies and widens until every stored hash is bounded.
-template <class SetT>
-std::array<BlockLine, 256> make_block_hull_lines(const SetT& hs) {
-  std::array<BlockLine, 256> lines;
-  std::array<std::vector<Point<double>>, 256> pts;
+template <size_t BlockBits = 8, class SetT>
+std::array<BlockLine, (1u << BlockBits)> make_block_hull_lines(const SetT& hs) {
+  static_assert(BlockBits <= 8, "a block is keyed by the leading byte's top bits");
+  constexpr size_t Blocks = 1u << BlockBits;
+  std::array<BlockLine, Blocks> lines;
+  std::array<std::vector<Point<double>>, Blocks> pts;
 
   // Gather (expected_index, deviation) points for each block.
   for (size_t i = 0; i < hs.count; ++i) {
     const uint8_t* h = hs.at(i);
     const size_t   e = expected_index(h, static_cast<uint32_t>(hs.count));
     const double   d = static_cast<double>((int64_t)i - (int64_t)e);
-    pts[h[0]].emplace_back(static_cast<double>(e), d);
+    pts[h[0] >> (8 - BlockBits)].emplace_back(static_cast<double>(e), d);
   }
 
-  for (int b = 0; b < 256; ++b) {
+  for (size_t b = 0; b < Blocks; ++b) {
     auto&     P  = pts[b];
     BlockLine& bl = lines[b];
 

@@ -166,147 +166,6 @@ std::pair<int64_t, int64_t> make_left_right(const ConstHashsetData& hsd) {
   return { left, right };
 }
 
-template <class T>
-double distance(const Point<T>& p, double a, double b) {
-  return std::abs(b + a * p.x - p.y) / std::sqrt(1 + a * a);
-}
-
-//std::pair<double, double> least_upper_bound(const std::vector<Point>& pts) {
-template <class T>
-std::pair<float, float> least_upper_bound(const std::vector<Point<T>>& pts) {
-
-  float min_err = std::numeric_limits<float>::max();
-  float best_a = 0.0;
-  float best_b = 0.0;
-
-  // check each segment for best fit
-
-  for (auto j = 1u; j < pts.size(); ++j) {
-    auto i = j - 1;
-
-    const float a = float(pts[j].y - pts[i].y) / (pts[j].x - pts[i].x);
-    const float b = pts[j].y - a * pts[j].x;
-
-    float err = 0.0;
-    for (auto k = 0u; k < pts.size(); ++k) {
-      const auto d = distance(pts[k], a, b);
-      err += d * d;
-    }
-
-    if (err < min_err) {
-      best_a = a;
-      best_b = b;
-      min_err = err;
-    }
-  }
-
-  return { best_a, best_b };
-}
-
-//std::pair<double, double> greatest_lower_bound(const std::vector<Point>& pts) {
-template <class T>
-std::pair<float, float> greatest_lower_bound(const std::vector<Point<T>>& pts) {
-  float min_err = std::numeric_limits<double>::max();
-  float best_a = 0.0;
-  float best_b = 0.0;
-
-  // check each segment for best fit
-
-  for (auto j = 1u; j < pts.size(); ++j) {
-    auto i = j - 1;
-
-    const float a = double(pts[j].y - pts[i].y) / (pts[j].x - pts[i].x);
-    const float b = pts[j].y - a * pts[j].x;
-
-    float err = 0.0;
-    for (auto k = 0u; k < pts.size(); ++k) {
-      const auto d = distance(pts[k], a, b);
-      err += d * d;
-    }
-
-    if (err < min_err) {
-      best_a = a;
-      best_b = b;
-      min_err = err;
-    }
-  }
-
-  return { best_a, best_b };
-}
-
-//std::tuple<double, double, double, double> make_linear_bounds(const std::vector<Point> pts, size_t active_bucket) {
-template <class T>
-std::tuple<float, float, float, float> make_linear_bounds(const std::vector<Point<T>> pts, size_t active_bucket) {
-  const auto uch = upper_ch(pts);
-  const auto lch = lower_ch(pts);
-
-/*
-  std::cout << "uch " << active_bucket << '\n';
-  for (const auto& p: uch) {
-    std::cout << p << '\n';
-  }
-  std::cout << '\n';
-*/
-  const auto ub = least_upper_bound(uch);
-//  std::cout << ub.first << ' ' << ub.second << "\n\n";
-
-/*
-  std::cout << "lch " << active_bucket << '\n';
-  for (const auto& p: lch) {
-    std::cout << p << '\n';
-  }
-  std::cout << '\n';
-*/
-
-  const auto lb = greatest_lower_bound(lch);
-//  std::cout << lb.first << ' ' << lb.second << "\n\n";
-
-  return { lb.first, lb.second, ub.first, ub.second };
-}
-
-template <
-  size_t HashLength,
-  size_t BucketBits
->
-//std::array<std::tuple<double, double, double, double>, (1 << BucketBits)> make_linear_bounds(const ConstHashsetData& hsd) {
-std::array<std::tuple<float, float, float, float>, (1 << BucketBits)> make_linear_bounds(const ConstHashsetData& hsd) {
-
-//  std::array<std::tuple<double, double, double, double>, (1 << BucketBits)> coef;
-  std::array<std::tuple<float, float, float, float>, (1 << BucketBits)> coef;
-
-  const uint8_t* const beg = static_cast<const uint8_t*>(hsd.beg);
-  const uint8_t* const end = static_cast<const uint8_t*>(hsd.end);
-
-  const std::array<uint8_t, HashLength>* hh = reinterpret_cast<const std::array<uint8_t, HashLength>*>(beg);
-
-  const size_t count = (end - beg) / HashLength;
-
-  std::vector<Point<int64_t>> pts;
-  size_t active_bucket = 0;
-
-  for (size_t i = 0; i < count; ++i) {
-    const size_t e = expected_index(hh[i].data(), count);
-    const int64_t delta = static_cast<int64_t>(i) - static_cast<int64_t>(e);
-
-    const size_t bi = hh[i][0] >> (8 - BucketBits);
-    if (bi > active_bucket) {
-      // close the bucket
-      coef[active_bucket] = make_linear_bounds(pts, active_bucket);
-      pts.clear();
-      active_bucket = bi;
-    }
-
-    pts.emplace_back(e, delta);
-  }
-
-  if (!pts.empty()) {
-    // close the last bucket
-    coef[active_bucket] = make_linear_bounds(pts, active_bucket);
-  }
-
-  return coef;
-}
-
 template <
   size_t HashLength,
   size_t BucketBits
@@ -396,11 +255,21 @@ template <
   size_t BucketBits
 >
 auto make_block_linear_ls(const ConstHashsetData& hsd) {
+  // make_block_hull_lines reads a set through count and at(i)
+  struct {
+    const uint8_t* beg;
+    size_t count;
+    const uint8_t* at(size_t i) const { return beg + i * HashLength; }
+  } const hs{
+    static_cast<const uint8_t*>(hsd.beg),
+    static_cast<size_t>(static_cast<const uint8_t*>(hsd.end) - static_cast<const uint8_t*>(hsd.beg)) / HashLength
+  };
+
   return std::unique_ptr<LookupStrategy>{
     std::make_unique<BlockLinearLookupStrategy<HashLength, BucketBits>>(
       hsd.beg,
       hsd.end,
-      make_linear_bounds<HashLength, BucketBits>(hsd)
+      make_block_hull_lines<BucketBits>(hs)
     )
   };
 }
