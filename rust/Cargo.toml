@@ -1,7 +1,7 @@
 [workspace]
 resolver = "2"
 members = ["hset", "hset-cli", "hset-testkit"]
-exclude = ["fuzz"]
+exclude = ["fuzz", "tlsh-bench"]
 
 [workspace.package]
 version = "0.1.0"
