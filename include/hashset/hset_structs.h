@@ -181,8 +181,8 @@ struct RecordFieldDescriptor {
 std::ostream& operator<<(std::ostream& out, const RecordFieldDescriptor& rfd);
 
 struct RecordHeader {
-  uint64_t record_length;
-  uint64_t record_count;
+  uint64_t record_length = 0;
+  uint64_t record_count = 0;
   std::vector<RecordFieldDescriptor> fields;
 
 // C++20: bool operator==(const RecordHeader&) const = default;
@@ -205,8 +205,8 @@ struct RecordData {
 std::ostream& operator<<(std::ostream& out, const RecordData& rdat);
 
 struct ConstRecordData {
-  const uint8_t* beg;
-  const uint8_t* end;
+  const uint8_t* beg = nullptr;
+  const uint8_t* end = nullptr;
 
 // C++20: bool operator==(const ConstRecordData&) const = default;
   bool operator==(const ConstRecordData& o) const {
