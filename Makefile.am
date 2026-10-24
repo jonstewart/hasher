@@ -194,6 +194,11 @@ test_test_CPPFLAGS = $(AM_CPPFLAGS) $(CATCH2_CFLAGS)
 
 test_test_LDADD = $(HASHER_LIB) $(TEST_LIBS) $(CATCH2_LIBS)
 
+# TLSH kNN eval driver (bench/README.md, "vs_knn_eval")
+check_PROGRAMS += bench/vs_knn_eval
+bench_vs_knn_eval_SOURCES = bench/vs_knn_eval.cpp
+bench_vs_knn_eval_LDADD = $(HASHER_LIB) $(PROJECT_LIBS) -lpthread
+
 test_bench_hex_SOURCES = \
 	test/bench_hex.cpp
 

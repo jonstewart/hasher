@@ -217,6 +217,117 @@ same 10%, so that is run-to-run variation on a shared box. The export takes
 aggregate pass 5.4 s, the 710 MB CSV 8.5 s), and the notfound check against
 the sorted list 13.5 s.
 
+## vs_knn_eval: TLSH kNN eval against a real hset
+
+`vs_knn_eval.cpp` times TLSH k-nearest-neighbour queries one at a time against
+the TLSH hash set of an hset with `TVEC` vectors and a `TIVF` index (the
+VirusShare hset, or a synthetic one), with three methods per query:
+
+* `brute`: `sfhash_hashset_tlsh_knn_with(..., SFHASH_TLSH_KNN_BRUTE)`, every
+  row, exact; the TLSH ground truth.
+* `index`: `sfhash_hashset_tlsh_knn_with(..., SFHASH_TLSH_KNN_INDEX)`, the
+  `TIVF` search, exact (docs/TLSH_EMBEDDING.md section 4).
+* `embed`: approximate kNN in embedding space, CrowdStrike style:
+  `sfhash_tlsh_embed` of the query, squared Euclidean distance to every row of
+  the `TVEC` matrix (`sfhash_hashset_tlsh_vectors`, all 264 dims, the length
+  dim only with `--include-length true`), top k in a bounded max-heap on
+  (dist2, row), so ties go to the lower row. The distance is a plain loop with
+  float reassociation allowed for that one function, so that GCC vectorizes
+  it (SSE here); `--embed-kernel lib` uses the library's strictly ordered,
+  scalar `sfhash_tlsh_embed_dist2` instead (about 2.5x slower per row).
+
+Two query sets of `--queries` (1,000) each: `member`, rows sampled uniformly
+without replacement from the non-null rows (the query is that row's digest),
+and `random`, uniformly random valid digests (uniform L byte, Q1/Q2 nibbles,
+checksum byte and 128 2-bit codes; reserved byte 0; never the null digest;
+each round-trips through `sfhash_tlsh_to_hex` / `sfhash_tlsh_from_hex`), which
+stand in for client queries not in the set. Both use `std::mt19937_64` with
+fixed, recorded seeds (`--member-seed`, `--random-seed`).
+
+```sh
+make bench/vs_knn_eval
+bench/vs_knn_eval --hset vs.hset --out knn-out --pin-cpu 2
+# defaults: --k 100 --max-distance unbounded --include-length true
+#           --queries 1000 --warm-reads 3 --warmup 50 --deep-k 1000
+```
+
+Timing. Before anything is timed, the file is read sequentially `--warm-reads`
+times (MiB/s per pass printed: the first pass shows whether it was cached),
+then mapped with `MAP_POPULATE`, and the size is printed against
+MemAvailable, with a warning when it does not fit; the fraction of the mapping
+resident (`mincore`) is recorded before and after the timed passes. The
+passes run per set, per method (all 1,000 queries of one method in a row,
+each method warmed by `--warmup` untimed queries of that set, drawn with
+`--warmup-seed` apart from the measured ones). Each query is timed alone with
+`steady_clock` around the kNN call only (for `embed`: query embedding, scan
+and heap). The timer overhead (an empty region, 1M repetitions) is recorded
+and not subtracted. The timing thread is single-threaded; `--pin-cpu C` pins
+it to CPU C. `taskset -c C bench/vs_knn_eval ...` pins it too, but then the
+untimed analysis pass below also runs on that one CPU; give taskset a set of
+CPUs and `--pin-cpu` one of them, or use `--pin-cpu` alone. On this VM the
+online CPUs are 0-3 and 12-23 (`cat /sys/devices/system/cpu/online`).
+
+Analysis pass (untimed, after the timed passes, `--threads`, default all CPUs,
+eight queries per scan): for every query, the TLSH distance of every row (a
+histogram), and the embedding ranking to depth `--deep-k` with the same
+distance function as the timed `embed` (its top k is checked to be a prefix).
+`--no-analysis` skips it.
+
+Outputs in `--out` (CSV with a header; `read_csv_auto` in DuckDB; ranks are
+1-based, rows are TLSH hash-set row indexes, usable with
+`sfhash_hashset_hash` and the record map):
+
+| file | columns |
+|------|---------|
+| `queries.csv` | `qset, qid, digest` (T1 hex), `lval` (L byte), `source_row` (empty for random), `n_identical` (rows with this exact digest, the query's own row included), `d_k` (k-th smallest TLSH distance), `count_lt` / `count_le` (rows with distance < / <= `d_k`), `index_exact` (brute and index results identical) |
+| `timings.csv` | `qset, qid, method, ns, n_results, ivf_cells, ivf_lists, ivf_rows` (index only: header cells visited, list bounds evaluated, rows scanned; from a second, untimed run of the same search) |
+| `results.csv` | `qset, qid, method, rank, row_idx, tlsh_dist, emb_dist2` (`tlsh_dist` from `sfhash_tlsh_diff` with the length setting, computed after timing; `emb_dist2` with the embed kernel, for all three methods) |
+| `deep.csv` | `qset, qid, rank, row_idx, emb_dist2, tlsh_dist`: embedding top `--deep-k` |
+| `hist.csv` | `qset, qid, tlsh_dist, n_rows`: the full distance histogram, nonzero bins (`--no-hist` to skip) |
+| `run.json` | hset path, size, name, rows, null rows, lists; parameters; seeds (hex strings); warm-up passes and settings; timer overhead; CPU, affinity, MemTotal/MemAvailable, residency; date, git commit, argv; per pass n/mean/median/stddev/p99/max/min in us; checks |
+| `summary.txt` | the printed summary |
+
+With ties at the k-th distance (identical digests are common in real
+malware), a tie-aware relevance is `tlsh_dist <= d_k`: any k rows with
+distance at most `d_k` are a correct answer, `count_le` rows qualify, and
+`count_lt` of them must be in every correct answer. p99 is nearest-rank
+(`quantile_disc(ns, 0.99)`), stddev the sample stddev.
+
+The summary prints, per set and method, mean, median, stddev, p99, max and min
+in us and ns per row; per set the brute/index mismatches (flagged loudly; the
+run continues and exits with status 3) and the mean recall@k of embed against
+brute, naive (row overlap) and tie-aware. It also warns if the library's
+distances disagree with `sfhash_tlsh_diff`, if brute's k-th distance disagrees
+with the histogram, or if the embed top k is not the prefix of the deep
+ranking. For example, recall@100 in SQL:
+
+```sql
+create view q as from 'knn-out/queries.csv';
+create view r as from 'knn-out/results.csv';
+select e.qset, avg(hit) as recall_naive, avg((e.tlsh_dist <= q.d_k)::int) as recall_tie
+from (select e.*, exists (select 1 from r b where b.method = 'brute' and b.qset = e.qset
+        and b.qid = e.qid and b.row_idx = e.row_idx)::int as hit
+      from r e where e.method = 'embed') e
+join q using (qset, qid) group by e.qset;
+```
+
+Synthetic check (2026-10-24, Xeon E5645, `--pin-cpu 2`, other work on the
+VM; `make_tlsh_corpus` digests plus 15% exact duplicates, built by
+`mkhashset ... md5 tlsh true true`; mean us per query, member / random):
+
+| rows | queries/set | brute | index | embed | embed recall@100 naive / tie-aware | brute/index mismatches | wall |
+|------|-------------|-------|-------|-------|------------------------------------|------------------------|------|
+| 100k | 1,000 | 2,876 / 3,143 | 1,485 / 1,871 | 22,492 / 22,956 | 0.780 / 0.787, 0.230 / 0.239 | 0 | 71 s |
+| 1M | 1,000 | 22,899 / 31,476 | 1,807 / 15,209 | 202,479 / 237,480 | 0.904 / 0.919, 0.210 / 0.220 | 0 | 602 s |
+| 4M | 200 | 119,373 / 141,308 | 1,005 / 33,177 | 897,950 / 874,696 | 0.945 / 0.990, 0.132 / 0.140 | 0 | 510 s |
+
+Brute costs 23-35 ns per row and embed 200-240 ns per row (1,056 bytes of
+floats per row, single-threaded, memory-bound), so at 9M rows a query costs
+about 0.3 s and 2 s, and the default run (2 sets x 1,000 queries x 3 methods,
+warm-ups and the analysis pass included) takes about 1.6-1.8 hours, most of
+it in embed. The library is built for baseline x86-64 (no `-mpopcnt`), so
+brute and index count bits without the POPCNT instruction this CPU has.
+
 ## Files
 
 * `eval.cpp`             — frozen eval driver (all 9 candidates, 4 datasets, fixed seeds)
@@ -231,3 +342,4 @@ the sorted list 13.5 s.
 * `harness.h`            — (legacy) data generation for `bench_lookup.cpp`
 * `bench_lookup.cpp`     — (legacy) standalone benchmark driver
 * `vs_lookup_eval.cpp`   — per-query lookup eval against a real hset (`make bench/vs_lookup_eval`)
+* `vs_knn_eval.cpp`      — TLSH kNN eval (brute / index / embed) against a real hset (`make bench/vs_knn_eval`)
