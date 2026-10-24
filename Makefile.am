@@ -139,7 +139,11 @@ src_hsetop_hsetop_LDADD = $(HASHER_LIB) $(PROJECT_LIBS)
 
 bin_PROGRAMS = src/fuzzy/fuzzy src/hasher/hasher src/mkhashset/mkhashset src/hsetop/hsetop
 
-check_PROGRAMS = test/test test/bench_hex test/bench_hsd test/bench_tlsh test/bench_hset_merge
+check_PROGRAMS = test/test test/bench_hex test/bench_hsd test/bench_tlsh test/bench_hset_merge bench/bench_eval
+
+bench_bench_eval_SOURCES = bench/eval.cpp src/lib/hashset/util.cpp
+bench_bench_eval_CPPFLAGS = -Iinclude -Ibench -Ivendors/parallel-hashmap
+bench_bench_eval_CXXFLAGS = $(AM_CXXFLAGS) -O3 -march=native
 
 TESTS = \
 	test/test \
@@ -155,6 +159,7 @@ test_test_SOURCES = \
 	test/test_hashset_api.cpp \
 	test/test_hashsetdata_util.cpp \
 	test/test_hex.cpp \
+	test/test_hset_batch.cpp \
 	test/test_hset_decoder.cpp \
 	test/test_hset_decoder_chunks.cpp \
 	test/test_hset_encoder.cpp \
@@ -165,8 +170,10 @@ test_test_SOURCES = \
 	test/test_hset_round_trip.cpp \
 	test/test_hset_tlsh.cpp \
 	test/test_hset_tlsh_vectors.cpp \
+	test/test_hull_lines.cpp \
 	test/test_record_iterator.cpp \
 	test/test_parser.cpp \
+	test/test_probe.cpp \
 	test/test_tlsh.cpp \
 	test/test_tlsh_cell_search.cpp \
 	test/test_tlsh_embedding.cpp \

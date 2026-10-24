@@ -1,4 +1,5 @@
 #include "hashset/util.h"
+#include "hashset/probe.h"
 
 #include <boost/endian/conversion.hpp>
 
@@ -18,3 +19,8 @@ uint32_t expected_index(const uint8_t* h, uint32_t set_size) {
   );
   return static_cast<uint32_t>((high32 * set_size) >> 32);
 }
+
+#ifdef HASHER_PROBE
+uint64_t g_hasher_probe_touches = 0;
+uint64_t g_hasher_probe_cmps = 0;
+#endif

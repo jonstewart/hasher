@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 72dca6ce5ae7f6b8847ab1b48e140df920a7d8b3ce36e5faefd1116d4f4db72f # shrinks to d = Doc { fields: [Field { htype: Sha2_512, name: "Y 2 v7-_Qpy l__N _X" }], records: [[Some([128, 255, 255, 255, 255, 255, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0])], [Some([128, 255, 255, 255, 255, 128, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0])]], opts: Opts { name: "", desc: "", timestamp: "2024-01-01T00:00:00Z", with_records: true, with_hashsets: true, hint: Hull { bits: 10 }, bits_policy: BitsPolicy { budget: 0.0, min_bits: 0, max_bits: 0 } } }

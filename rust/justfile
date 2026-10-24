@@ -1,0 +1,190 @@
+# hset task runner. `just --list` for the menu.
+#
+# Recipes run through sh. Tiers: `check` is the commit gate; `check-slow`
+# is nightly. Every deeper tier compares against Rust-internal oracles.
+
+set shell := ["sh", "-euc"]
+
+# Seconds each fuzz target runs under `just fuzz-ci`.
+fuzz_seconds := env_var_or_default("FUZZ_SECONDS", "60")
+# Sanitizer for fuzz builds. The crate has one `unsafe` (a prefetch hint);
+# sanitizer-free builds are portable to the Mac.
+fuzz_sanitizer := env_var_or_default("FUZZ_SANITIZER", "none")
+# Parallel cargo-mutants jobs.
+mutants_jobs := env_var_or_default("MUTANTS_JOBS", "2")
+# Memory cap for the cargo-mutants scope (Linux only).
+mutants_memory := env_var_or_default("MUTANTS_MEMORY", "3G")
+# Memory cap for the cargo-kani scope (Linux only). 4G passes all 29
+# harnesses here.
+kani_memory := env_var_or_default("KANI_MEMORY", "4G")
+# Proptest cases for `just prop`.
+proptest_cases := env_var_or_default("PROPTEST_CASES", "20000")
+
+# List the available recipes.
+default:
+    @just --list
+
+# Format every crate in place.
+fmt:
+    cargo fmt --all
+
+# Fail if anything is unformatted.
+fmt-check:
+    cargo fmt --all -- --check
+
+# Clippy over the workspace with warnings fatal.
+lint:
+    cargo clippy --workspace --all-targets -- -D warnings
+    cargo clippy --manifest-path fuzz/Cargo.toml --all-targets -- -D warnings
+
+# Commit gate: unit, interop, CLI and property tests at default case counts.
+# nextest does not run doctests, so they run separately to keep this the
+# same test set as `cargo test --workspace`.
+test:
+    #!/bin/sh
+    set -eu
+    if ! command -v cargo-nextest >/dev/null 2>&1; then
+        echo "test: cargo-nextest is required (cargo install cargo-nextest)" >&2
+        exit 1
+    fi
+    cargo nextest run --workspace
+    cargo test --workspace --doc
+
+# Property tests at a high case count (the whole suite; example tests
+# cost seconds and the in-crate proptests live in the unit-test binaries).
+prop:
+    PROPTEST_CASES={{ proptest_cases }} cargo nextest run --workspace
+
+# Fast gate, run on every change.
+check: fmt-check lint test
+
+# Fuzz one target without a time limit: `just fuzz lookup`. Extra arguments
+# go to libFuzzer. New inputs land in target/fuzz-corpus so the committed
+# seeds stay clean (fuzz/README.md).
+fuzz target *extra:
+    #!/bin/sh
+    set -eu
+    if ! command -v cargo-fuzz >/dev/null 2>&1; then
+        echo "SKIP: cargo-fuzz not installed; cargo install cargo-fuzz" >&2
+        exit 0
+    fi
+    case "{{ target }}" in lookup) max_len=1048576 ;; *) max_len=65536 ;; esac
+    mkdir -p "target/fuzz-corpus/{{ target }}" "fuzz/corpus/{{ target }}"
+    cargo fuzz run -s {{ fuzz_sanitizer }} "{{ target }}" \
+        "target/fuzz-corpus/{{ target }}" "fuzz/corpus/{{ target }}" -- \
+        -timeout=10 -rss_limit_mb=2048 -dict=fuzz/hset.dict -max_len=$max_len {{ extra }}
+
+# Bounded fuzzing: every target, FUZZ_SECONDS each.
+fuzz-ci:
+    #!/bin/sh
+    set -eu
+    if ! command -v cargo-fuzz >/dev/null 2>&1; then
+        echo "SKIP: cargo-fuzz not installed; cargo install cargo-fuzz" >&2
+        exit 0
+    fi
+    targets=$(cargo fuzz list)
+    if [ -z "$targets" ]; then
+        echo "no fuzz targets found under fuzz/fuzz_targets/" >&2
+        exit 1
+    fi
+    for target in $targets; do
+        echo "fuzzing $target for {{ fuzz_seconds }}s"
+        just fuzz "$target" -max_total_time={{ fuzz_seconds }}
+    done
+
+# Fold the scratch corpus of one target into the committed seeds, minimised.
+# `cargo fuzz cmin` minimises a single directory in place, so the scratch
+# inputs are copied in first. A greedy set cover over edge coverage (hit
+# counts ignored) keeps the seeds to a few dozen files per target.
+fuzz-seed target:
+    #!/bin/sh
+    set -eu
+    if ! command -v cargo-fuzz >/dev/null 2>&1; then
+        echo "SKIP: cargo-fuzz not installed; cargo install cargo-fuzz" >&2
+        exit 0
+    fi
+    mkdir -p "fuzz/corpus/{{ target }}" "target/fuzz-corpus/{{ target }}"
+    find "target/fuzz-corpus/{{ target }}" -type f -exec cp {} "fuzz/corpus/{{ target }}/" \;
+    cargo fuzz cmin -s {{ fuzz_sanitizer }} "{{ target }}" "fuzz/corpus/{{ target }}" -- \
+        -set_cover_merge=1 -use_counters=0
+
+# Model-check the pure integer functions of hset with Kani, if installed.
+# A runaway harness eats memory first (an uncapped run killed a session on
+# the dev VM), so on Linux it sits in the same capped systemd scope as
+# `mutants`, with the same OOMPolicy=continue.
+verify:
+    #!/bin/sh
+    set -eu
+    if ! cargo kani --version >/dev/null 2>&1; then
+        echo "SKIP: kani not installed. cargo install kani-verifier && cargo kani setup" >&2
+        exit 0
+    fi
+    if ! command -v systemd-run >/dev/null 2>&1; then
+        echo "NOTE: systemd-run not found; running cargo kani without a memory cap" >&2
+        cargo kani -p hset
+        exit 0
+    fi
+    systemd-run --user --scope -q -p MemoryMax={{ kani_memory }} -p MemorySwapMax=0 \
+        -p OOMPolicy=continue \
+        cargo kani -p hset
+
+# Shared cargo-mutants invocation: the cargo-mutants guard, the ../test
+# fixtures guard and HSET_FIXTURES_DIR export, then the capped systemd
+# scope. Private (leading underscore): `mutants` and `mutants-diff` are the
+# public entry points, each calling this with its own cargo-mutants
+# arguments, so the guard and the cap are written once.
+# A runaway mutant eats memory first, so on Linux the run sits in a systemd
+# scope with a hard cap. OOMPolicy=continue: the scope's default policy
+# stops the whole unit on the first OOM kill, which would discard the run
+# over one runaway mutant; `continue` kills just that test process and lets
+# cargo-mutants record it as caught.
+# cargo-mutants copies only the `rust/` workspace into a tempdir, so the C++
+# fixtures under `test/` (outside the workspace) are not there; export
+# HSET_FIXTURES_DIR as an absolute path so the copied tree's tests still
+# find them (see hset-testkit::fixtures).
+_mutants-run *args:
+    #!/bin/sh
+    set -eu
+    if ! command -v cargo-mutants >/dev/null 2>&1; then
+        echo "mutants: cargo-mutants is required (cargo install cargo-mutants)" >&2
+        exit 1
+    fi
+    if [ ! -d ../test ]; then
+        echo "mutants: ../test (the C++ fixtures) not found" >&2
+        exit 1
+    fi
+    HSET_FIXTURES_DIR="$(cd ../test && pwd)"
+    export HSET_FIXTURES_DIR
+    if ! command -v systemd-run >/dev/null 2>&1; then
+        echo "NOTE: systemd-run not found; running cargo-mutants without a memory cap" >&2
+        cargo mutants {{ args }}
+        exit 0
+    fi
+    systemd-run --user --scope -q -p MemoryMax={{ mutants_memory }} -p MemorySwapMax=0 \
+        -p OOMPolicy=continue \
+        cargo mutants {{ args }}
+
+# Mutation-test one crate: `just mutants hset`. See `_mutants-run` above
+# for the fixtures export and the memory cap.
+mutants crate:
+    just _mutants-run --package {{ crate }} -j {{ mutants_jobs }}
+
+# Mutants only in code changed since main: the daily form. `--relative`
+# keeps diff paths rooted at `rust/`, matching what cargo-mutants expects;
+# without it every path is prefixed with `rust/` and nothing matches. See
+# `_mutants-run` above for the fixtures export and the memory cap.
+mutants-diff:
+    #!/bin/sh
+    set -eu
+    mkdir -p target
+    git diff --relative main... > target/mutants.diff
+    just _mutants-run --workspace --in-diff target/mutants.diff -j {{ mutants_jobs }}
+
+# Slow gate, run on a cadence: high-count proptests, bounded fuzzing, the
+# Kani harnesses, then mutation testing.
+check-slow: prop fuzz-ci verify
+    #!/bin/sh
+    set -eu
+    for crate in hset hset-cli; do
+        just mutants "$crate"
+    done

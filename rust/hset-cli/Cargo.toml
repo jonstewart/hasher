@@ -1,0 +1,22 @@
+[package]
+name = "hset-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Command-line tools for making and querying .hset hash-set files"
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "hset"
+path = "src/main.rs"
+
+[dependencies]
+hset = { path = "../hset" }
+clap.workspace = true
+memmap2.workspace = true
+
+[dev-dependencies]
+hset-testkit.workspace = true
+proptest.workspace = true

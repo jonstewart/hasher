@@ -24,7 +24,11 @@ void to_hex(char* dst, const void* src, size_t slen);
 #endif
 
 template <typename C>
-#if defined(HAVE_FUNC_ATTRIBUTE_IFUNC) && defined(HAVE_FUNC_ATTRIBUTE_TARGET_CLONES)
+// clang does not support target_clones on function templates ("multiversioned
+// functions do not yet support function templates"); it's redundant here anyway
+// since the scalar/SIMD work lives in the multiversioned 3-arg to_hex() this
+// calls, which dispatches at runtime via ifunc. So apply it on GCC only.
+#if defined(HAVE_FUNC_ATTRIBUTE_IFUNC) && defined(HAVE_FUNC_ATTRIBUTE_TARGET_CLONES) && !defined(__clang__)
 __attribute__((target_clones(
 #ifdef HAVE_X86INTRIN_H
 "avx2", "sse4.1",

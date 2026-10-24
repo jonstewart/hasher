@@ -49,5 +49,28 @@
 /test/*.log
 /test/*.trs
 /test/*.hset
-.DS_Store
 /rust/tlsh-bench/target/
+
+# hash-set files written by the test suite (round-trip / set-ops / api tests).
+# The committed fixtures (good.hset, test1.hset, 0123456789_*.hset) are tracked
+# and unaffected.
+/test/bogus.hset
+/test/sha1.hset
+/test/md5_sha1_a.hset
+/test/md5_sha1_b.hset
+/test/md5_sha1_aub.hset
+/test/md5_sha1_anb.hset
+/test/md5_sha1_a-b.hset
+
+# standalone benchmark binaries
+bench/bench_lookup
+bench/bench_eval
+bench/bench_eval_pg
+bench/bench_eval_probe
+bench/gmon.out
+bench/perf.data
+bench/perf.data.old
+
+# macOS metadata copied in with the tree (AppleDouble forks and Finder state)
+._*
+.DS_Store

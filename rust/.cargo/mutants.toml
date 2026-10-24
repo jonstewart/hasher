@@ -1,0 +1,141 @@
+# cargo-mutants configuration. Every exclusion says why the mutation is
+# unobservable; anything else that survives gets a test or is removed.
+#
+# cargo-mutants copies only this workspace into a tempdir per build, so the
+# C++ reference fixtures under `test/` (one level above `rust/`, outside the
+# workspace) are not there; the `mutants` and `mutants-diff` recipes export
+# HSET_FIXTURES_DIR as an absolute path so the fixture-backed tests in the
+# copy still find them (see hset-testkit::fixtures).
+test_tool = "nextest"
+
+# Test infrastructure and benchmarks are not the system under test.
+exclude_globs = ["hset-testkit/**", "**/benches/**", "**/examples/**"]
+
+exclude_re = [
+    # Written as a bare `proofs::` prefix, not `::proofs::`: cargo-mutants
+    # prints mutant locations as bare paths with no leading `::`, so the
+    # anchored form never matches. Leave the `\b` as-is; don't "simplify"
+    # it back to `::proofs::`.
+    "\\bproofs::",           # Kani harnesses: not compiled under cfg(test), no test can see them
+    "\\bprefetch\\b",        # cache hint with no observable result
+    "\\bprefetch_entry\\b",  # same, on the Model trait
+    "::describe\\b",         # diagnostics text
+    "::table_bytes\\b",      # diagnostics
+    "::mean_window\\b",      # diagnostics; only steers which batch path runs, answers are identical
+    "SetOp::name\\b",        # diagnostics
+
+    # --- Lookup search: mutations that change speed, never an answer ---
+    #
+    # The searches are exact for any window or bracket that still holds
+    # the lower bound, so arithmetic that only picks *which* exact search
+    # runs, where it probes first, or what it prefetches cannot change a
+    # result. Patterns name the exact `line:col: mutation` where the same
+    # function also has caught mutants with the same operator text;
+    # re-check them with `cargo mutants -p hset --list` after editing
+    # `hset/src/lookup/search.rs`.
+
+    # Prefetch hints. `prefetch_window` walks the cache lines of [lo, hi)
+    # issuing hints and `ptr_at` only produces their addresses (every
+    # caller passes i < n, so `i + L` and `i / L` stay inside the data).
+    # The whole of both is excluded, including a hint loop that a mutant
+    # makes walk the address space (a timeout) and a `hi / lo` that
+    # divides by zero: no answer depends on either function.
+    "Strategy<.*>::prefetch_window\\b",
+    "Strategy<.*>::ptr_at\\b",
+    # `prefetch_for` choosing which lines to hint: every surviving
+    # variant keeps the hinted index at most `hi <= n`. (Mutants that
+    # push it past the data panic in the slice and stay in.)
+    "replace Strategy<.*>::prefetch_for with \\(\\)",
+    "search\\.rs:(245:20: replace <= with >|245:16: replace \\* with [+/]|247:35: replace == with !=|253:49: replace \\* with [+/]) in Strategy<.*>::prefetch_for\\b",
+    # Window-size cut-overs between equally exact searches: binary search
+    # vs linear scan (`> 8` vs `== 8`/`>= 8` only moves where the scan
+    # takes over), k-ary steps vs binary search (the `hi - lo > 8` guard
+    # still bounds every k-ary step), and binary vs recursive/k-ary in
+    # `find_in_prefetched` and `find_recursive`.
+    "search\\.rs:264:19: replace > with (==|>=) in Strategy<.*>::lower_bound_binary\\b",
+    "search\\.rs:318:(23: replace > with (==|>=)|44: replace > with (==|<|>=)|40: replace \\* with [+/]|34: replace - with \\+) in Strategy<.*>::lower_bound_kary\\b",
+    "search\\.rs:(368:(36: replace <= with >|32: replace \\* with [+/]|26: replace - with \\+)|370:35: replace == with !=) in Strategy<.*>::find_in_prefetched\\b",
+    "search\\.rs:165:(30: replace <= with >|26: replace \\* with [+/]|20: replace - with \\+) in Strategy<.*>::find_recursive\\b",
+    # k-ary probe placement: the probes stay sorted inside [lo, hi), and
+    # the returned sub-window (one wider, or ending at p[c+1] itself, which
+    # the following search returns when every key in it is smaller) still
+    # holds the lower bound and is strictly smaller than [lo, hi).
+    "search\\.rs:(291:32: replace \\* with \\+|309:51: replace \\+ with [-*]|310:55: replace \\+ with \\*) in Strategy<.*>::kary_step\\b",
+    # Recursive search estimates: the region's centre clamp and end move
+    # by one (the region stays non-empty and inside [lo, hi), since the
+    # radius is at least 2); the re-aimed centre and radius after a miss
+    # are only estimates (textually `b - 1 * d` is `b - d`); and the
+    # binary search of [lo, a) or [a, b) instead of [lo, a] or (a, b)
+    # returns the same lower bound, because key[a] is >= or < the query.
+    "search\\.rs:(145:51: replace - with [+/]|147:24: replace \\+ with [-*]) in Strategy<.*>::region\\b",
+    "search\\.rs:(183:46: replace - with [+/]|183:35: replace - with \\+|184:41: replace \\* with \\+|196:39: replace \\+ with [-*]|196:35: replace - with [+/]|197:41: replace \\* with \\+) in Strategy<.*>::find_recursive\\b",
+    "search\\.rs:(188:61|200:57): replace \\+ with \\* in Strategy<.*>::find_recursive\\b",
+    # Batch pipelines: the `lo < hi` guards in front of `prefetch_for`
+    # (an empty window hints at most index n, which is in bounds), the
+    # hash slice handed to `prefetch_for` only steers a hint, extra
+    # pipeline iterations past `count + 2D` do nothing (every stage checks
+    # its query index, and staged batches have at least 4 queries), and
+    # stage 3 never sees `i - 2D == count`.
+    "search\\.rs:(388:27: replace \\+ with \\*|402:23: replace < with (==|>|<=)|407:40: replace < with <=) in Strategy<.*>::batch_staged\\b",
+    "search\\.rs:(459:26: replace < with (==|>|<=)|460:56: replace \\* with /) in Strategy<.*>::batch_passes\\b",
+    # Lane batches: whether a lane interpolates, where its first probe
+    # goes and how it re-aims. Every probe is clamped into [lo, hi - 1]
+    # and every comparison shrinks the bracket, so each lane ends with the
+    # exact answer however its probes are chosen (`mid + 1 * d` is
+    # textually `mid + d`).
+    "search\\.rs:(498:43: replace == with !=|520:46: replace && with \\|\\||520:63: replace > with (==|<|>=)|520:59: replace \\* with [+/]|520:53: replace - with \\+) in Strategy<.*>::batch_lanes\\b",
+    "search\\.rs:(5(63|71):38: replace > with <|566:(47|51): replace \\+ with \\*|574:64: replace \\+ with \\*|586:40: replace match guard .* with (true|false)|586:60: replace > with (==|<|>=)|586:56: replace \\* with [+/]|586:47: replace - with \\+|587:43: replace -= with /=) in Strategy<.*>::batch_lanes\\b",
+    # Fewer than 4 queries per batch vs the batch pipelines: identical
+    # answers (`prop_lookup` checks every batch mode at sizes 0 to 257).
+    "search\\.rs:647:22: replace < with (==|>|<=) in <impl Lookup for Strategy<.*>>::contains_batch\\b",
+    # `equal_range` starting its scan at `first * 1` instead of
+    # `first + 1`: the extra comparison is with the hash just found.
+    "search\\.rs:(636|742):29: replace \\+ with \\* in <impl Lookup for (Strategy|DynBasic)<.*>>::equal_range\\b",
+
+    # --- Hull slope fitting: equivalent mutants ---
+    # `dx >= 0` / `last.x >= first.x` also admit dx == 0, whose slope
+    # dy / 0 is +inf or NaN and is rejected by the [0, 1] range check.
+    "hull\\.rs:(160:19|167:15): replace > with >= in choose_slope\\b",
+
+    # --- Outside lookup: equivalent mutants and capacity hints ---
+    #
+    # `|` -> `^` where the operands share no set bit, so both give the
+    # same value: a hex digit pair (`h << 4` has a zero low nibble, `l`
+    # is below 16), the digit and letter lane masks (a byte cannot be
+    # both), the narrowed SIMD byte (`w << 4` keeps the high digit in the
+    # top nibble of the low byte, `w >> 8` is the low digit; the high
+    # byte is dropped by `narrow`; this holds for valid digits, and the
+    # output is unspecified on failure), the big-endian key loads (`k << 8`
+    # has a zero low byte), hint tags (`0x6200`/`0x6800` plus a `u8`) and
+    # `HHnn` chunk tags (`HHDR` has a zero low half, `log2` is below 16).
+    "hex\\.rs:(68:53: replace \\| with \\^ in scalar::decode_into|170:26: replace \\| with \\^ in simd::nibbles|18[89]:28: replace \\| with \\^ in simd::decode_block)\\b",
+    "key\\.rs:(22:26: replace \\| with \\^ in key64|34:22: replace \\| with \\^ in key64_dyn)\\b",
+    "structs\\.rs:(84:12: replace \\| with \\^ in hint_tag_block|89:12: replace \\| with \\^ in hint_tag_hull)\\b",
+    "encode\\.rs:143:31: replace \\| with \\^ in encode\\b",
+    # `Md5 = 1 << 0` and `1 >> 0` are both 1.
+    "hash_type\\.rs:15:13: replace << with >>",
+    # Sizes passed to `reserve` / `with_capacity`: they only decide when
+    # the buffer reallocates, never its contents (capacity beyond the
+    # requested minimum is unspecified, so no test can pin it).
+    "hex\\.rs:(239:29: replace \\* with [+/] in encode_to_string|307:16: replace / with % in check_rows|316:(22|27): replace \\* with [+/] in encode_rows|316:35: replace \\+ with \\* in encode_rows)\\b",
+    # The `encode` capacity estimate: `*` in place of `+` (99:9, 103:30,
+    # 103:62) multiplies section sizes, so the requested capacity grows
+    # quadratically (over 10^14 bytes for about 1M hashes). Below that the
+    # bytes written are unchanged; whether a huge request fails depends
+    # on the OS's overcommit policy, which no portable test can pin.
+    # (`103:30` with `-` is not excluded: it underflows for hashes shorter
+    # than their 8-byte record index entries, see
+    # `short_hashes_with_a_record_index_encode`.)
+    "encode\\.rs:(99:9|103:62|103:30): replace \\+ with \\* in encode\\b",
+    # Hex row paths: at exactly `SCRATCH` bytes the per-row path and the
+    # batched path (one row per batch) produce the same bytes, and
+    # flushing an empty final batch decodes nothing.
+    "hex\\.rs:(324:18: replace > with >= in encode_rows|359:13: replace > with >= in encode_rows_to_writer|434:20: replace > with >= in decode_rows|455:17: replace > with >= in decode_rows)\\b",
+]
+
+# A mutant that breaks a loop bound in the search or the merge runs until
+# stopped; memory is capped by the systemd-run scope in `just mutants`,
+# which sets OOMPolicy=continue so an OOM kill removes only that mutant's
+# test process (recorded as caught) instead of aborting the whole run.
+minimum_test_timeout = 60
+timeout_multiplier = 3

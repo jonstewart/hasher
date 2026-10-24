@@ -2,6 +2,8 @@
 #include "parser.h"
 #include "throw.h"
 
+#include <algorithm>
+
 #include <boost/lexical_cast.hpp>
 
 using value_type = std::pair<const char*, const char*>;
