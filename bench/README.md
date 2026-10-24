@@ -328,6 +328,51 @@ warm-ups and the analysis pass included) takes about 1.6-1.8 hours, most of
 it in embed. The library is built for baseline x86-64 (no `-mpopcnt`), so
 brute and index count bits without the POPCNT instruction this CPU has.
 
+## vs_report: DuckDB analysis and HTML report for the two evals
+
+`vs_report/vs_report.py` loads a `vs_knn_eval` output directory and the
+`vs_lookup_eval` found / notfound CSVs (with their `.meta.json`) into a DuckDB
+file, computes the latency and information-retrieval metrics in SQL
+(`vs_report/sql/*.sql`), and writes a static, self-contained HTML report
+(inline SVG charts, no scripts, no network) whose prose is filled in from the
+numbers, with `[TO FINISH]` markers where a human judgement is needed. Python
+standard library only, DuckDB through its CLI.
+
+```sh
+python3 -I bench/vs_report/vs_report.py \
+    --knn /work/vs-eval/knn \
+    --found /work/vs-eval/lookup/lookup_found.csv \
+    --notfound /work/vs-eval/lookup/lookup_notfound.csv \
+    --out /work/vs-eval/report          # writes index.html and vs.duckdb
+# --build-seconds S  TVEC/TIVF build time, for the break-even query count
+# --synthetic        banner and caveat for a pipeline check
+# --threads 4 --memory 8GB (DuckDB), --reuse-db (re-render from an existing --db)
+```
+
+Any of `--knn`, `--found`, `--notfound` may be left out. The exit status is
+1 when a validation check fails: brute/index mismatches (rows, and distance
+at every rank), internal consistency of the kNN outputs (k-th distance,
+count_le against `hist.csv`, embed a prefix of the deep ranking), agreement
+with the program's `summary.txt` and `meta.json` statistics, page residency,
+and the lookup assertions (every stored SHA-256 found, no random one found).
+
+Metrics: latency per set x method (n, mean, median, stddev, p90, p99, p99.9,
+min, max), speedups (ratios of means and medians, per-query paired ratios),
+the index's work (rows, lists, cells) against its latency, latency against
+the neighbourhood (count_le, n_identical, d_k); for embed against the brute
+ground truth, per query and aggregated: precision, recall and F1 at k, naive
+(row identity) and tie-aware (relevant = distance <= d_k), recall over all
+tied rows, recall@k' to the deep depth (the recall of re-ranking k'
+embedding candidates by TLSH) and the depth needed, AP@k, nDCG@k with a
+graded gain, RBO, Kendall tau-b and Spearman rho, ROC and PR AUC with bounds
+for the rows beyond the recorded depth, and distance errors per rank and at
+the k-th result. The report defines each one. The tables (`lat_stats`,
+`speedup`, `ir_q`, `ir_summary`, `auc_q`, `deep_curve`, `depth_needed`,
+`dist_err_by_rank`, `index_work`, `density_corr`, `lookup_stats`, ...) stay
+in the DuckDB file for further queries. On the 1M synthetic run plus the 9M
+lookup CSV it takes about 2 minutes on 4 threads, most of it loading the
+9M-row found CSV.
+
 ## Files
 
 * `eval.cpp`             — frozen eval driver (all 9 candidates, 4 datasets, fixed seeds)
@@ -343,3 +388,4 @@ brute and index count bits without the POPCNT instruction this CPU has.
 * `bench_lookup.cpp`     — (legacy) standalone benchmark driver
 * `vs_lookup_eval.cpp`   — per-query lookup eval against a real hset (`make bench/vs_lookup_eval`)
 * `vs_knn_eval.cpp`      — TLSH kNN eval (brute / index / embed) against a real hset (`make bench/vs_knn_eval`)
+* `vs_report/`           — DuckDB analysis and static HTML report of the two evals (`vs_report.py`, `sql/`, `svgchart.py`, `report.css`)
