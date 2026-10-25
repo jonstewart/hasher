@@ -259,3 +259,91 @@ fn a_list_whose_members_all_drop_is_omitted() {
     assert_eq!(m.cell_lists[CELL + 1], 2);
     (&m).validate(&kept).unwrap();
 }
+
+//
+// rejected inputs (merge_tlsh_ivf_remaps_and_drops)
+//
+
+fn assert_rejected(r: hset::Result<TlshIvf>, needle: &str) {
+    match r {
+        Err(e) => assert!(e.to_string().contains(needle), "{e} lacks {needle:?}"),
+        Ok(_) => panic!("merge accepted, expected an error with {needle:?}"),
+    }
+}
+
+#[test]
+fn a_map_that_disagrees_with_the_index_row_count_is_an_error() {
+    let (h, _) = small_lists_cell();
+    let mut map = h.identity();
+    map.pop();
+    assert_rejected(
+        merge_tlsh_ivf(Some((&h.ivf, &map[..])), NONE, &h.rows, 0),
+        "row map",
+    );
+    let map = (0..=h.rows.len() as u32).collect::<Vec<_>>();
+    assert_rejected(
+        merge_tlsh_ivf(NONE, Some((&h.ivf, &map[..])), &h.rows, 0),
+        "row map",
+    );
+}
+
+#[test]
+fn a_map_not_increasing_within_a_list_is_an_error() {
+    // swap the outputs of the first two members of list A
+    let (h, _) = small_lists_cell();
+    let mut map = h.identity();
+    map.swap(h.ids[0][0] as usize, h.ids[0][1] as usize);
+    assert_rejected(
+        merge_tlsh_ivf(Some((&h.ivf, &map[..])), NONE, &h.rows, 0),
+        "not increasing",
+    );
+}
+
+#[test]
+fn more_output_rows_than_mapped_ids_is_an_error() {
+    let (h, _) = small_lists_cell();
+    let map = h.identity();
+    let mut rows = h.rows.clone();
+    rows.push(rows[rows.len() - 1]);
+    assert_rejected(
+        merge_tlsh_ivf(Some((&h.ivf, &map[..])), NONE, &rows, 0),
+        "expected",
+    );
+}
+
+#[test]
+fn a_mapped_id_past_the_output_rows_is_an_error() {
+    let (h, _) = small_lists_cell();
+    let mut map = h.identity();
+    let last = map.len() - 1;
+    map[last] = last as u32 + 1;
+    assert_rejected(
+        merge_tlsh_ivf(Some((&h.ivf, &map[..])), NONE, &h.rows, DEFAULT_COALESCE),
+        "past",
+    );
+}
+
+#[test]
+fn an_index_id_past_its_rows_is_an_error_not_a_panic() {
+    let (h, _) = small_lists_cell();
+    let mut ivf = h.ivf.clone();
+    let last = ivf.ids.len() - 1;
+    ivf.ids[last] = 1000;
+    let map = h.identity();
+    assert_rejected(
+        merge_tlsh_ivf(Some((&ivf, &map[..])), NONE, &h.rows, 0),
+        "out of range",
+    );
+}
+
+#[test]
+fn an_owned_index_with_arrays_of_the_wrong_length_is_an_error_not_a_panic() {
+    let (h, _) = small_lists_cell();
+    let mut ivf = h.ivf.clone();
+    ivf.medoids.pop();
+    let map = h.identity();
+    assert_rejected(
+        merge_tlsh_ivf(Some((&ivf, &map[..])), NONE, &h.rows, 0),
+        "medoids",
+    );
+}

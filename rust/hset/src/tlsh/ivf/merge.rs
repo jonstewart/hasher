@@ -17,6 +17,12 @@ pub fn merge_tlsh_ivf<A: IvfIndex + ?Sized, B: IvfIndex + ?Sized>(
     let n_out = u32::try_from(rows.len())
         .map_err(|_| Error::input("too many rows for a TIVF index"))?;
     let _ = coalesce_threshold;
+    if let Some((index, map)) = a {
+        check_side(index, map, "left")?;
+    }
+    if let Some((index, map)) = b {
+        check_side(index, map, "right")?;
+    }
 
     let mut out = TlshIvf::empty();
     out.n = u64::from(n_out);
@@ -40,7 +46,28 @@ pub fn merge_tlsh_ivf<A: IvfIndex + ?Sized, B: IvfIndex + ?Sized>(
         }
     }
     out.cell_lists[CELL_COUNT] = out.lists() as u32;
+
+    if out.ids.len() != rows.len() {
+        return Err(Error::input(format!(
+            "merged TIVF index has {} ids, expected {}",
+            out.ids.len(),
+            rows.len()
+        )));
+    }
     Ok(out)
+}
+
+/// The array lengths of one side's index, and its map's length.
+fn check_side<I: IvfIndex + ?Sized>(index: &I, map: &[u32], side: &str) -> Result<()> {
+    index.check_layout()?;
+    if map.len() as u64 != index.n() {
+        return Err(Error::input(format!(
+            "the {side} row map has {} entries, the {side} index {} rows",
+            map.len(),
+            index.n()
+        )));
+    }
+    Ok(())
 }
 
 /// A list of one cell while it is merged (C++ `MergeList`).
@@ -68,12 +95,26 @@ fn gather<I: IvfIndex + ?Sized>(
         };
         let mut shrunk = false;
         for id in index.list_ids(l) {
-            let id = map[id as usize];
-            if id == DROPPED {
+            let Some(&out) = map.get(id as usize) else {
+                return Err(Error::format(format!(
+                    "TIVF list {l} has id {id} out of range for {} rows",
+                    map.len()
+                )));
+            };
+            if out == DROPPED {
                 shrunk = true;
                 continue;
             }
-            m.ids.push(id);
+            if out as usize >= rows.len() {
+                return Err(Error::input(format!(
+                    "row map sends row {id} to {out}, past the {} merged rows",
+                    rows.len()
+                )));
+            }
+            if m.ids.last().is_some_and(|&last| out <= last) {
+                return Err(Error::input("row map is not increasing within a TIVF list"));
+            }
+            m.ids.push(out);
         }
         if m.ids.is_empty() {
             continue;
