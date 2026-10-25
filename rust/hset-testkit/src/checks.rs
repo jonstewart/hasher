@@ -28,22 +28,30 @@
 //!
 //! [`check_text_input`] is the text-parsing property: `Builder::add_text`
 //! never panics and accepts exactly what [`text_oracle_accepts`] does.
+//!
+//! [`check_tlsh_knn`] is the TLSH search property, run by all of the
+//! above on every TLSH section they load: brute force answers like
+//! [`naive_knn`], and a valid index like brute force.
 
 use std::collections::BTreeSet;
 use std::panic::{AssertUnwindSafe, catch_unwind, resume_unwind};
 
 use hset::format::decode;
+use hset::hashset::{KnnStrategy, VerifyReport};
 use hset::lookup::{HintSpec, Lookup, build_hint, hint_from_parts, make_lookup_with};
 use hset::merge::merge;
+use hset::synth::SplitMix64;
+use hset::tlsh::TlshDigest;
 use hset::{Builder, Error, HashType, Hashset, SetOp};
 
 use hset::builder::parse_value;
 use hset::hex;
 
 use crate::corrupt::Corruption;
-use crate::doc::{Doc, Opts, set_op_expected};
+use crate::doc::{Doc, Expected, Opts, set_op_expected};
 use crate::oracle::{NaiveSet, hex_oracle};
 use crate::strategies::{LookupCase, UNSUPPORTED_LENGTH, queries};
+use crate::tlsh::{Perturbation, naive_knn, perturb, random_digest};
 
 /// Build `doc`, decode and check it against `doc.expected()`, load and
 /// verify it, check `records_for`/`equal_range` per section against the
@@ -74,6 +82,7 @@ fn roundtrip(doc: &Doc) {
     assert!(hs.verify_digest(), "verify_digest");
     let report = hs.verify();
     assert!(report.is_ok(), "verify: {:?}", report.problems);
+    check_tlsh_sections(&hs, &report, &expected);
 
     // 3. Review Focus 5: records_for and equal_range per distinct stored
     //    hash, against the oracle's hashes and ridx.
@@ -147,6 +156,9 @@ pub fn exercise_loaded(bytes: &[u8]) -> bool {
     let _ = hs.verify();
     for i in 0..hs.section_count() {
         exercise_section(&hs, i);
+        if hs.tlsh_rows(i).is_ok() {
+            check_tlsh_knn(&hs, i);
+        }
     }
     exercise_records(&hs);
     true
@@ -343,6 +355,111 @@ fn check_query(lk: &dyn Lookup, naive: &NaiveSet, q: &[u8]) {
     }
 }
 
+/// kNN parameters [`check_tlsh_knn`] tries per query, `(k, max_distance,
+/// include_length)`; a `k` of `usize::MAX` stands for every row.
+const KNN_PARAMS: [(usize, u32, bool); 5] = [
+    (1, 144, true),
+    (4, 400, false),
+    (usize::MAX, u32::MAX, true),
+    (usize::MAX, 0, true),
+    (0, u32::MAX, true),
+];
+
+/// Stored rows [`check_tlsh_knn`] queries with (each also near-copied).
+const TLSH_QUERY_ROWS: usize = 3;
+
+/// The kNN property of TLSH section `idx` of `hs`: for a few queries (the
+/// first, middle and last rows, a near copy of each, a random digest and
+/// the null digest) and [`KNN_PARAMS`], brute force equals [`naive_knn`];
+/// when the section's index validates, the index search and `tlsh_knn`
+/// equal brute force; when it does not, both are an `Error::Format`.
+/// Returns whether the index validated (`None` when there is none).
+///
+/// # Panics
+///
+/// When `idx` is not a TLSH section, or on any disagreement.
+pub fn check_tlsh_knn(hs: &Hashset<'_>, idx: usize) -> Option<bool> {
+    let rows = hs.tlsh_rows(idx).expect("a TLSH section");
+    let n = rows.len();
+    let index = hs.tlsh_index(idx).map(|v| v.is_some());
+    let has_index = hs.tlsh_knn_strategies(idx).expect("strategies").index;
+    assert_eq!(has_index, !matches!(index, Ok(false)), "strategies: index");
+
+    let mut rng = SplitMix64::new(idx as u64);
+    let mut qs: Vec<TlshDigest> = Vec::new();
+    let picks = [0, n / 2, n.saturating_sub(1)];
+    for &i in picks.iter().take(TLSH_QUERY_ROWS.min(n)) {
+        let r = TlshDigest(rows[i]);
+        qs.push(r);
+        qs.push(perturb(&mut rng, &r, &Perturbation::default()));
+    }
+    qs.push(random_digest(&mut rng));
+    qs.push(TlshDigest::NULL);
+
+    for q in &qs {
+        for (k, max_distance, include_length) in KNN_PARAMS {
+            let k = k.min(n + 1);
+            let want = naive_knn(rows, q, k, max_distance, include_length);
+            let with = |s| hs.tlsh_knn_with(idx, q, k, max_distance, include_length, s, None);
+            let ctx = || {
+                format!(
+                    "section {idx}, query {q:?}, k {k}, max {max_distance}, length {include_length}"
+                )
+            };
+            let brute = with(KnnStrategy::Brute).expect("brute force");
+            assert_eq!(brute, want, "brute force kNN, {}", ctx());
+            let auto = hs.tlsh_knn(idx, q, k, max_distance, include_length);
+            match index {
+                Ok(true) => {
+                    let got = with(KnnStrategy::Index).expect("index kNN");
+                    assert_eq!(got, want, "index kNN, {}", ctx());
+                    assert_eq!(auto.expect("tlsh_knn"), want, "tlsh_knn, {}", ctx());
+                }
+                Ok(false) => {
+                    assert!(
+                        matches!(with(KnnStrategy::Index), Err(Error::Input(_))),
+                        "{}",
+                        ctx()
+                    );
+                    assert_eq!(auto.expect("tlsh_knn"), want, "tlsh_knn, {}", ctx());
+                }
+                Err(_) => {
+                    assert!(
+                        matches!(with(KnnStrategy::Index), Err(Error::Format(_))),
+                        "{}",
+                        ctx()
+                    );
+                    assert!(matches!(auto, Err(Error::Format(_))), "tlsh_knn, {}", ctx());
+                }
+            }
+        }
+    }
+    has_index.then_some(index.is_ok())
+}
+
+/// The TLSH checks of a file built or merged from a model: per expected
+/// TLSH section, [`verify`](Hashset::verify) found the cell hint exact and
+/// the index (present iff expected) valid, and [`check_tlsh_knn`] holds.
+fn check_tlsh_sections(hs: &Hashset<'_>, report: &VerifyReport, expected: &Expected) {
+    for (idx, e) in expected.sections.iter().enumerate() {
+        if e.htype != HashType::Tlsh {
+            continue;
+        }
+        let t = report.sections[idx].tlsh.as_ref().expect("a TLSH report");
+        assert_eq!(t.cells_exact, Some(true), "section {idx}: cell hint");
+        assert_eq!(
+            t.index.map(|i| i.valid),
+            e.tivf.then_some(true),
+            "section {idx}: TIVF"
+        );
+        assert_eq!(
+            check_tlsh_knn(hs, idx),
+            e.tivf.then_some(true),
+            "section {idx}: kNN"
+        );
+    }
+}
+
 /// A record as its present fields, `(type, value)` in ascending type
 /// order: the same record whatever the field order or the absent fields of
 /// the file that holds it.
@@ -414,6 +531,12 @@ pub fn check_set_op(op: SetOp, a: &Doc, b: &Doc) {
                 let hs = Hashset::load(&bytes).unwrap_or_else(|e| panic!("load: {e}\n{}", ctx()));
                 let report = hs.verify();
                 assert!(report.is_ok(), "verify: {:?}\n{}", report.problems, ctx());
+                if let Err(p) = catch_unwind(AssertUnwindSafe(|| {
+                    check_tlsh_sections(&hs, &report, &want)
+                })) {
+                    let msg = p.downcast_ref::<String>().cloned().unwrap_or_default();
+                    panic!("{msg}\n{}", ctx());
+                }
             }
             (Err(e), Err(refusal)) => {
                 assert!(matches!(e, Error::Input(_)), "error kind {e:?}\n{}", ctx());
@@ -661,6 +784,79 @@ pub fn check_text_input(text: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::doc::Field;
+    use crate::tlsh::doc_value;
+    use hset::TlshIndexPolicy;
+
+    /// Fields tlsh and sizes, `n` records: TLSH values of every
+    /// [`doc_value`] kind (every fifth absent), sizes `i % 5`.
+    fn tlsh_doc(n: u64, seed: u64) -> Doc {
+        Doc {
+            fields: vec![
+                Field::canonical(HashType::Tlsh),
+                Field::canonical(HashType::Size),
+            ],
+            records: (0..n)
+                .map(|i| {
+                    let v = i * 7 + seed;
+                    vec![
+                        (i % 5 != 4).then(|| doc_value((v % 6) as u8, (v % 4) as u8, v).0.to_vec()),
+                        Some((i % 5).to_le_bytes().to_vec()),
+                    ]
+                })
+                .collect(),
+            opts: Opts::default_for_tests(),
+        }
+    }
+
+    #[test]
+    fn tlsh_knn_check_holds_with_and_without_an_index() {
+        for (tlsh_index, want) in [(true, Some(true)), (false, None)] {
+            let mut doc = tlsh_doc(40, 0);
+            doc.opts.tlsh_index = tlsh_index;
+            doc.opts.tlsh_list_size = 3;
+            let bytes = doc.build().unwrap();
+            let hs = Hashset::load(&bytes).unwrap();
+            assert_eq!(check_tlsh_knn(&hs, 0), want);
+            assert!(exercise_loaded(&bytes));
+        }
+    }
+
+    #[test]
+    fn tlsh_knn_check_reports_an_invalid_index() {
+        let bytes = tlsh_doc(40, 0).build().unwrap();
+        let file = decode(&bytes).unwrap();
+        let tivf = file.sections[0].tivf.unwrap();
+        // the last row id, out of range
+        let at = tivf.as_ptr() as usize - bytes.as_ptr() as usize + tivf.len() - 4;
+        let mut bad = bytes.clone();
+        bad[at..at + 4].copy_from_slice(&u32::MAX.to_le_bytes());
+        let hs = Hashset::load(&bad).unwrap();
+        assert_eq!(check_tlsh_knn(&hs, 0), Some(false));
+        assert!(exercise_loaded(&bad));
+    }
+
+    #[test]
+    fn tlsh_documents_round_trip_and_merge_as_modelled() {
+        let mut a = tlsh_doc(48, 0);
+        a.opts.tlsh_list_size = 3;
+        check_doc_roundtrip(&a);
+        for (op, b_index, policy, coalesce) in [
+            (SetOp::Union, true, TlshIndexPolicy::Inherit, 64),
+            (SetOp::Union, false, TlshIndexPolicy::Inherit, 64),
+            (SetOp::Intersect, false, TlshIndexPolicy::Write, 6),
+            (SetOp::Subtract, true, TlshIndexPolicy::Omit, 0),
+            (SetOp::Subtract, true, TlshIndexPolicy::Inherit, 6),
+        ] {
+            let mut b = tlsh_doc(30, 3);
+            b.opts.tlsh_index = b_index;
+            a.opts.tlsh_merge = policy;
+            a.opts.tlsh_coalesce = coalesce;
+            check_set_op(op, &a, &b);
+            b.opts.tlsh_merge = policy;
+            check_set_op(op, &b, &a);
+        }
+    }
 
     #[test]
     fn text_input_accepts_well_formed_lines() {
