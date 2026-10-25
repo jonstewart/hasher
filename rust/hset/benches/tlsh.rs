@@ -145,6 +145,23 @@ fn queries(rows: &[Row], set: QuerySet) -> Vec<TlshDigest> {
         .collect()
 }
 
+/// The sum of the body distances from `q` to every row.
+#[inline(always)]
+fn body_sum(q: &BodyQuery, rows: &[Row]) -> u32 {
+    let mut s = 0u32;
+    for r in rows {
+        s = s.wrapping_add(q.body(r));
+    }
+    s
+}
+
+/// [`body_sum`] compiled for POPCNT.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "popcnt")]
+fn body_sum_popcnt(q: &BodyQuery, rows: &[Row]) -> u32 {
+    body_sum(q, rows)
+}
+
 /// `(name, set, k, max_distance)`.
 const WORKLOADS: [(&str, QuerySet, usize, u32); 3] = [
     ("near", QuerySet::Near, 10, 144),
@@ -165,18 +182,22 @@ fn bench_tlsh(c: &mut Criterion) {
         );
         let valid = (&ivf).validate(&rows).unwrap();
 
-        // body kernel over every row
+        // body kernel over every row: as a caller's loop compiles it, and
+        // compiled for POPCNT as the crate's scans are
         let mut g = c.benchmark_group("tlsh/body");
         g.throughput(Throughput::Elements(n as u64));
         g.sample_size(20);
-        let q = BodyQuery::new(&queries(&rows, QuerySet::Near)[0]);
+        let q = black_box(BodyQuery::new(&queries(&rows, QuerySet::Near)[0]));
         g.bench_function(BenchmarkId::new("body_query", &label), |b| {
-            b.iter(|| {
-                rows.iter()
-                    .map(|r| black_box(&q).body(r))
-                    .fold(0u32, u32::wrapping_add)
-            })
+            b.iter(|| body_sum(&q, &rows))
         });
+        #[cfg(target_arch = "x86_64")]
+        if std::arch::is_x86_feature_detected!("popcnt") {
+            g.bench_function(BenchmarkId::new("body_query_popcnt", &label), |b| {
+                // SAFETY: the CPU has POPCNT, checked above.
+                b.iter(|| unsafe { body_sum_popcnt(&q, &rows) })
+            });
+        }
         g.finish();
 
         for (wl, set, k, max_distance) in WORKLOADS {
