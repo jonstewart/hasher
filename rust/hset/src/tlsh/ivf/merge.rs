@@ -1,5 +1,44 @@
-//! Carrying TIVF lists through a merge, and coalescing small lists
-//! (`merge_tlsh_ivf`, `coalesce_cell`).
+//! Carrying TIVF lists through a merge, and coalescing small lists (C++
+//! `merge_tlsh_ivf` and `coalesce_cell` in `tlsh_ivf.cpp`;
+//! docs/TLSH_EMBEDDING.md section 3).
+//!
+//! A merge of two TLSH hash sets ([`crate::merge`]) emits the sorted union
+//! (or intersection, or difference) of their rows, with a row map per side
+//! from input row to output row or [`DROPPED`]. [`merge_tlsh_ivf`] builds
+//! the output's index from the inputs' in O(lists + ids) plus the
+//! coalescing, without re-clustering, and writes the same bytes as C++ for
+//! the same inputs.
+//!
+//! # Coalescing
+//!
+//! Concatenating lists over repeated merges would pile up small lists, so
+//! with a threshold `C > 0` the small lists of a cell (fewer than `C / 2`
+//! members) are joined greedily, smallest union radius first, until at
+//! most one is left; see [`merge_tlsh_ivf`]. Afterwards
+//! [`check_invariant`](super::check_invariant)`(C)` holds, which bounds the
+//! lists of a cell of `m` rows by `m / (C / 2) + 1`.
+//!
+//! The cost is quadratic in `s`, the number of small lists in one cell: an
+//! `s * s` matrix of `u32` distances (`4 s^2` bytes) and a heap of up to
+//! `s (s - 1) / 2` candidate pairs of 20 bytes each, `O(s^2 log s)` time
+//! and `s` times the rows of the small lists in kernel evaluations, as in
+//! C++. Each small list has at least one member, so `s` is at most the
+//! cell's row count, but merging indexes of many tiny lists (for example
+//! indexes built or merged with coalescing off) into one cell can make it
+//! large: 10,000 small lists in one cell take about 400 MB for the matrix
+//! and up to 1 GB for the heap. The algorithm is kept as C++ has it, since
+//! the output bytes must match.
+//!
+//! # Differences from the C++ library
+//!
+//! * A side without an index is `None` (C++ passes an empty
+//!   `TlshIvfView`), and the output row count is `rows.len()` (C++ takes
+//!   `n_out` separately and checks only that the gathered ids number
+//!   `n_out`).
+//! * Rust checks what C++ trusts or leaves undefined: the array lengths of
+//!   an owned index, that each map has one entry per input row, that every
+//!   input id is inside its map, and that every mapped id is an output row.
+//!   These are errors rather than out-of-bounds reads.
 
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
@@ -10,7 +49,48 @@ use crate::tlsh::CELL_COUNT;
 use crate::tlsh::digest::{DIGEST_LENGTH, TlshDigest};
 use crate::tlsh::distance::BodyQuery;
 
-/// Stub.
+/// The index of a merged TLSH section, from the inputs' indexes (C++
+/// `merge_tlsh_ivf`).
+///
+/// `a` and `b` are the left and right inputs: an index and its row map,
+/// `map[i]` the output row of input row `i` or [`DROPPED`], or `None` for a
+/// side with no rows. `rows` are the output rows, in output order (sorted,
+/// as the row merge emits them). A map must be increasing over the kept
+/// rows of each list, which the sorted two-pointer row merge guarantees.
+///
+/// For each cell, in cell order, the output lists are `a`'s lists of the
+/// cell followed by `b`'s, ids mapped, dropped ids removed and lists that
+/// become empty omitted. A list that lost members keeps its medoid and
+/// gets its `radius2` recomputed exactly over its remaining members (with
+/// [`BodyQuery::emb_body`] over `rows`); other lists keep medoid and
+/// `radius2` verbatim (a loose radius stays loose, and the medoid need not
+/// be a member).
+///
+/// Then, when `coalesce_threshold / 2 > 0` and the cell has more than one
+/// list, the cell is coalesced: while two of its lists have fewer than
+/// `C / 2` members each (C = `coalesce_threshold`), the pair whose union
+/// has the smallest radius about one of the two medoids (ties to the
+/// smaller pair of positions among the small lists) becomes one list, at
+/// the earlier list's position, with the medoid giving that radius (the
+/// earlier list's on a tie), that radius as `radius2`, and the sorted union
+/// of the ids; a union of at least `C / 2` members takes no further part.
+/// [`DEFAULT_COALESCE`](super::DEFAULT_COALESCE) is the default threshold,
+/// and 0 disables coalescing. See the [module docs](self) for the cost.
+///
+/// The inputs should be validated ([`IvfIndex::validate`]): an index that
+/// is not gives an error or an index that fails validation, never a panic.
+/// For validated inputs and maps from the row merge, the result passes
+/// `validate` over `rows`, its radii are exact where the inputs' were, and
+/// [`check_invariant`](super::check_invariant)`(coalesce_threshold)` holds.
+///
+/// # Errors
+///
+/// [`Error::Input`] when a map's length is not its index's row count, a map
+/// is not increasing within a list, a mapped id is not below `rows.len()`,
+/// the kept ids do not number `rows.len()`, or `rows.len()` exceeds
+/// `u32::MAX`; [`Error::Format`] when an owned index's arrays have the
+/// wrong lengths ([`IvfIndex::check_layout`]) or an input id is past its
+/// map.
 pub fn merge_tlsh_ivf<A: IvfIndex + ?Sized, B: IvfIndex + ?Sized>(
     a: Option<(&A, &[u32])>,
     b: Option<(&B, &[u32])>,
@@ -223,10 +303,8 @@ fn coalesce_cell(lists: &mut Vec<MergeList>, rows: &[[u8; DIGEST_LENGTH]], half:
             alive[i] = false;
             alive_count -= 1;
         } else {
-            for k in 0..s {
-                if k != i && alive[k] {
-                    push(&mut heap, &dist, &version, i.min(k), i.max(k));
-                }
+            for (k, _) in alive.iter().enumerate().filter(|&(k, &a)| a && k != i) {
+                push(&mut heap, &dist, &version, i.min(k), i.max(k));
             }
         }
     }

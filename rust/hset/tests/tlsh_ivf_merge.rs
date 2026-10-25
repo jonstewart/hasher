@@ -521,8 +521,8 @@ fn check_merged(m: &TlshIvf, rows: &[[u8; 36]], c: u32) {
         assert_eq!(exact, Some(v.radius2(l)), "list {l} radius is not exact");
     }
     assert!(check_invariant(&v, c), "coalescing invariant at C = {c}");
-    let half = (c / 2) as usize;
-    if half > 0 {
+    if c / 2 > 0 {
+        let half = (c / 2) as usize;
         let cells = naive_cell_index(rows);
         for cell in 0..CELLS {
             let rows_in = (cells[cell + 1] - cells[cell]) as usize;
