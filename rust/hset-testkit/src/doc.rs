@@ -8,7 +8,10 @@ use std::collections::BTreeSet;
 use hset::builder::format_value;
 use hset::format::{FieldDescriptor, Hint, HsetFile, hint_tag_block, hint_tag_hull};
 use hset::lookup::resolve_bits;
-use hset::{BitsPolicy, BuildOptions, Builder, HashType, HintSpec};
+use hset::merge::MergeOptions;
+use hset::{BitsPolicy, BuildOptions, Builder, HashType, HintSpec, SetOp};
+
+use crate::oracle::set_op_model;
 
 /// Every type that can be stored in a hash set: `HashType::ALL` minus `Fuzzy`,
 /// and minus `Tlsh`, whose values must be canonical TLSH digests and whose
@@ -177,15 +180,7 @@ impl Doc {
                 if !opts.with_records {
                     present.dedup_by(|a, b| a.0 == b.0);
                 }
-                let hint_tag = if f.htype.is_digest() {
-                    match resolve_bits(opts.hint, present.len(), hlen, &opts.bits_policy) {
-                        HintSpec::None => None,
-                        HintSpec::Block { bits } => Some(hint_tag_block(bits)),
-                        HintSpec::Hull { bits } => Some(hint_tag_hull(bits)),
-                    }
-                } else {
-                    None
-                };
+                let hint_tag = hint_tag(f.htype, present.len(), hlen, opts.hint, &opts.bits_policy);
                 sections.push(ExpectedSection {
                     htype: f.htype,
                     name: f.name.clone(),
@@ -252,6 +247,35 @@ impl Doc {
             .collect()
     }
 
+    /// The distinct records in the order the built file stores them (sorted
+    /// by their layout row): record `k` of the file is element `k`.
+    fn distinct_records(&self) -> Vec<&[Option<Vec<u8>>]> {
+        let mut recs: Vec<(Vec<u8>, &[Option<Vec<u8>>])> = self
+            .records
+            .iter()
+            .map(|r| (layout_row(&self.fields, r), r.as_slice()))
+            .collect();
+        recs.sort();
+        recs.dedup_by(|x, y| x.0 == y.0);
+        recs.into_iter().map(|(_, r)| r).collect()
+    }
+
+    /// Record `r`'s value of the field of type `t`, if the document has the
+    /// field and the record a value for it.
+    fn value_of<'r>(&self, r: &'r [Option<Vec<u8>>], t: HashType) -> Option<&'r Vec<u8>> {
+        let i = self.fields.iter().position(|f| f.htype == t)?;
+        r[i].as_ref()
+    }
+
+    /// The distinct present values of the field of type `t` (none when the
+    /// document lacks the field): the rows of its built section as a set.
+    fn values(&self, t: HashType) -> BTreeSet<Vec<u8>> {
+        self.records
+            .iter()
+            .filter_map(|r| self.value_of(r, t).cloned())
+            .collect()
+    }
+
     /// The records as `hset make` text: one line per record in input order,
     /// columns separated by a space, an absent value as an empty column.
     pub fn to_text(&self) -> String {
@@ -280,6 +304,169 @@ impl Doc {
             .collect::<Vec<_>>()
             .join(",")
     }
+}
+
+/// The tag of the hint a section of `n` rows of type `htype` gets under
+/// `hint` and `policy`: none for a non-digest type.
+fn hint_tag(
+    htype: HashType,
+    n: usize,
+    hlen: usize,
+    hint: HintSpec,
+    policy: &BitsPolicy,
+) -> Option<u16> {
+    if !htype.is_digest() {
+        return None;
+    }
+    match resolve_bits(hint, n, hlen, policy) {
+        HintSpec::None => None,
+        HintSpec::Block { bits } => Some(hint_tag_block(bits)),
+        HintSpec::Hull { bits } => Some(hint_tag_hull(bits)),
+    }
+}
+
+/// `merge`'s error when exactly one input has hash sections (a substring of
+/// its message, as are the other refusals).
+pub const REFUSE_RECORDS_ONLY: &str =
+    "cannot merge a records-only hashset with one that has hash sections";
+/// `merge`'s error when the write flags leave nothing to write.
+pub const REFUSE_NOTHING_TO_WRITE: &str = "neither records nor hash sections are to be written";
+
+impl Opts {
+    /// The merge options of an output built with these options: the same
+    /// metadata, hint and bits policy, `with_records` and `with_hashsets`
+    /// as the write flags, and the default TLSH index policy.
+    pub fn merge_options(&self) -> MergeOptions {
+        let mut o = MergeOptions::new(self.name.clone(), self.desc.clone());
+        o.timestamp = Some(self.timestamp.clone());
+        o.write_records = self.with_records;
+        o.write_hashsets = self.with_hashsets;
+        o.hint = self.hint;
+        o.bits_policy = self.bits_policy;
+        o
+    }
+}
+
+/// The decoded file `hset::merge::merge(op, a, b, &out.merge_options())`
+/// must write, from the C++ merge semantics (HASHSET_FORMAT "Set
+/// operations"), or the refusal it must fail with
+/// ([`REFUSE_RECORDS_ONLY`], [`REFUSE_NOTHING_TO_WRITE`]).
+///
+/// * Exactly one input with hash sections is refused.
+/// * **Both inputs have records**: the output fields are `a`'s, then
+///   `b`'s of the types `a` lacks; each side's distinct records, widened to
+///   them (an absent field is a zero presence byte and zero value), are
+///   combined as sets ([`set_op_model`]) and sorted. A section per output
+///   field holds the value of every output record that has one; on equal
+///   values `a`'s rows come first, each side's in its own file's order
+///   (descending input record), and `RIDX` names the output record. An
+///   output without records (`out.with_records` off) has each value once.
+/// * **Otherwise** the output has no records and a section per type of
+///   either input (`a`'s first, named by the first side that has it),
+///   holding the set operation on the two sides' distinct values (a side
+///   without the type contributes nothing).
+/// * Digest sections get `out`'s hint as the builder sizes it.
+///
+/// Inputs that have neither records nor sections in common, which C++
+/// also refuses, cannot be expressed: a [`Doc`] always has records or
+/// sections and so falls under the first rule.
+pub fn set_op_expected(op: SetOp, a: &Doc, b: &Doc, out: &Opts) -> Result<Expected, &'static str> {
+    if a.opts.with_hashsets != b.opts.with_hashsets {
+        return Err(REFUSE_RECORDS_ONLY);
+    }
+    let record_merge = a.opts.with_records && b.opts.with_records;
+    let with_records = record_merge && out.with_records;
+    let with_hashsets = a.opts.with_hashsets && out.with_hashsets;
+    if !with_records && !with_hashsets {
+        return Err(REFUSE_NOTHING_TO_WRITE);
+    }
+    let mut fields: Vec<Field> = a.fields.clone();
+    for f in &b.fields {
+        if !fields.iter().any(|x| x.htype == f.htype) {
+            fields.push(f.clone());
+        }
+    }
+    let section = |f: &Field, hashes: Vec<Vec<u8>>, ridx: Option<Vec<u64>>| ExpectedSection {
+        htype: f.htype,
+        name: f.name.clone(),
+        hash_length: f.length(),
+        hint_tag: hint_tag(
+            f.htype,
+            hashes.len(),
+            f.length(),
+            out.hint,
+            &out.bits_policy,
+        ),
+        hashes,
+        ridx,
+    };
+    let mut expected = Expected {
+        name: out.name.clone(),
+        desc: out.desc.clone(),
+        time: out.timestamp.clone(),
+        fields: fields.iter().map(Field::descriptor).collect(),
+        record_length: fields.iter().map(|f| 1 + f.length()).sum(),
+        records: None,
+        sections: Vec::new(),
+    };
+    if !record_merge {
+        if with_hashsets {
+            for f in &fields {
+                let rows = set_op_model(op, &a.values(f.htype), &b.values(f.htype));
+                expected
+                    .sections
+                    .push(section(f, rows.into_iter().collect(), None));
+            }
+        }
+        return Ok(expected);
+    }
+
+    // every distinct record of a side, in its file's order, widened
+    let widen = |d: &Doc, r: &[Option<Vec<u8>>]| -> Vec<u8> {
+        let values: Vec<Option<Vec<u8>>> = fields
+            .iter()
+            .map(|f| d.value_of(r, f.htype).cloned())
+            .collect();
+        layout_row(&fields, &values)
+    };
+    let (ar, br) = (a.distinct_records(), b.distinct_records());
+    let aw: Vec<Vec<u8>> = ar.iter().map(|r| widen(a, r)).collect();
+    let bw: Vec<Vec<u8>> = br.iter().map(|r| widen(b, r)).collect();
+    let (aset, bset): (BTreeSet<Vec<u8>>, BTreeSet<Vec<u8>>) =
+        (aw.iter().cloned().collect(), bw.iter().cloned().collect());
+    let out_records: Vec<Vec<u8>> = set_op_model(op, &aset, &bset).into_iter().collect();
+    let out_index = |w: &Vec<u8>| out_records.binary_search(w).ok().map(|k| k as u64);
+    // a record identical on both sides is emitted as the left copy
+    let emitted = |side: usize, k: usize| -> Option<u64> {
+        match side {
+            0 => out_index(&aw[k]),
+            _ if op == SetOp::Union && !aset.contains(&bw[k]) => out_index(&bw[k]),
+            _ => None,
+        }
+    };
+    if with_hashsets {
+        for f in &fields {
+            // (value, side, descending input record, output record)
+            let mut rows: Vec<(Vec<u8>, usize, std::cmp::Reverse<usize>, u64)> = Vec::new();
+            for (side, d, recs) in [(0, a, &ar), (1, b, &br)] {
+                for (k, r) in recs.iter().enumerate() {
+                    if let (Some(v), Some(o)) = (d.value_of(r, f.htype), emitted(side, k)) {
+                        rows.push((v.clone(), side, std::cmp::Reverse(k), o));
+                    }
+                }
+            }
+            rows.sort();
+            if !with_records {
+                rows.dedup_by(|x, y| x.0 == y.0);
+            }
+            let ridx = with_records.then(|| rows.iter().map(|r| r.3).collect());
+            expected
+                .sections
+                .push(section(f, rows.into_iter().map(|r| r.0).collect(), ridx));
+        }
+    }
+    expected.records = with_records.then_some(out_records);
+    Ok(expected)
 }
 
 /// The decoded contents a built document must have.
@@ -568,5 +755,212 @@ pub(crate) mod tests {
         assert_eq!(lines[2], " 7");
         assert_eq!(lines[4], " ");
         assert_eq!(doc.type_list(), "md5,sizes");
+    }
+
+    // set operations: hand-derived expectations of the merge model
+
+    const M: [u8; 16] = [0x22; 16];
+    const X: [u8; 16] = [0x01; 16];
+    const Y: [u8; 16] = [0x02; 16];
+    const SHA: [u8; 20] = [0x33; 20];
+
+    fn doc_of(fields: &[HashType], records: Vec<Vec<Option<Vec<u8>>>>) -> Doc {
+        Doc {
+            fields: fields.iter().map(|&t| Field::canonical(t)).collect(),
+            records,
+            opts: Opts::default_for_tests(),
+        }
+    }
+
+    fn out_opts(with_records: bool, with_hashsets: bool) -> Opts {
+        Opts {
+            name: "out".to_string(),
+            with_records,
+            with_hashsets,
+            ..Opts::default_for_tests()
+        }
+    }
+
+    type SectionRows = (HashType, Vec<Vec<u8>>, Option<Vec<u64>>);
+
+    fn hashes_and_ridx(e: &Expected) -> Vec<SectionRows> {
+        e.sections
+            .iter()
+            .map(|s| (s.htype, s.hashes.clone(), s.ridx.clone()))
+            .collect()
+    }
+
+    #[test]
+    fn set_op_model_widens_records_to_the_left_fields_then_the_right_extras() {
+        let a = doc_of(
+            &[HashType::Md5],
+            vec![vec![Some(Y.to_vec())], vec![Some(X.to_vec())]],
+        );
+        let b = doc_of(&[HashType::Size], vec![vec![size(5)]]);
+        let e = set_op_expected(SetOp::Union, &a, &b, &out_opts(true, true)).unwrap();
+        assert_eq!(e.name, "out");
+        let names: Vec<&str> = e.fields.iter().map(|f| f.name.as_str()).collect();
+        assert_eq!(names, ["md5", "sizes"]);
+        assert_eq!(e.record_length, 17 + 9);
+        // an absent field is a zero presence byte, so b's record sorts first
+        assert_eq!(
+            e.records,
+            Some(vec![
+                row(None, Some(5)),
+                row(Some(X), None),
+                row(Some(Y), None)
+            ])
+        );
+        assert_eq!(
+            hashes_and_ridx(&e),
+            [
+                (
+                    HashType::Md5,
+                    vec![X.to_vec(), Y.to_vec()],
+                    Some(vec![1, 2])
+                ),
+                (HashType::Size, vec![le(5)], Some(vec![0])),
+            ]
+        );
+    }
+
+    /// a: (M,20) (M,10); b in the other field order: (30,M) and (10,M),
+    /// the same record as one of a's.
+    fn tie_pair() -> (Doc, Doc) {
+        let a = doc_of(
+            &[HashType::Md5, HashType::Size],
+            vec![
+                vec![Some(M.to_vec()), size(20)],
+                vec![Some(M.to_vec()), size(10)],
+            ],
+        );
+        let b = doc_of(
+            &[HashType::Size, HashType::Md5],
+            vec![
+                vec![size(30), Some(M.to_vec())],
+                vec![size(10), Some(M.to_vec())],
+            ],
+        );
+        (a, b)
+    }
+
+    #[test]
+    fn set_op_model_orders_equal_rows_left_first_each_side_by_descending_record() {
+        let (a, b) = tie_pair();
+        let e = set_op_expected(SetOp::Union, &a, &b, &out_opts(true, true)).unwrap();
+        assert_eq!(
+            e.records,
+            Some(vec![
+                row(Some(M), Some(10)),
+                row(Some(M), Some(20)),
+                row(Some(M), Some(30)),
+            ])
+        );
+        // left rows: records 1 then 0 (descending); then right's (M,30),
+        // record 2; right's (M,10) is the left copy's and is dropped
+        assert_eq!(
+            hashes_and_ridx(&e),
+            [
+                (HashType::Md5, vec![M.to_vec(); 3], Some(vec![1, 0, 2])),
+                (
+                    HashType::Size,
+                    vec![le(10), le(20), le(30)],
+                    Some(vec![0, 1, 2])
+                ),
+            ]
+        );
+        let ho = set_op_expected(SetOp::Union, &a, &b, &out_opts(false, true)).unwrap();
+        assert_eq!(ho.records, None);
+        assert_eq!(
+            hashes_and_ridx(&ho),
+            [
+                (HashType::Md5, vec![M.to_vec()], None),
+                (HashType::Size, vec![le(10), le(20), le(30)], None),
+            ]
+        );
+        let i = set_op_expected(SetOp::Intersect, &a, &b, &out_opts(true, true)).unwrap();
+        assert_eq!(i.records, Some(vec![row(Some(M), Some(10))]));
+        assert_eq!(i.sections[0].ridx, Some(vec![0]));
+        let d = set_op_expected(SetOp::Subtract, &a, &b, &out_opts(true, true)).unwrap();
+        assert_eq!(d.records, Some(vec![row(Some(M), Some(20))]));
+        let d = set_op_expected(SetOp::Subtract, &b, &a, &out_opts(true, true)).unwrap();
+        assert_eq!(d.records.as_ref().map(Vec::len), Some(1));
+        assert_eq!(hashes_and_ridx(&d)[0].1, vec![le(30)], "b's fields lead");
+    }
+
+    #[test]
+    fn set_op_model_without_records_on_both_sides_merges_section_values_as_sets() {
+        let mut a = doc_of(
+            &[HashType::Md5],
+            vec![vec![Some(X.to_vec())], vec![Some(Y.to_vec())]],
+        );
+        a.opts.with_records = false;
+        a.fields[0].name = "left md5".to_string();
+        let b = doc_of(
+            &[HashType::Sha1, HashType::Md5],
+            vec![
+                vec![Some(SHA.to_vec()), Some(X.to_vec())],
+                vec![None, Some(X.to_vec())],
+            ],
+        );
+        let u = set_op_expected(SetOp::Union, &a, &b, &out_opts(true, true)).unwrap();
+        assert_eq!(u.records, None, "records only when both sides have them");
+        let names: Vec<&str> = u.sections.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(names, ["left md5", "sha1"]);
+        assert_eq!(
+            hashes_and_ridx(&u),
+            [
+                (HashType::Md5, vec![X.to_vec(), Y.to_vec()], None),
+                (HashType::Sha1, vec![SHA.to_vec()], None),
+            ]
+        );
+        let i = set_op_expected(SetOp::Intersect, &a, &b, &out_opts(true, true)).unwrap();
+        assert_eq!(
+            hashes_and_ridx(&i),
+            [
+                (HashType::Md5, vec![X.to_vec()], None),
+                (HashType::Sha1, vec![], None)
+            ]
+        );
+        let d = set_op_expected(SetOp::Subtract, &b, &a, &out_opts(true, true)).unwrap();
+        assert_eq!(
+            hashes_and_ridx(&d),
+            [
+                (HashType::Sha1, vec![SHA.to_vec()], None),
+                (HashType::Md5, vec![], None)
+            ]
+        );
+        assert_eq!(
+            set_op_expected(SetOp::Union, &a, &b, &out_opts(true, false)),
+            Err(REFUSE_NOTHING_TO_WRITE)
+        );
+    }
+
+    #[test]
+    fn set_op_model_refusals_and_records_only_outputs() {
+        let (a, b) = tie_pair();
+        let mut ro = a.clone();
+        ro.opts.with_hashsets = false;
+        assert_eq!(
+            set_op_expected(SetOp::Union, &ro, &b, &out_opts(true, true)),
+            Err(REFUSE_RECORDS_ONLY)
+        );
+        assert_eq!(
+            set_op_expected(SetOp::Union, &a, &ro, &out_opts(true, true)),
+            Err(REFUSE_RECORDS_ONLY)
+        );
+        assert_eq!(
+            set_op_expected(SetOp::Union, &a, &b, &out_opts(false, false)),
+            Err(REFUSE_NOTHING_TO_WRITE)
+        );
+        let mut ro2 = b.clone();
+        ro2.opts.with_hashsets = false;
+        assert_eq!(
+            set_op_expected(SetOp::Union, &ro, &ro2, &out_opts(false, true)),
+            Err(REFUSE_NOTHING_TO_WRITE)
+        );
+        let e = set_op_expected(SetOp::Union, &ro, &ro2, &out_opts(true, true)).unwrap();
+        assert_eq!(e.records.as_ref().map(Vec::len), Some(3));
+        assert!(e.sections.is_empty());
     }
 }
