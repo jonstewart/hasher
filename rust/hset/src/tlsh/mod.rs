@@ -5,6 +5,15 @@
 //!   transport encoding.
 //! * [`distance`]: the reference implementation's `totalDiff`, split into
 //!   header and body costs, and the popcount body kernel [`BodyQuery`].
+//! * [`cells`], [`order`], [`knn`]: the `0x7400` cell index, the header
+//!   cost order, and brute-force and cell kNN ([`knn_brute`]).
+//! * [`ivf`]: the `TIVF` index: its model ([`TlshIvf`], [`TivfView`],
+//!   [`ValidIvf`]), indexed kNN ([`knn_ivf`]), the BISECT build
+//!   ([`build_tlsh_ivf`]) and the merge ([`merge_tlsh_ivf`]).
+//!
+//! A loaded file searches its TLSH sections through
+//! [`Hashset::tlsh_knn`](crate::Hashset::tlsh_knn) and its siblings, and
+//! the builder writes the index ([`BuildOptions::tlsh_index`](crate::BuildOptions::tlsh_index)).
 //!
 //! # Differences from the C++ library
 //!

@@ -8,7 +8,7 @@
 //!
 //! Debug builds are slow: only one test builds an index over 5000 rows.
 
-use hset::format::Hint;
+use hset::format::{Document, FORMAT_VERSION, HashsetIn, Hint, encode};
 use hset::hashset::{IndexReport, KnnStrategies, KnnStrategy, TlshReport};
 use hset::tlsh::{IvfIndex, KnnStats, TlshDigest, TlshMatch, knn_brute};
 use hset::{BuildOptions, Builder, Error, HashType, Hashset};
@@ -241,6 +241,48 @@ fn a_corrupt_tivf_header_fails_the_load() {
     corrupt(0, 9, "version");
     corrupt(4, 7, "dims");
     corrupt(16, bytes[off + 16].wrapping_add(1), "row count");
+}
+
+/// A TIVF is only read on a TLSH section of 36-byte digests (controller
+/// ruling 6): on a TLSH-typed section of another hash length it fails the
+/// load, whereas without one such a section loads as opaque hashes with
+/// no kNN.
+#[test]
+fn a_tivf_on_a_tlsh_section_of_other_lengths_fails_the_load() {
+    let rows = [1u8; 16];
+    // a payload of the right length for one row (its offsets do not
+    // matter: the load stops at the hash length)
+    let payload = hset::tlsh::TlshIvf {
+        n: 1,
+        ids: vec![0],
+        ..hset::tlsh::TlshIvf::empty()
+    }
+    .to_bytes();
+    let doc = |tivf| Document {
+        version: FORMAT_VERSION,
+        name: "",
+        desc: "",
+        time: "",
+        records: None,
+        hashsets: vec![HashsetIn {
+            htype: HashType::Tlsh,
+            name: "tlsh16",
+            hash_length: 16,
+            data: &rows,
+            hint: None,
+            ridx: None,
+            tivf,
+        }],
+    };
+    let bytes = encode(&doc(Some(&payload))).unwrap();
+    let e = Hashset::load(&bytes).unwrap_err();
+    assert!(matches!(e, Error::Format(_)), "{e}");
+    assert!(e.to_string().contains("TIVF"), "{e}");
+
+    let bytes = encode(&doc(None)).unwrap();
+    let hs = Hashset::load(&bytes).unwrap();
+    assert!(matches!(hs.tlsh_knn_strategies(0), Err(Error::Input(_))));
+    assert!(hs.contains(0, &rows));
 }
 
 /// [`indexed_file`] with the TIVF's first id out of range, which only the
