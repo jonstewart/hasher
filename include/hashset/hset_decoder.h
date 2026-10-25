@@ -79,16 +79,16 @@ public:
     const uint8_t* end
   ):
     beg(beg), end(end),
-    toc_cur(toc.entries.begin()), toc_end(toc.entries.end())
+    toc_cur(toc.entries.begin()), toc_end(toc.entries.end()),
+    at_end(false)
   {
-    if (toc_cur != toc_end) {
-      ++(*this);
-    }
+    ++(*this);
   }
 
+  // the end iterator, which every iterator past its last entry equals
   TOCIterator():
     beg(nullptr), end(nullptr),
-    toc_cur(), toc_end() {}
+    toc_cur(), toc_end(), at_end(true) {}
 
   reference operator*() const noexcept {
     return ch;
@@ -102,6 +102,9 @@ public:
     if (toc_cur != toc_end) {
       advance_chunk();
     }
+    else {
+      at_end = true;
+    }
     return *this;
   }
 
@@ -112,13 +115,12 @@ public:
   }
 
   bool operator==(const TOCIterator& other) const noexcept {
-    return toc_cur == other.toc_cur;
+    return at_end || other.at_end ?
+      at_end == other.at_end : toc_cur == other.toc_cur;
   }
 
-// C++20:
-//  bool operator!=(const TOCIterator&) const noexcept = default;
   bool operator!=(const TOCIterator& other) const noexcept {
-    return toc_cur != other.toc_cur;
+    return !(*this == other);
   }
 
 private:
@@ -128,6 +130,10 @@ private:
   const uint8_t* const end;
   decltype(TableOfContents::entries)::const_iterator toc_cur;
   const decltype(TableOfContents::entries)::const_iterator toc_end;
+
+  // true once the iterator has passed the last entry; ch then holds the
+  // last chunk read
+  bool at_end;
 
   Chunk ch;
 };
@@ -266,6 +272,13 @@ Holder decode_chunks(ChunkIterator ch, ChunkIterator ch_end) {
   catch (const UnexpectedChunkType&) {
     THROW("unexpected chunk type " << printable_chunk_type(ch->type));
   }
+
+  // FEND is the last entry: the FTOC lists nothing a decoder that stops at
+  // the FEND would never visit (a TVEC, say)
+  THROW_IF(
+    ch != ch_end,
+    "FTOC lists " << printable_chunk_type(ch->type) << " after FEND"
+  );
 
   return h;
 }

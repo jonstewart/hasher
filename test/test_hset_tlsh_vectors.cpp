@@ -529,26 +529,32 @@ TEST_CASE("hset_tlsh_index_decode_rejects_corruption") {
 
 namespace {
 
-// b's file with a well-formed TVEC chunk added to its TLSH section, as the
-// writers before its removal laid it out: the 32-byte header (version 1,
-// variant 0, 264 dims, n rows, dtype 1 = float32) and the embedding of
-// every HDAT row, its data on a 4096-byte boundary. The chunk is appended
-// at the end of the file and its FTOC entry inserted after the section's
-// HDAT [RIDX]; the FTOC grows into the room of the FHDR, which is moved to
-// the end of the file too.
-std::vector<char> with_tvec_chunk(const Built& b) {
+// the FTOC index just after the TLSH section's HINT HDAT [RIDX], where
+// the writers before its removal put the TVEC
+size_t after_tlsh_section(const TableOfContents& toc) {
+  size_t at = find_type(toc, Chunk::HHDR | 15) + 1; // SFHASH_TLSH == 1 << 15
+  while (at < toc.entries.size() &&
+         (toc.entries[at].second == Chunk::HINT ||
+          toc.entries[at].second == Chunk::HDAT ||
+          toc.entries[at].second == Chunk::RIDX)) {
+    ++at;
+  }
+  return at;
+}
+
+// b's file with a well-formed TVEC chunk added, as the writers before its
+// removal laid it out: the 32-byte header (version 1, variant 0, 264 dims,
+// n rows, dtype 1 = float32) and the embedding of every HDAT row, its data
+// on a 4096-byte boundary. The chunk is appended at the end of the file
+// and its FTOC entry inserted at FTOC index at (>= 2, after the FHDR); the
+// FTOC grows into the room of the FHDR, which is moved to the end of the
+// file too.
+std::vector<char> with_tvec_chunk(const Built& b, size_t at) {
+  REQUIRE(at >= 2);
+  REQUIRE(at <= b.toc.entries.size());
   std::vector<char> buf = b.buf;
   const uint64_t n = sfhash_hashset_count(b.hset.get(), b.tidx);
   const TlshDigest* rows = rows_of(b.hset.get(), b.tidx);
-
-  // the TVEC goes after the TLSH section's HINT HDAT [RIDX]
-  size_t at = find_type(b.toc, Chunk::HHDR | 15) + 1; // SFHASH_TLSH == 1 << 15
-  while (at < b.toc.entries.size() &&
-         (b.toc.entries[at].second == Chunk::HINT ||
-          b.toc.entries[at].second == Chunk::HDAT ||
-          b.toc.entries[at].second == Chunk::RIDX)) {
-    ++at;
-  }
 
   // move the FHDR to the end of the file
   const size_t ftoc = 8 + 32;
@@ -600,20 +606,31 @@ std::vector<char> with_tvec_chunk(const Built& b) {
 
 TEST_CASE("hset_with_a_tvec_chunk_is_rejected") {
   // TVEC is not an allowed chunk: a reader rejects a file that has one,
-  // with or without records and a TIVF index after it
+  // with or without records and a TIVF index, wherever the FTOC lists it:
+  // in the TLSH section (where it once went), right after the FHDR, or
+  // after the FEND, where a decoder that stops at the FEND never visits it
   for (const bool records: { true, false }) {
     for (const uint32_t opts: { 0u, uint32_t(SFHASH_HSET_TLSH_INDEX) }) {
       const Built b = build(true, "test/tlsh_vec_tvec.hset", records, true, opts);
-      const std::vector<char> buf = with_tvec_chunk(b);
-      SFHASH_Error* err = nullptr;
-      HsetPtr hset(
-        sfhash_load_hashset(buf.data(), buf.data() + buf.size(), &err),
-        sfhash_destroy_hashset
-      );
-      CHECK(!hset);
-      REQUIRE(err);
-      CHECK(std::string(err->message).find("TVEC") != std::string::npos);
-      sfhash_free_error(err);
+      REQUIRE(b.toc.entries.back().second == Chunk::FEND);
+      const std::pair<const char*, size_t> placements[] = {
+        { "in the TLSH section", after_tlsh_section(b.toc) },
+        { "after the FHDR", 2 },
+        { "after the FEND", b.toc.entries.size() }
+      };
+      for (const auto& [where, at]: placements) {
+        INFO("records " << records << ", options " << opts << ", TVEC " << where);
+        const std::vector<char> buf = with_tvec_chunk(b, at);
+        SFHASH_Error* err = nullptr;
+        HsetPtr hset(
+          sfhash_load_hashset(buf.data(), buf.data() + buf.size(), &err),
+          sfhash_destroy_hashset
+        );
+        CHECK(!hset);
+        REQUIRE(err);
+        CHECK(std::string(err->message).find("TVEC") != std::string::npos);
+        sfhash_free_error(err);
+      }
     }
   }
 }
