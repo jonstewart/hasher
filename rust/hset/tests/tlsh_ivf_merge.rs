@@ -648,6 +648,225 @@ fn incremental_unions_keep_the_invariant_and_the_list_bound() {
 }
 
 //
+// parity with the C++ merge
+//
+
+/// A merge whose output payload the C++ `merge_tlsh_ivf` was run on.
+struct Golden {
+    name: &'static str,
+    a: Option<(TlshIvf, Vec<u32>)>,
+    b: Option<(TlshIvf, Vec<u32>)>,
+    rows: Vec<[u8; 36]>,
+    c: u32,
+}
+
+impl Golden {
+    /// Two overlapping samples of `pool(seed, n, cells, flip)`, indexed by
+    /// [`random_index`] with lists of up to `max_list`, merged by `op`.
+    fn two_sides(
+        name: &'static str,
+        op: SetOp,
+        (seed, n, cells, flip): (u64, usize, usize, f64),
+        max_list: usize,
+        c: u32,
+    ) -> Self {
+        let all = pool(seed, n, cells, flip);
+        let mut rng = SplitMix64::new(seed ^ 0x5eed);
+        let (mut a, mut b) = (Vec::new(), Vec::new());
+        for d in &all {
+            match rng.below(3) {
+                0 => a.push(*d),
+                1 => b.push(*d),
+                _ => {
+                    a.push(*d);
+                    b.push(*d);
+                }
+            }
+        }
+        let side = |d: &[TlshDigest], s| {
+            let rows = sorted_unique(d);
+            let ivf = random_index(&rows, s, max_list);
+            Side { rows, ivf }
+        };
+        let (l, r) = (side(&a, seed ^ 1), side(&b, seed ^ 2));
+        let (rows, m) = merge_sides(op, &l, &r);
+        Self {
+            name,
+            a: Some((l.ivf, m.lmap)),
+            b: Some((r.ivf, m.rmap)),
+            rows,
+            c,
+        }
+    }
+
+    /// One side alone, keeping the rows `keep` selects (`left` says which
+    /// side it is passed as).
+    fn one_side(
+        name: &'static str,
+        (seed, n, cells, flip): (u64, usize, usize, f64),
+        max_list: usize,
+        keep: impl Fn(usize) -> bool,
+        left: bool,
+        c: u32,
+    ) -> Self {
+        let rows = sorted_unique(&pool(seed, n, cells, flip));
+        let ivf = random_index(&rows, seed ^ 3, max_list);
+        let mut out = Vec::new();
+        let map = (0..rows.len())
+            .map(|i| {
+                if keep(i) {
+                    out.push(rows[i]);
+                    out.len() as u32 - 1
+                } else {
+                    DROPPED
+                }
+            })
+            .collect();
+        let side = Some((ivf, map));
+        let (a, b) = if left { (side, None) } else { (None, side) };
+        Self {
+            name,
+            a,
+            b,
+            rows: out,
+            c,
+        }
+    }
+
+    fn merged(&self) -> TlshIvf {
+        fn side(s: &Option<(TlshIvf, Vec<u32>)>) -> Option<(&TlshIvf, &[u32])> {
+            s.as_ref().map(|(i, m)| (i, &m[..]))
+        }
+        merge_tlsh_ivf(side(&self.a), side(&self.b), &self.rows, self.c).unwrap()
+    }
+}
+
+fn golden_merges() -> Vec<Golden> {
+    vec![
+        Golden::two_sides("union64", SetOp::Union, (11, 600, 3, 0.04), 6, 64),
+        Golden::two_sides("intersect64", SetOp::Intersect, (11, 600, 3, 0.04), 6, 64),
+        Golden::two_sides("subtract64", SetOp::Subtract, (11, 600, 3, 0.04), 6, 64),
+        // near-identical bodies: many equal radii, so the ties decide
+        Golden::two_sides("ties10", SetOp::Union, (12, 500, 2, 0.004), 3, 10),
+        Golden::two_sides("ties64", SetOp::Union, (13, 400, 1, 0.0), 2, 64),
+        Golden::two_sides("union5", SetOp::Union, (14, 500, 4, 0.05), 4, 5),
+        Golden::two_sides("union0", SetOp::Union, (15, 300, 3, 0.05), 4, 0),
+        // one cell of many small lists
+        Golden::two_sides("onecell", SetOp::Union, (16, 1200, 1, 0.03), 2, 64),
+        Golden::one_side(
+            "left_drops",
+            (17, 500, 3, 0.04),
+            7,
+            |i| i % 3 != 1,
+            true,
+            64,
+        ),
+        Golden::one_side(
+            "right_drops",
+            (18, 500, 3, 0.04),
+            7,
+            |i| i % 4 != 0,
+            false,
+            32,
+        ),
+    ]
+}
+
+/// SHA-256 of the C++ `merge_tlsh_ivf` payload (`write_tivf_data`) for
+/// each [`golden_merges`] input, from the harness run on the inputs
+/// [`dump_golden_merge_inputs`] writes (the harness linked libhasher's
+/// `tlsh_ivf.o` built from `tlsh_ivf.cpp` as of 961c340; list counts in
+/// and out: union64 114 + 111 -> 17, onecell 534 + 530 -> 33 in one cell,
+/// union0 76 + 82 -> 140).
+const GOLDEN_SHA256: &[(&str, &str)] = &[
+    (
+        "union64",
+        "6ae83e4d837ccc0d31e34eb02cb41e3692753bfae7fa4f76f3493fd226b6702e",
+    ),
+    (
+        "intersect64",
+        "19e95fd9919c21df25be19ae94da85d1ce929c93aa72df31c22bcccd29153379",
+    ),
+    (
+        "subtract64",
+        "578e8cac8ad43ff82bad67ec9723be14c0d51b44bbc8dff65f8e2ed1372944eb",
+    ),
+    (
+        "ties10",
+        "0d405c58ba88c4b87bcba4e7734bd3bd94edce401608abf9d899dffe250d3007",
+    ),
+    (
+        "ties64",
+        "b17216884e334dcc88cc08f8f12d0203fa1a0fb7c88b6177f11284ddeeeb2f5b",
+    ),
+    (
+        "union5",
+        "f18d2ed46185e865a9bac06fe3bcc3b38d646b8c1db91bc7d3851cd42ebe52d2",
+    ),
+    (
+        "union0",
+        "2e4e53a26839a7f06f38aa27849ede360aebf36ce3bac78106ee3a3c97f3e21c",
+    ),
+    (
+        "onecell",
+        "b94f09402043d4e433c18237d698b7904425fe131b6e8ae030424d45df45318a",
+    ),
+    (
+        "left_drops",
+        "2841b84781fb15860c9e9c21139ec16730d4ee393e85830575defb607593cf77",
+    ),
+    (
+        "right_drops",
+        "c995b2d48bbb0b1fafe1707a73acbf61e5589bb3d9661fb962cabd2b1d193454",
+    ),
+];
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    Sha256::digest(bytes)
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+
+#[test]
+fn merges_equal_the_cpp_payloads_byte_for_byte() {
+    let golden = golden_merges();
+    assert_eq!(golden.len(), GOLDEN_SHA256.len());
+    for (g, (name, sha)) in golden.iter().zip(GOLDEN_SHA256) {
+        assert_eq!(g.name, *name);
+        let m = g.merged();
+        check_merged(&m, &g.rows, g.c);
+        assert_eq!(sha256_hex(&m.to_bytes()), *sha, "{name}");
+    }
+}
+
+/// Writes each [`golden_merges`] input for the C++ harness to
+/// `$HSET_IVF_MERGE_DUMP/<name>.{rows,c,a.tivf,a.map,b.tivf,b.map}`, and
+/// the Rust payload to `<name>.rust.tivf`. The harness (a `main` around
+/// `parse_tivf_data`, `merge_tlsh_ivf` and `write_tivf_data`) writes
+/// `<name>.cpp.tivf`.
+#[test]
+#[ignore = "writes the C++ parity inputs; set HSET_IVF_MERGE_DUMP"]
+fn dump_golden_merge_inputs() {
+    let dir = std::path::PathBuf::from(std::env::var("HSET_IVF_MERGE_DUMP").unwrap());
+    let u32s = |v: &[u32]| v.iter().flat_map(|x| x.to_le_bytes()).collect::<Vec<u8>>();
+    for g in golden_merges() {
+        let path = |ext: &str| dir.join(format!("{}.{ext}", g.name));
+        std::fs::write(path("rows"), g.rows.as_flattened()).unwrap();
+        std::fs::write(path("c"), g.c.to_le_bytes()).unwrap();
+        for (side, s) in [("a", &g.a), ("b", &g.b)] {
+            if let Some((ivf, map)) = s {
+                std::fs::write(path(&format!("{side}.tivf")), ivf.to_bytes()).unwrap();
+                std::fs::write(path(&format!("{side}.map")), u32s(map)).unwrap();
+            }
+        }
+        std::fs::write(path("rust.tivf"), g.merged().to_bytes()).unwrap();
+        println!("{} {}", g.name, sha256_hex(&g.merged().to_bytes()));
+    }
+}
+
+//
 // rejected inputs (merge_tlsh_ivf_remaps_and_drops)
 //
 
