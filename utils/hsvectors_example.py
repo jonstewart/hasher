@@ -1,19 +1,22 @@
 #!/usr/bin/python3
 
 """
-Nearest neighbours and clustering over the TLSH vectors stored in an hset.
+Nearest neighbours and clustering over the TLSH embeddings of an hset's rows.
 
-A TLSH hash set written with vectors (the default, see mkhashset) carries a
-TVEC chunk: the n x 264 float32 lower-bound embedding of every digest, page
-aligned so numpy can memory-map it straight out of the file. For digests a
-and b with TLSH distance <= 144, ||phi(a) - phi(b)||^2 <= diff(a, b), so
-small squared Euclidean distances are a sound filter for small TLSH
-distances (docs/TLSH_EMBEDDING.md). Drop column 256 to ignore the length
-term, as tlsh_diff(..., include_length=False) does.
+libhasher's tlsh_embed maps a digest to a 264-dim float32 lower-bound
+embedding phi: for digests a and b with TLSH distance <= 144,
+||phi(a) - phi(b)||^2 <= diff(a, b), so small squared Euclidean distances
+are a sound filter for small TLSH distances (docs/TLSH_EMBEDDING.md). Drop
+column 256 to ignore the length term, as tlsh_diff(..., include_length=False)
+does. hset files do not store the embeddings; HSet.tlsh_embeddings()
+computes the n x 264 matrix of a TLSH hash set from its rows (about 1 KiB
+per row in memory).
 
-Only numpy is required:
+libhasher (the hasher Python package, python/ in the source tree) and numpy
+are required:
 
-    python3 utils/hsvectors_example.py corpus.hset [ROW]
+    LD_LIBRARY_PATH=src/lib/.libs PYTHONPATH=python \
+        python3 utils/hsvectors_example.py corpus.hset [ROW]
 
 ROW is the query row (default 0). With scikit-learn installed the script also
 fits sklearn.neighbors.NearestNeighbors and clusters the matrix with HDBSCAN
@@ -27,20 +30,11 @@ Build a small hset to try it on:
       md5_tlsh.txt example.hset
 """
 
-import os
 import sys
 import warnings
 
-try:
-    from hasher import hsvectors
-except ImportError:
-    # libhasher is not installed; hsvectors.py itself needs only Python
-    import importlib.util
-    _path = os.path.join(os.path.dirname(os.path.realpath(__file__)),
-                         '..', 'python', 'hasher', 'hsvectors.py')
-    _spec = importlib.util.spec_from_file_location('hsvectors', _path)
-    hsvectors = importlib.util.module_from_spec(_spec)
-    _spec.loader.exec_module(hsvectors)
+import hasher
+from hasher import hsvectors
 
 
 def knn_numpy(X, q, k):
@@ -59,9 +53,10 @@ def main(path, row=0, k=10):
     except ImportError:
         sys.exit('numpy is required: pip install numpy')
 
-    X = hsvectors.load_tlsh_vectors(path)
     D = hsvectors.load_tlsh_digests(path)
-    print(f'{path}: vectors {X.shape} {X.dtype}, digests {D.shape} {D.dtype}')
+    with hasher.HSet.open(path) as hset:
+        X = hset.tlsh_embeddings()
+    print(f'{path}: embeddings {X.shape} {X.dtype}, digests {D.shape} {D.dtype}')
     ridx = hsvectors.load_tlsh_record_index(path)
     if ridx is not None:
         print(f'record index: {ridx.shape} {ridx.dtype}')

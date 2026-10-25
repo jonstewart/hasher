@@ -1,17 +1,18 @@
 """
-hsvectors: read the TLSH embedding vectors of an hset file without libhasher
+hsvectors: read the chunks and TLSH rows of an hset file without libhasher
 
 An hset file is "SetOHash", a 32-byte SHA-256, then chunks. Each chunk is a
 4-byte type, a little-endian u64 payload length and the payload; the first
 chunk, FTOC, lists (offset, type) of every chunk in the file. A TLSH hash set
 is the chunk run
 
-    HHnn HINT HDAT [RIDX] [TVEC] [TIVF]
+    HHnn HINT HDAT [RIDX] [TIVF]
 
-where HDAT holds n sorted 36-byte canonical digests, TVEC a 32-byte header
-followed by an n x 264 float32 row-major matrix (row r is the embedding of
-HDAT row r, and the matrix starts on a 4096-byte boundary of the file) and
-RIDX n little-endian u64 record indexes. See HASHSET_FORMAT and
+where HDAT holds n sorted 36-byte canonical digests, RIDX n little-endian
+u64 record indexes and TIVF the kNN index. The file does not store the
+rows' embeddings (the TVEC chunk that did was removed from the format and is
+rejected); compute them with libhasher, hasher.tlsh_embed() per digest or
+HSet.tlsh_embeddings() for a whole hash set. See HASHSET_FORMAT and
 docs/TLSH_EMBEDDING.md.
 
 This module is pure Python with no dependency on the C library. numpy is a
@@ -20,25 +21,22 @@ without it; read_toc, tlsh_sections, the *_rows functions and the hex codec
 work everywhere.
 
     from hasher import hsvectors
-    X = hsvectors.load_tlsh_vectors('corpus.hset')   # (n, 264) float32 memmap
     D = hsvectors.load_tlsh_digests('corpus.hset')   # (n, 36) uint8 memmap
     print(hsvectors.tlsh_hex(bytes(D[0])))
 """
 
-from array import array
 from collections import namedtuple
 import hashlib
 import os
 import struct
-import sys
 
 __all__ = [
     'MAGIC', 'TLSH_DIGEST_LENGTH', 'TLSH_EMBEDDING_DIMS',
-    'ChunkEntry', 'TlshSection', 'TvecHeader', 'TivfHeader',
+    'ChunkEntry', 'TlshSection', 'TivfHeader',
     'read_toc', 'chunk_name', 'hhdr_hash_type', 'chunk_sha256',
-    'tlsh_sections', 'tvec_header', 'tivf_header',
-    'load_tlsh_vectors', 'load_tlsh_digests', 'load_tlsh_record_index',
-    'tlsh_vector_rows', 'tlsh_digest_rows', 'tlsh_record_index_rows',
+    'tlsh_sections', 'tivf_header',
+    'load_tlsh_digests', 'load_tlsh_record_index',
+    'tlsh_digest_rows', 'tlsh_record_index_rows',
     'tlsh_hex', 'tlsh_from_hex',
 ]
 
@@ -50,9 +48,6 @@ TLSH_DIGEST_LENGTH = 36
 TLSH_EMBEDDING_DIMS = 264
 TLSH_HASH_BIT = 15        # SFHASH_TLSH == 1 << 15
 
-TVEC_HEADER_LENGTH = 32
-TVEC_DATA_ALIGNMENT = 4096
-TVEC_DTYPE_FLOAT32 = 1
 TIVF_HEADER_LENGTH = 32
 
 # hash type bit -> field name, as in hasher.ALL_HASHES
@@ -63,14 +58,13 @@ HASH_NAMES = [
 ]
 
 # (offset, type, length): type is the 4-byte chunk type decoded as latin-1,
-# e.g. 'FTOC', 'TVEC'; a hash set header is 'HH' + the hash type bit as a
+# e.g. 'FTOC', 'TIVF'; a hash set header is 'HH' + the hash type bit as a
 # big-endian u16, see chunk_name()/hhdr_hash_type()
 ChunkEntry = namedtuple('ChunkEntry', 'offset type length')
 
 # the chunks of one TLSH hash set; each is a ChunkEntry or None
-TlshSection = namedtuple('TlshSection', 'hhdr hint hdat ridx tvec tivf')
+TlshSection = namedtuple('TlshSection', 'hhdr hint hdat ridx tivf')
 
-TvecHeader = namedtuple('TvecHeader', 'version variant flags dims n dtype data_offset')
 TivfHeader = namedtuple('TivfHeader', 'version flags dims lists n')
 
 
@@ -188,7 +182,7 @@ def hhdr_hash_type(ctype):
 
 
 def chunk_name(ctype):
-    """A printable name for a chunk type: 'TVEC', 'HHDR(tlsh)', 'HHDR(0x0013)'."""
+    """A printable name for a chunk type: 'TIVF', 'HHDR(tlsh)', 'HHDR(0x0013)'."""
     ht = hhdr_hash_type(ctype)
     if ht is None:
         return ctype
@@ -199,18 +193,25 @@ def chunk_name(ctype):
 
 def tlsh_sections(src):
     """The TLSH hash sets of an hset, as [TlshSection]. src is a path, a
-    bytes-like object, or a table of contents from read_toc()."""
+    bytes-like object, or a table of contents from read_toc(). Raises
+    ValueError on a TVEC chunk, which the format does not allow (it held
+    the rows' embeddings, which are no longer stored)."""
     toc = src if isinstance(src, list) else read_toc(src)
     sections = []
     cur = None
     for e in toc:
         ht = hhdr_hash_type(e.type)
+        if e.type == 'TVEC':
+            raise ValueError(
+                f'TVEC chunk at offset {e.offset}: not allowed in an hset '
+                '(the stored TLSH embedding was removed from the format)'
+            )
         if ht is not None:
             cur = None
             if ht == 1 << TLSH_HASH_BIT:
                 cur = {'hhdr': e}
                 sections.append(cur)
-        elif cur is not None and e.type in ('HINT', 'HDAT', 'RIDX', 'TVEC', 'TIVF'):
+        elif cur is not None and e.type in ('HINT', 'HDAT', 'RIDX', 'TIVF'):
             cur[e.type.lower()] = e
         else:
             cur = None
@@ -234,43 +235,6 @@ def _section(rd, section):
 
 def _hdat_count(sec):
     return sec.hdat.length // TLSH_DIGEST_LENGTH
-
-
-def _parse_tvec(rd, sec):
-    if sec.tvec is None:
-        raise ValueError('TLSH hash set has no TVEC chunk (vectors not written)')
-    if sec.tvec.length < TVEC_HEADER_LENGTH:
-        raise ValueError('TVEC chunk shorter than its header')
-    hdr = rd.read(sec.tvec.offset + CHUNK_HEADER_LENGTH, TVEC_HEADER_LENGTH)
-    version, variant, flags, dims, n, dtype, _res0, _res1 = struct.unpack('<HBBIQIIQ', hdr)
-    data_off = sec.tvec.offset + CHUNK_HEADER_LENGTH + TVEC_HEADER_LENGTH
-
-    if version != 1:
-        raise ValueError(f'unsupported TVEC version {version}')
-    if variant != 0:
-        raise ValueError(f'unsupported TVEC variant {variant}')
-    if dims != TLSH_EMBEDDING_DIMS:
-        raise ValueError(f'unsupported TVEC dims {dims}, expected {TLSH_EMBEDDING_DIMS}')
-    if dtype != TVEC_DTYPE_FLOAT32:
-        raise ValueError(f'unsupported TVEC dtype {dtype}, expected {TVEC_DTYPE_FLOAT32} (float32)')
-    if sec.tvec.length - TVEC_HEADER_LENGTH != n * dims * 4:
-        raise ValueError(
-            f'TVEC has {sec.tvec.length - TVEC_HEADER_LENGTH} bytes of vector data, '
-            f'expected {n} rows of {dims * 4}'
-        )
-    if n != _hdat_count(sec):
-        raise ValueError(f'TVEC has {n} rows but HDAT has {_hdat_count(sec)}')
-    if data_off % TVEC_DATA_ALIGNMENT != 0:
-        raise ValueError(f'TVEC data offset {data_off} is not {TVEC_DATA_ALIGNMENT}-byte aligned')
-
-    return TvecHeader(version, variant, flags, dims, n, dtype, data_off)
-
-
-def tvec_header(src, section=0):
-    """The validated TVEC header of a TLSH hash set as a TvecHeader; its
-    data_offset is the absolute file offset of the float32 matrix."""
-    rd = _Reader(src)
-    return _parse_tvec(rd, _section(rd, section))
 
 
 def tivf_header(src, section=0):
@@ -313,21 +277,10 @@ def _view(rd, np, dtype, offset, shape):
     return a
 
 
-def load_tlsh_vectors(src, section=0):
-    """The TVEC matrix of the section-th TLSH hash set as a read-only numpy
-    array of shape (n, 264), float32: a numpy.memmap when src is a path, a
-    view when it is a bytes-like object. Validates the chunk layout and the
-    TVEC header and raises ValueError on anything unexpected."""
-    np = _numpy()
-    rd = _Reader(src)
-    tv = _parse_tvec(rd, _section(rd, section))
-    return _view(rd, np, '<f4', tv.data_offset, (tv.n, tv.dims))
-
-
 def load_tlsh_digests(src, section=0):
     """The HDAT rows of the section-th TLSH hash set as a read-only (n, 36)
     uint8 numpy array (memmap for a path), row r being the canonical digest
-    whose embedding is row r of load_tlsh_vectors()."""
+    of row r."""
     np = _numpy()
     rd = _Reader(src)
     sec = _section(rd, section)
@@ -368,23 +321,6 @@ def tlsh_digest_rows(src, section=0):
     sec = _section(rd, section)
     data = rd.read(sec.hdat.offset + CHUNK_HEADER_LENGTH, sec.hdat.length)
     return [data[i:i + TLSH_DIGEST_LENGTH] for i in range(0, len(data), TLSH_DIGEST_LENGTH)]
-
-
-def tlsh_vector_rows(src, section=0):
-    """The TVEC rows of a TLSH hash set as a list of array('f') of 264
-    floats, after the same validation as load_tlsh_vectors()."""
-    rd = _Reader(src)
-    tv = _parse_tvec(rd, _section(rd, section))
-    data = rd.read(tv.data_offset, tv.n * tv.dims * 4)
-    row_len = tv.dims * 4
-    rows = []
-    for i in range(0, len(data), row_len):
-        a = array('f')
-        a.frombytes(data[i:i + row_len])
-        if sys.byteorder != 'little':
-            a.byteswap()
-        rows.append(a)
-    return rows
 
 
 def tlsh_record_index_rows(src, section=0):

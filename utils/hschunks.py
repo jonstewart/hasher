@@ -2,8 +2,10 @@
 
 """
 Print the table of contents (FTOC) of an hset file: the offset, type,
-payload length and payload SHA-256 of every chunk, with the TVEC and TIVF
-headers of TLSH hash sets decoded. Pure Python; libhasher is not needed.
+payload length and payload SHA-256 of every chunk, with the TIVF headers of
+TLSH hash sets decoded. Pure Python; libhasher is not needed. A file with a
+TVEC chunk (the stored embedding, no longer part of the format) gets its
+table printed and then an error, as libhasher rejects it.
 
     hschunks.py corpus.hset
 
@@ -37,14 +39,13 @@ def main(path):
         print(f'{e.offset:>12}  {hsvectors.chunk_name(e.type):<12}  {e.length:>12}  '
               f'{hsvectors.chunk_sha256(path, e)}')
 
-    for i, sec in enumerate(hsvectors.tlsh_sections(toc)):
+    try:
+        sections = hsvectors.tlsh_sections(toc)
+    except ValueError as e:
+        sys.exit(f'\n{path}: {e}')
+    for i, sec in enumerate(sections):
         print(f'\nTLSH hash set {i}: {sec.hdat.length // hsvectors.TLSH_DIGEST_LENGTH} rows'
               f'{", RIDX" if sec.ridx else ""}')
-        if sec.tvec:
-            tv = hsvectors.tvec_header(path, i)
-            print(f'  TVEC: version {tv.version}, variant {tv.variant}, flags {tv.flags}, '
-                  f'dims {tv.dims}, n {tv.n}, dtype {tv.dtype}, data at {tv.data_offset} '
-                  f'({"" if tv.data_offset % 4096 == 0 else "NOT "}4096-aligned)')
         if sec.tivf:
             iv = hsvectors.tivf_header(path, i)
             print(f'  TIVF: version {iv.version}, flags {iv.flags}, dims {iv.dims}, '

@@ -86,8 +86,7 @@ GB zip), scans in 165 s with no errors.
 2. Build the hset. The hset record format stores fixed-length hash types
 only, so a record holds md5, sha1, sha256, tlsh and size (TNULL: field
 absent, no TLSH row); the file gets the md5, sha1, sha2_256, tlsh and sizes
-hash sections, and the TLSH section its TVEC embedding vectors and TIVF
-kNN index. ssdeep, entropy, zip and member name are not representable in
+hash sections, and the TLSH section its TIVF kNN index. ssdeep, entropy, zip and member name are not representable in
 the hset and stay in the TSVs, which are the full-fidelity sidecar (join on
 sha256 or md5).
 
@@ -96,15 +95,18 @@ sha256 or md5).
 
 An INPUT directory means its data TSVs (not *.errors.tsv or *.summary.tsv);
 TSV files can also be listed. Identical records collapse to one.
-HSET_TLSH_OPTIONS or --tlsh-options select the TLSH sections as for
-mkhashset (default 3, both).
+HSET_TLSH_OPTIONS or --tlsh-options select the TLSH index as for
+mkhashset (default 2, the index; 0 for none).
 
 Build cost, measured at full scale on the VM (9,437,184 synthetic rows: the
 131,072 real TLSH digests of VirusShare_00000 in 72 copies with a few body
 nibbles mutated per copy, random md5/sha1/sha256): 411 s in all, 103 s of it
 parsing the TSVs; then the builder sorts the records, builds the TIVF index
-on all CPUs and writes the hash sections, RIDX, TVEC, TIVF and the file
-SHA-256. The file is 12.5 GB (TVEC is 9.9 GB of it). The builder works in a
+on all CPUs and writes the hash sections, RIDX, TIVF and the file SHA-256.
+That build also wrote the TVEC embedding matrix, since removed from the
+format (docs/DESIGN_DECISIONS.md): the file was 12.5 GB, 9.9 GB of it
+TVEC, so the same build now gives a file of about 2.6 GB, and its time and
+the file pages below include writing the matrix. The builder works in a
 shared mapping of the output file: its anonymous memory peaked at 420 MB,
 and the 12 GB of file pages it touched (maxrss 12.4 GB) are page cache that
 the kernel writes back and can reclaim (MemAvailable stayed above 30 GB),

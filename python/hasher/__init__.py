@@ -379,10 +379,6 @@ _sfhash_hashset_tlsh_knn_strategies = _hasher.sfhash_hashset_tlsh_knn_strategies
 _sfhash_hashset_tlsh_knn_strategies.argtypes = [c_void_p, c_size_t]
 _sfhash_hashset_tlsh_knn_strategies.restype = c_uint32
 
-# const float* sfhash_hashset_tlsh_vectors(const SFHASH_Hashset* hset, size_t tidx, size_t* dims);
-_sfhash_hashset_tlsh_vectors = _hasher.sfhash_hashset_tlsh_vectors
-_sfhash_hashset_tlsh_vectors.argtypes = [c_void_p, c_size_t, POINTER(c_size_t)]
-_sfhash_hashset_tlsh_vectors.restype = POINTER(c_float)
 
 c_ssize_p = POINTER(c_ssize_t)
 
@@ -596,19 +592,23 @@ def _tlsh_knn(hset, tidx, digest, k, max_distance, include_length, strategy):
     return [(out[i].index, out[i].distance) for i in range(n)]
 
 
-def _tlsh_vectors(hset, tidx):
-    dims = c_size_t()
-    ptr = _sfhash_hashset_tlsh_vectors(hset, tidx, byref(dims))
-    if not ptr:
-        return None
+def _tlsh_embeddings(hset, tidx):
     try:
         import numpy as np
-    except ImportError:
-        return None
+    except ImportError as e:
+        raise ImportError('tlsh_embeddings needs numpy (pip install numpy); '
+                          'tlsh_embed embeds one digest without it') from e
+    if not _sfhash_hashset_tlsh_knn_strategies(hset, tidx):
+        raise ValueError(f"hash set {tidx} is not a TLSH hash set")
     n = _sfhash_hashset_count(hset, tidx)
-    a = np.ctypeslib.as_array(ptr, shape=(n, dims.value))
-    a.flags.writeable = False
-    return a
+    out = np.empty((n, TLSH_EMBEDDING_DIMS), dtype=np.float32)
+    base = out.ctypes.data
+    row_bytes = TLSH_EMBEDDING_DIMS * 4
+    for r in range(n):
+        _sfhash_tlsh_embed(
+            _sfhash_hashset_hash(hset, tidx, r), cast(base + r * row_bytes, POINTER(c_float))
+        )
+    return out
 
 
 class Hashset(object):
@@ -651,11 +651,12 @@ class Hashset(object):
         0 if it is not a TLSH hash set."""
         return _sfhash_hashset_tlsh_knn_strategies(self.hset, self.idx)
 
-    def tlsh_vectors(self):
-        """The TVEC embedding matrix as a read-only (n, 264) float32 numpy
-        array viewing the hset's memory (valid while the HSet is alive), or
-        None when there are no vectors or numpy is not installed."""
-        return _tlsh_vectors(self.hset, self.idx)
+    def tlsh_embeddings(self):
+        """The embeddings of every row, computed with tlsh_embed (hset files
+        do not store them), as a new (n, 264) float32 numpy array: row r is
+        tlsh_embed(self.hash(r)). About 1 KiB per row. Raises ValueError if
+        this is not a TLSH hash set, ImportError without numpy."""
+        return _tlsh_embeddings(self.hset, self.idx)
 
 
 class HSet(Handle):
@@ -711,11 +712,10 @@ class HSet(Handle):
         """Bitwise OR of the TLSH_KNN_* strategies hash set tidx supports."""
         return _sfhash_hashset_tlsh_knn_strategies(self.get(), self._tlsh_index(tidx))
 
-    def tlsh_vectors(self, tidx=None):
-        """The TVEC matrix of TLSH hash set tidx as a read-only (n, 264)
-        float32 numpy array over the mapped file, or None (no vectors, or no
-        numpy). Valid only while this HSet is alive."""
-        return _tlsh_vectors(self.get(), self._tlsh_index(tidx))
+    def tlsh_embeddings(self, tidx=None):
+        """The embeddings of every row of TLSH hash set tidx (default the
+        first), computed from the rows; see Hashset.tlsh_embeddings."""
+        return _tlsh_embeddings(self.get(), self._tlsh_index(tidx))
 
     def name(self):
         return _sfhash_hashset_name(self.get()).decode('utf-8')

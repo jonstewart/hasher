@@ -1,8 +1,8 @@
 #!/usr/bin/python3
 
 # TLSH hash sets: the pure-Python chunk walker (hasher.hsvectors), the kNN
-# bindings and the stored embedding vectors, against an hset built by the
-# mkhashset binary from the sibling build tree.
+# bindings and the embeddings computed from the rows, against an hset built
+# by the mkhashset binary from the sibling build tree.
 
 import hashlib
 import os
@@ -86,7 +86,7 @@ class TestTlshHashset(unittest.TestCase):
         cls.queries += [tlsh_of(rng.randbytes(2048)) for _ in range(3)]
 
         cls.tmpdir = tempfile.TemporaryDirectory(prefix='hasher-tlsh-')
-        txt = os.path.join(cls.tmpdir.name, 'md5_tlsh.txt')
+        txt = cls.txt_path = os.path.join(cls.tmpdir.name, 'md5_tlsh.txt')
         cls.hset_path = os.path.join(cls.tmpdir.name, 'md5_tlsh.hset')
         with open(txt, 'w') as f:
             for d in cls.digests:
@@ -137,6 +137,7 @@ class TestTlshHashset(unittest.TestCase):
         secs = hsvectors.tlsh_sections(self.hset_path)
         self.assertEqual(1, len(secs))
         sec = secs[0]
+        self.assertEqual(('hhdr', 'hint', 'hdat', 'ridx', 'tivf'), hsvectors.TlshSection._fields)
         self.assertEqual(len(self.rows) * 36, sec.hdat.length)
         self.assertEqual(len(self.rows) * 8, sec.ridx.length)
         self.assertIsNotNone(sec.tivf)
@@ -146,6 +147,31 @@ class TestTlshHashset(unittest.TestCase):
         self.assertEqual(256, iv.dims)
         self.assertEqual(len(self.rows), iv.n)
         self.assertGreater(iv.lists, 0)
+
+    def test_tvec_chunk_is_rejected(self):
+        # TVEC (the stored embedding, removed from the format) is not an
+        # allowed chunk: retype the TIVF chunk, in the FTOC and its header
+        with open(self.hset_path, 'rb') as f:
+            data = bytearray(f.read())
+        toc = hsvectors.read_toc(bytes(data))
+        i = [e.type for e in toc].index('TIVF')
+        data[52 + 12 * i + 8:52 + 12 * i + 12] = b'TVEC'
+        data[toc[i].offset:toc[i].offset + 4] = b'TVEC'
+        self.assertEqual('TVEC', hsvectors.read_toc(bytes(data))[i].type)
+        with self.assertRaisesRegex(ValueError, 'TVEC'):
+            hsvectors.tlsh_sections(bytes(data))
+
+    def test_hset_tlsh_options_3_means_index(self):
+        # bit 1 of HSET_TLSH_OPTIONS is reserved and ignored
+        out = os.path.join(self.tmpdir.name, 'opt3.hset')
+        subprocess.run(
+            [MKHASHSET, 'tlsh test', 'md5 and tlsh with an index',
+             'md5', 'tlsh', 'true', 'true', self.txt_path, out],
+            check=True, cwd=self.tmpdir.name, capture_output=True,
+            env=dict(os.environ, HSET_TLSH_OPTIONS='3')
+        )
+        want = [(e.type, e.length) for e in hsvectors.read_toc(self.hset_path)]
+        self.assertEqual(want, [(e.type, e.length) for e in hsvectors.read_toc(out)])
 
     def test_not_an_hset(self):
         with self.assertRaises(ValueError):
@@ -207,8 +233,21 @@ class TestTlshHashset(unittest.TestCase):
             buf = f.read()
         self.assertTrue(np.array_equal(D, hsvectors.load_tlsh_digests(buf)))
 
+    @unittest.skipIf(np is None, 'numpy not installed')
+    def test_tlsh_embeddings(self):
+        # computed from the rows: row r is tlsh_embed of row r
+        n = len(self.rows)
+        X = self.hset.tlsh_embeddings(self.tidx)
+        self.assertEqual((n, 264), X.shape)
+        self.assertEqual(np.float32, X.dtype)
+        for r in range(n):
+            self.assertEqual(hasher.tlsh_embed(self.rows[r]), X[r].tolist())
+        self.assertTrue(np.array_equal(X, self.hset.tlsh_embeddings()))
+        self.assertTrue(np.array_equal(X, self.hset.hashset(self.tidx).tlsh_embeddings()))
+        with self.assertRaises(ValueError):
+            self.hset.tlsh_embeddings(0)  # the md5 hash set
+
         # the embedding is a lower bound on the TLSH distance within 144
-        X = np.array([hasher.tlsh_embed(bytes(d)) for d in D], dtype=np.float32)
         q = X[0]
         d2 = ((X - q) ** 2).sum(axis=1)
         for r in range(n):
