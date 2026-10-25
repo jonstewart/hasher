@@ -35,7 +35,7 @@ use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_m
 use hset::synth::SplitMix64;
 use hset::tlsh::ivf::bisect::{IvfBuildOptions, build_tlsh_ivf};
 use hset::tlsh::ivf::search::knn_ivf;
-use hset::tlsh::{BodyQuery, IvfIndex, TlshDigest, knn_brute};
+use hset::tlsh::{BodyQuery, IvfIndex, KnnStats, TlshDigest, knn_brute};
 use hset_testkit::tlsh::{corpus, sorted_rows};
 
 type Row = [u8; 36];
@@ -181,11 +181,19 @@ fn bench_tlsh(c: &mut Criterion) {
 
         for (wl, set, k, max_distance) in WORKLOADS {
             let qs = queries(&rows, set);
+            let mut stats = KnnStats::default();
             for (qi, q) in qs.iter().enumerate() {
                 let brute = knn_brute(&rows, q, k, max_distance, true);
-                let ivf_hits = knn_ivf(&valid, q, k, max_distance, true, None);
+                let ivf_hits = knn_ivf(&valid, q, k, max_distance, true, Some(&mut stats));
                 assert_eq!(brute, ivf_hits, "{label} {wl} query {qi}");
             }
+            let per = |x: u64| x / QUERIES as u64;
+            eprintln!(
+                "{label} {wl}: ivf per query visits {} cells, bounds {} lists, scans {} rows",
+                per(stats.cells),
+                per(stats.lists),
+                per(stats.rows)
+            );
             let mut g = c.benchmark_group(format!("tlsh/knn/{wl}"));
             g.throughput(Throughput::Elements(QUERIES as u64));
             g.warm_up_time(Duration::from_secs(1));

@@ -85,7 +85,7 @@ use std::ops::Range;
 
 use super::CELL_COUNT;
 use super::digest::{DIGEST_LENGTH, TlshDigest};
-use super::distance::BodyQuery;
+use super::distance::{BodyQuery, popcount};
 use crate::error::{Error, Result};
 
 /// Lists hold about this many rows each: the clustering target `T` of the
@@ -358,12 +358,16 @@ pub trait IvfIndex {
     where
         Self: Sized,
     {
-        check_valid(&self, rows)?;
+        popcount().scan(
+            #[inline(always)]
+            || check_valid(&self, rows),
+        )?;
         Ok(ValidIvf { index: self, rows })
     }
 }
 
 /// The checks of [`IvfIndex::validate`].
+#[inline(always)]
 fn check_valid<I: IvfIndex + ?Sized>(ivf: &I, rows: &[[u8; DIGEST_LENGTH]]) -> Result<()> {
     ivf.check_layout()?;
     let n = ivf.n();

@@ -21,7 +21,7 @@
 
 use super::{IvfIndex, ValidIvf};
 use crate::tlsh::digest::{DIGEST_LENGTH, TlshDigest};
-use crate::tlsh::distance::BodyQuery;
+use crate::tlsh::distance::{BodyQuery, popcount};
 use crate::tlsh::knn::{KnnStats, TlshMatch, TopK};
 use crate::tlsh::order::HeaderOrder;
 
@@ -96,13 +96,28 @@ pub fn knn_ivf<I: IvfIndex>(
     k: usize,
     max_distance: u32,
     include_length: bool,
+    stats: Option<&mut KnnStats>,
+) -> Vec<TlshMatch> {
+    if k == 0 || ivf.rows().is_empty() || q.is_null() {
+        return Vec::new();
+    }
+    popcount().scan(
+        #[inline(always)]
+        || ivf_scan(ivf, q, k, max_distance, include_length, stats),
+    )
+}
+
+/// The search of [`knn_ivf`], inlined into its `Popcount::scan` context.
+#[inline(always)]
+fn ivf_scan<I: IvfIndex>(
+    ivf: &ValidIvf<'_, I>,
+    q: &TlshDigest,
+    k: usize,
+    max_distance: u32,
+    include_length: bool,
     mut stats: Option<&mut KnnStats>,
 ) -> Vec<TlshMatch> {
     let rows = ivf.rows();
-    if k == 0 || rows.is_empty() || q.is_null() {
-        return Vec::new();
-    }
-
     let order = HeaderOrder::new(q, include_length);
     let body = BodyQuery::new(q);
     let checksum = q.checksum();

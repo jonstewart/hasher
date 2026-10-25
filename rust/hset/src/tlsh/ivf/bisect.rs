@@ -54,7 +54,7 @@ use crate::error::{Error, Result};
 use crate::tlsh::CELL_COUNT;
 use crate::tlsh::cells::cell_index;
 use crate::tlsh::digest::{DIGEST_LENGTH, TlshDigest};
-use crate::tlsh::distance::BodyQuery;
+use crate::tlsh::distance::{BodyQuery, Popcount, popcount};
 use crate::tlsh::embed::{EMBED_BODY_DIMS, embed_body_i8};
 use crate::tlsh::mt64::Mt19937_64;
 
@@ -144,7 +144,9 @@ pub fn build_tlsh_ivf(rows: &[Row], opts: &IvfBuildOptions) -> Result<TlshIvf> {
         .collect();
 
     // each cell has its own RNG, so cells are independent and the result
-    // does not depend on which thread builds which cell
+    // does not depend on which thread builds which cell; the workers use
+    // the caller's kernel choice
+    let pc = popcount();
     let work = |i: usize| {
         let c = nonempty[i];
         let mut rng = Mt19937_64::new(opts.seed ^ (c as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15));
@@ -153,6 +155,7 @@ pub fn build_tlsh_ivf(rows: &[Row], opts: &IvfBuildOptions) -> Result<TlshIvf> {
             cells[c] as u32,
             opts.target_list_size,
             &mut rng,
+            pc,
         )
     };
     let threads = match opts.threads {
@@ -248,6 +251,8 @@ const KMEANS_MAX_ITERATIONS: usize = 10;
 /// `perm` in depth-first order. Integer arithmetic only.
 struct CellBisector<'a> {
     rows: &'a [Row],
+    /// The kernel every distance loop runs with.
+    popcount: Popcount,
     perm: Vec<u32>,
     target: usize,
     rng: &'a mut Mt19937_64,
@@ -275,9 +280,10 @@ struct CellBisector<'a> {
 }
 
 impl<'a> CellBisector<'a> {
-    fn new(rows: &'a [Row], target: usize, rng: &'a mut Mt19937_64) -> Self {
+    fn new(rows: &'a [Row], target: usize, rng: &'a mut Mt19937_64, popcount: Popcount) -> Self {
         Self {
             rows,
+            popcount,
             perm: (0..rows.len() as u32).collect(),
             target,
             rng,
@@ -337,15 +343,20 @@ impl<'a> CellBisector<'a> {
     /// distance 0 and none has a smaller index.
     fn farthest(&self, lo: usize, hi: usize, p: u32) -> u32 {
         let q = BodyQuery::new(&TlshDigest(self.rows[p as usize]));
-        let (mut best, mut best_d) = (p, 0);
-        for &id in &self.perm[lo..hi] {
-            let d = q.emb_body(&self.rows[id as usize]);
-            if d > best_d || (d == best_d && id < best) {
-                best = id;
-                best_d = d;
-            }
-        }
-        best
+        self.popcount.scan(
+            #[inline(always)]
+            || {
+                let (mut best, mut best_d) = (p, 0);
+                for &id in &self.perm[lo..hi] {
+                    let d = q.emb_body(&self.rows[id as usize]);
+                    if d > best_d || (d == best_d && id < best) {
+                        best = id;
+                        best_d = d;
+                    }
+                }
+                best
+            },
+        )
     }
 
     /// Move the members of `lo..hi` nearer `a` than `b` (ties to `a`) to
@@ -355,10 +366,22 @@ impl<'a> CellBisector<'a> {
         let qa = BodyQuery::new(&TlshDigest(self.rows[a as usize]));
         let qb = BodyQuery::new(&TlshDigest(self.rows[b as usize]));
         let rows = self.rows;
-        let (near_a, near_b): (Vec<u32>, Vec<u32>) = self.perm[lo..hi].iter().partition(|&&id| {
-            let r = &rows[id as usize];
-            qa.emb_body(r) <= qb.emb_body(r)
-        });
+        // plain loops, not iterator adapters: their closures would not be
+        // inlined into the POPCNT context
+        let (mut near_a, mut near_b) = (Vec::new(), Vec::new());
+        self.popcount.scan(
+            #[inline(always)]
+            || {
+                for &id in &self.perm[lo..hi] {
+                    let r = &rows[id as usize];
+                    if qa.emb_body(r) <= qb.emb_body(r) {
+                        near_a.push(id);
+                    } else {
+                        near_b.push(id);
+                    }
+                }
+            },
+        );
         let mid = lo + near_a.len();
         self.perm[lo..mid].copy_from_slice(&near_a);
         self.perm[mid..hi].copy_from_slice(&near_b);
@@ -370,10 +393,15 @@ impl<'a> CellBisector<'a> {
     /// every body in the node is the same), so every split makes progress.
     fn median_split(&mut self, lo: usize, hi: usize, a: u32) -> usize {
         let q = BodyQuery::new(&TlshDigest(self.rows[a as usize]));
-        let mut keyed: Vec<(u32, u32)> = self.perm[lo..hi]
-            .iter()
-            .map(|&id| (q.emb_body(&self.rows[id as usize]), id))
-            .collect();
+        let mut keyed: Vec<(u32, u32)> = Vec::with_capacity(hi - lo);
+        self.popcount.scan(
+            #[inline(always)]
+            || {
+                for &id in &self.perm[lo..hi] {
+                    keyed.push((q.emb_body(&self.rows[id as usize]), id));
+                }
+            },
+        );
         keyed.sort_unstable();
         for (p, (_, id)) in self.perm[lo..hi].iter_mut().zip(keyed) {
             *p = id;
@@ -451,6 +479,16 @@ impl<'a> CellBisector<'a> {
     /// member coincides with a seed's body there are fewer than `k`
     /// distinct bodies and seeding stops early.
     fn seed_rows(&mut self, k: usize) {
+        self.popcount.scan(
+            #[inline(always)]
+            || self.seed_rows_scan(k),
+        );
+    }
+
+    /// The loops of [`seed_rows`](Self::seed_rows), inlined into its
+    /// `Popcount::scan` context.
+    #[inline(always)]
+    fn seed_rows_scan(&mut self, k: usize) {
         let s = self.node.len();
         let first = self.draw(s) as u32;
         self.seeds.clear();
@@ -583,8 +621,14 @@ fn dot(x: &[i8; EMBED_BODY_DIMS], s: &[i32; EMBED_BODY_DIMS]) -> i32 {
 /// The lists of one cell's rows by coarse bisection and flat integer
 /// k-means (C++ `bisect_cell`), each with its exact 1-center; ids written
 /// are local indexes plus `base`.
-fn bisect_cell(rows: &[Row], base: u32, target: usize, rng: &mut Mt19937_64) -> CellLists {
-    let mut bis = CellBisector::new(rows, target, rng);
+fn bisect_cell(
+    rows: &[Row],
+    base: u32,
+    target: usize,
+    rng: &mut Mt19937_64,
+    pc: Popcount,
+) -> CellLists {
+    let mut bis = CellBisector::new(rows, target, rng, pc);
     let leaves = bis.leaves();
     let mut out = CellLists {
         ids: Vec::with_capacity(rows.len()),
@@ -593,7 +637,10 @@ fn bisect_cell(rows: &[Row], base: u32, target: usize, rng: &mut Mt19937_64) -> 
     for (lo, hi) in leaves {
         let mut ids = bis.perm[lo..hi].to_vec();
         ids.sort_unstable();
-        let (med, r2) = one_center(rows, &ids);
+        let (med, r2) = pc.scan(
+            #[inline(always)]
+            || one_center(rows, &ids),
+        );
         out.medoids.push(TlshDigest(rows[med as usize]));
         out.radius2.push(r2);
         out.sizes.push(ids.len() as u32);
@@ -606,6 +653,7 @@ fn bisect_cell(rows: &[Row], base: u32, target: usize, rng: &mut Mt19937_64) -> 
 /// ascending): the member whose largest squared body-embedding distance
 /// to the others is smallest, ties by the smaller index. Returns
 /// `(medoid, radius2)` (C++ `one_center`).
+#[inline(always)]
 fn one_center(rows: &[Row], ids: &[u32]) -> (u32, u32) {
     let (mut best, mut best_r) = (ids[0], u32::MAX);
     for &i in ids {

@@ -14,7 +14,7 @@ use std::collections::BinaryHeap;
 
 use super::CELL_COUNT;
 use super::digest::{DIGEST_LENGTH, TlshDigest};
-use super::distance::{BodyQuery, l_cost, mod_diff, q_cost};
+use super::distance::{BodyQuery, l_cost, mod_diff, popcount, q_cost};
 use super::order::HeaderOrder;
 
 /// Offset of the checksum byte in a canonical row (see [`super::digest`]).
@@ -141,7 +141,21 @@ pub fn knn_brute(
     if k == 0 || rows.is_empty() || q.is_null() {
         return Vec::new();
     }
+    popcount().scan(
+        #[inline(always)]
+        || brute_scan(rows, q, k, max_distance, include_length),
+    )
+}
 
+/// The scan of [`knn_brute`], inlined into its `Popcount::scan` context.
+#[inline(always)]
+fn brute_scan(
+    rows: &[[u8; DIGEST_LENGTH]],
+    q: &TlshDigest,
+    k: usize,
+    max_distance: u32,
+    include_length: bool,
+) -> Vec<TlshMatch> {
     // per-query header cost tables indexed by a row's L and Q bytes
     let mut l_costs = [0u32; 256];
     let mut q_costs = [0u32; 256];
@@ -194,13 +208,30 @@ pub fn knn_cells(
     k: usize,
     max_distance: u32,
     include_length: bool,
-    mut stats: Option<&mut KnnStats>,
+    stats: Option<&mut KnnStats>,
 ) -> Vec<TlshMatch> {
     assert_eq!(cells.len(), CELL_COUNT + 1, "cell index length");
     if k == 0 || q.is_null() {
         return Vec::new();
     }
+    popcount().scan(
+        #[inline(always)]
+        || cells_scan(rows, cells, q, k, max_distance, include_length, stats),
+    )
+}
 
+/// The search of [`knn_cells`], inlined into its `Popcount::scan`
+/// context.
+#[inline(always)]
+fn cells_scan(
+    rows: &[[u8; DIGEST_LENGTH]],
+    cells: &[u64],
+    q: &TlshDigest,
+    k: usize,
+    max_distance: u32,
+    include_length: bool,
+    mut stats: Option<&mut KnnStats>,
+) -> Vec<TlshMatch> {
     let order = HeaderOrder::new(q, include_length);
     let body = BodyQuery::new(q);
     let checksum = q.checksum();

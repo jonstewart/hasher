@@ -47,7 +47,7 @@ use super::{DROPPED, IvfIndex, TlshIvf};
 use crate::error::{Error, Result};
 use crate::tlsh::CELL_COUNT;
 use crate::tlsh::digest::{DIGEST_LENGTH, TlshDigest};
-use crate::tlsh::distance::BodyQuery;
+use crate::tlsh::distance::{BodyQuery, popcount};
 
 /// The index of a merged TLSH section, from the inputs' indexes (C++
 /// `merge_tlsh_ivf`).
@@ -230,17 +230,23 @@ fn coalesce_cell(lists: &mut Vec<MergeList>, rows: &[[u8; DIGEST_LENGTH]], half:
     // dist[i * s + j]: max squared distance from the medoid of small list
     // i over the members of small list j; exact, including the diagonal
     let mut dist = vec![0u32; s * s];
-    for i in 0..s {
-        let q = BodyQuery::new(&lists[small[i]].medoid);
-        for j in 0..s {
-            dist[i * s + j] = lists[small[j]]
-                .ids
-                .iter()
-                .map(|&id| q.emb_body(&rows[id as usize]))
-                .max()
-                .unwrap_or(0);
-        }
-    }
+    popcount().scan(
+        #[inline(always)]
+        || {
+            // plain loops: iterator adapters' closures would not be
+            // inlined into the POPCNT context
+            for i in 0..s {
+                let q = BodyQuery::new(&lists[small[i]].medoid);
+                for j in 0..s {
+                    let mut r = 0;
+                    for &id in &lists[small[j]].ids {
+                        r = r.max(q.emb_body(&rows[id as usize]));
+                    }
+                    dist[i * s + j] = r;
+                }
+            }
+        },
+    );
 
     // radius of the union of i and j about the medoid of i
     let about = |dist: &[u32], i: usize, j: usize| dist[i * s + i].max(dist[i * s + j]);
@@ -334,8 +340,14 @@ fn merge_sorted(a: &[u32], b: &[u32]) -> Vec<u32> {
 /// Exact squared body-embedding radius about `m` over the rows `ids`.
 fn radius_about(m: &TlshDigest, ids: &[u32], rows: &[[u8; DIGEST_LENGTH]]) -> u32 {
     let q = BodyQuery::new(m);
-    ids.iter()
-        .map(|&id| q.emb_body(&rows[id as usize]))
-        .max()
-        .unwrap_or(0)
+    popcount().scan(
+        #[inline(always)]
+        || {
+            let mut r = 0;
+            for &id in ids {
+                r = r.max(q.emb_body(&rows[id as usize]));
+            }
+            r
+        },
+    )
 }

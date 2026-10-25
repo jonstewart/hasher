@@ -22,8 +22,117 @@
 //! `W = 5` gives the TLSH body cost; `W = 4` gives the squared distance
 //! between the body embeddings (per bucket 0, 1, 2, 5), the BISECT build's
 //! and the TIVF search's metric. C++: `include/tlsh_digest.h`.
+//!
+//! # Popcount dispatch
+//!
+//! Rust targets baseline x86-64, where `count_ones` is a bit-twiddling
+//! sequence; the C++ library is built with `-mpopcnt`. Every scan loop in
+//! the crate (the kNN searches, the BISECT build, the merge's coalescing,
+//! TIVF validation) therefore runs through one dispatcher that compiles it
+//! a second time with the POPCNT target feature and picks that copy when
+//! the CPU has the instruction ([`Popcount::detected`]). [`with_popcount`]
+//! forces a choice on a thread, for tests and benchmarks. On other
+//! architectures there is one copy (aarch64's `count_ones` is NEON `cnt`).
+
+use std::cell::Cell;
 
 use super::digest::{DIGEST_LENGTH, HI, LO, TlshDigest};
+
+/// The popcount instructions the TLSH scans (kNN searches, index builds,
+/// merges and validation) are compiled for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Popcount {
+    /// `u64::count_ones` for the build target: a bit-twiddling sequence on
+    /// baseline x86-64, NEON `cnt` on aarch64. Always available.
+    Portable,
+    /// The x86-64 `POPCNT` instruction, used only on a CPU that has it.
+    Popcnt,
+}
+
+impl Popcount {
+    /// The fastest kind this CPU runs (`std`'s feature detection, which
+    /// queries CPUID once per process).
+    pub fn detected() -> Self {
+        if Self::Popcnt.is_available() {
+            Self::Popcnt
+        } else {
+            Self::Portable
+        }
+    }
+
+    /// Whether this CPU runs this kind.
+    pub fn is_available(self) -> bool {
+        match self {
+            Self::Portable => true,
+            #[cfg(target_arch = "x86_64")]
+            Self::Popcnt => std::arch::is_x86_feature_detected!("popcnt"),
+            #[cfg(not(target_arch = "x86_64"))]
+            Self::Popcnt => false,
+        }
+    }
+
+    /// Run the scan `f` compiled for this kind (the portable kind when the
+    /// CPU lacks it). Every TLSH scan loop goes through here.
+    ///
+    /// Code is compiled for POPCNT only where it is inlined into the
+    /// `#[target_feature]` context, so `f` must be an `#[inline(always)]`
+    /// closure holding the whole loop, or calling `#[inline(always)]`
+    /// functions that do: a call into code compiled without the feature
+    /// gets the portable `count_ones`, and a dispatched kernel call per
+    /// row would cost a function call per row.
+    #[inline(always)]
+    pub(crate) fn scan<R>(self, f: impl FnOnce() -> R) -> R {
+        #[cfg(target_arch = "x86_64")]
+        if self == Self::Popcnt && self.is_available() {
+            // SAFETY: `popcnt_context` is safe apart from its
+            // `#[target_feature(enable = "popcnt")]`, and calling it is
+            // sound exactly when the CPU has POPCNT, which was checked just
+            // above. This is the crate's only use of a target feature.
+            return unsafe { popcnt_context(f) };
+        }
+        f()
+    }
+}
+
+/// `f()`, with `f` (and what is inlined into it) compiled for POPCNT, so
+/// `u64::count_ones` there is one `popcnt` instruction.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "popcnt")]
+fn popcnt_context<R>(f: impl FnOnce() -> R) -> R {
+    f()
+}
+
+thread_local! {
+    /// The [`with_popcount`] choice on this thread, if any.
+    static CHOICE: Cell<Option<Popcount>> = const { Cell::new(None) };
+}
+
+/// The kind the TLSH scans started on this thread use now:
+/// [`Popcount::detected`] unless [`with_popcount`] chose another.
+pub fn popcount() -> Popcount {
+    CHOICE.get().unwrap_or_else(Popcount::detected)
+}
+
+/// Run `f` with the TLSH scans it starts on this thread (and the worker
+/// threads of an index build it starts) compiled for `p`, or for
+/// [`Popcount::Portable`] when this CPU lacks `p`; the previous choice is
+/// restored afterwards, also when `f` panics. Results never depend on the
+/// choice: this is the hook to test and measure each kernel.
+pub fn with_popcount<R>(p: Popcount, f: impl FnOnce() -> R) -> R {
+    struct Restore(Option<Popcount>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            CHOICE.set(self.0);
+        }
+    }
+    let p = if p.is_available() {
+        p
+    } else {
+        Popcount::Portable
+    };
+    let _restore = Restore(CHOICE.replace(Some(p)));
+    f()
+}
 
 /// Cost of a (mod 256) L difference of `k`: 0, 1, then `12 k`.
 pub const fn l_cost(k: u32) -> u32 {
@@ -91,9 +200,12 @@ fn word(d: &[u8; DIGEST_LENGTH], plane: usize, w: usize) -> u64 {
 /// `emb_body(r) == emb_body_dist2(q, r)` for every row `r`.
 ///
 /// Rows are taken as raw 36-byte arrays, the shape of an `HDAT` section.
-/// The kernel is portable scalar `u64::count_ones`; the planes are held as
-/// words and the fields are private, so a kernel compiled for the POPCNT
-/// instruction can be chosen at construction without changing this API.
+/// The kernel is `u64::count_ones`, always inlined, so it compiles to the
+/// instructions of the loop it lands in: the crate's scans run under
+/// [`Popcount`] dispatch and get the POPCNT instruction where the CPU has
+/// it; a caller's own loop over [`body`](Self::body) gets the build
+/// target's `count_ones` (on baseline x86-64 a bit-twiddling sequence,
+/// about half the speed).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct BodyQuery {
     lo: [u64; 2],
@@ -128,13 +240,13 @@ impl BodyQuery {
     }
 
     /// TLSH body distance from the query to `row`.
-    #[inline]
+    #[inline(always)]
     pub fn body(&self, row: &[u8; DIGEST_LENGTH]) -> u32 {
         self.weighted::<5>(row)
     }
 
     /// Squared body-embedding distance from the query to `row`.
-    #[inline]
+    #[inline(always)]
     pub fn emb_body(&self, row: &[u8; DIGEST_LENGTH]) -> u32 {
         self.weighted::<4>(row)
     }
