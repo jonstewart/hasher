@@ -143,7 +143,7 @@ fn golden_bisect_small() {
         94,
         "bdc17ba69181cce3886aba9a75cfabf6eccdf442e5b58c29b36f1379218598be",
     );
-    ivf.validate(&rows).expect("valid");
+    (&ivf).validate(&rows).expect("valid");
 }
 
 #[test]
@@ -152,6 +152,8 @@ fn golden_bisect_large() {
     let ivf = build_tlsh_ivf(&rows, &IvfBuildOptions::default()).expect("build");
     // the coarse split is exercised
     assert!(max_cell_rows(&ivf) > FLAT_MAX as u64);
+    let cells = ivf.cell_lists.windows(2).filter(|w| w[0] != w[1]).count();
+    assert_eq!(cells, 40);
     check_golden(
         &rows,
         &ivf,
@@ -159,5 +161,118 @@ fn golden_bisect_large() {
         343,
         "b1bb7a6d494bef04007ac04832f89aa00552c11f2d1eb01d6c085d5f0bfe55bb",
     );
-    ivf.validate(&rows).expect("valid");
+    (&ivf).validate(&rows).expect("valid");
+}
+
+//
+// C++-written fixtures (`make check` in the repository root; untracked, so
+// absent files are skipped)
+//
+
+/// Tags of the chunks read here (big-endian ASCII, HASHSET_FORMAT).
+const FTOC: [u8; 4] = *b"FTOC";
+const HDAT: [u8; 4] = *b"HDAT";
+const TIVF: [u8; 4] = *b"TIVF";
+const TVEC: [u8; 4] = *b"TVEC";
+/// The section header of the TLSH hash type, `HH` and log2 of
+/// `SFHASH_TLSH` = 1 << 15.
+const HH_TLSH: [u8; 4] = [b'H', b'H', 0, 15];
+
+/// The chunks of a hash-set file in FTOC order, as (tag, payload): the
+/// FTOC chunk at offset 40 lists (u64 LE offset, u32 BE tag) per chunk,
+/// and each chunk is a u32 BE tag, a u64 LE length and the payload. A
+/// minimal walker for this test, independent of `hset::format`.
+fn chunks(file: &[u8]) -> Vec<([u8; 4], &[u8])> {
+    let chunk_at = |off: usize| -> ([u8; 4], &[u8]) {
+        let tag: [u8; 4] = file[off..off + 4].try_into().unwrap();
+        let len = u64::from_le_bytes(file[off + 4..off + 12].try_into().unwrap()) as usize;
+        (tag, &file[off + 12..off + 12 + len])
+    };
+    let (tag, toc) = chunk_at(40);
+    assert_eq!(tag, FTOC, "no FTOC at offset 40");
+    toc.chunks_exact(12)
+        .map(|e| {
+            let off = u64::from_le_bytes(e[..8].try_into().unwrap()) as usize;
+            let (tag, payload) = chunk_at(off);
+            assert_eq!(tag, e[8..12], "FTOC tag differs from the chunk's");
+            (tag, payload)
+        })
+        .collect()
+}
+
+/// The TLSH section's HDAT rows and TIVF payload, or `None` when the file
+/// has no TLSH section or no TIVF.
+fn tlsh_section(file: &[u8]) -> Option<(Vec<[u8; 36]>, Vec<u8>)> {
+    let all = chunks(file);
+    assert!(
+        all.iter().all(|(t, _)| *t != TVEC),
+        "a TVEC chunk: a fixture from before the TVEC removal"
+    );
+    let start = all.iter().position(|(t, _)| *t == HH_TLSH)?;
+    let section = &all[start + 1..];
+    let end = section
+        .iter()
+        .position(|(t, _)| t.starts_with(b"HH") || *t == *b"FEND")
+        .unwrap_or(section.len());
+    let section = &section[..end];
+    let (_, hdat) = section.iter().find(|(t, _)| *t == HDAT)?;
+    let (_, tivf) = section.iter().find(|(t, _)| *t == TIVF)?;
+    assert_eq!(hdat.len() % 36, 0, "HDAT is not whole TLSH rows");
+    let rows = hdat.as_chunks::<36>().0.to_vec();
+    Some((rows, tivf.to_vec()))
+}
+
+#[test]
+fn rebuilding_cpp_fixtures_reproduces_their_tivf() {
+    let dir = hset_testkit::fixtures::fixtures_dir();
+    // plan 3.1: builder outputs of the vendored example digests, records
+    // (81 rows, duplicates kept; the TLSH-first file has the same rows) and
+    // hashsets-only (80 rows)
+    let cases = [
+        ("md5_tlsh.hset", 81, 76, "4526562d16fc0251141dd786fc6a810f8bdda64dbd1db43dac06928bc7d901ef"),
+        ("md5_tlsh_knn.hset", 81, 76, "4526562d16fc0251141dd786fc6a810f8bdda64dbd1db43dac06928bc7d901ef"),
+        ("tlsh_md5.hset", 81, 76, "4526562d16fc0251141dd786fc6a810f8bdda64dbd1db43dac06928bc7d901ef"),
+        ("md5_tlsh_ho.hset", 80, 76, "06f4d2ff581774066559d1094f0eda30e3421836615e255069c32026ec1d0d88"),
+    ];
+    let mut checked = 0;
+    for (name, want_rows, want_lists, want_sha) in cases {
+        let path = dir.join(name);
+        let Ok(file) = std::fs::read(&path) else {
+            eprintln!("skipping {}: not found", path.display());
+            continue;
+        };
+        let (rows, payload) = tlsh_section(&file).unwrap_or_else(|| panic!("{name}: no TLSH TIVF"));
+        assert_eq!(sha256_hex(&payload), want_sha, "{name}: fixture TIVF");
+        let ivf = build_tlsh_ivf(&rows, &IvfBuildOptions::default()).expect("build");
+        assert_eq!(rows.len(), want_rows, "{name}");
+        assert_eq!(ivf.lists(), want_lists, "{name}");
+        assert!(ivf.to_bytes() == payload, "{name}: rebuilt TIVF differs from C++'s");
+        checked += 1;
+    }
+    eprintln!("checked {checked} fixtures in {}", dir.display());
+}
+
+#[test]
+fn rebuilding_other_fresh_cpp_builds_reproduces_their_tivf() {
+    // C++ fixtures whose TIVF is a fresh default BISECT build (not a merge,
+    // not KMEANS) over thousands of rows in many cells
+    let dir = hset_testkit::fixtures::fixtures_dir();
+    let names = [
+        "merge_a_ho.hset",
+        "merge_a_rec.hset",
+        "merge_t1_a.hset",
+        "merge_df_a.hset",
+        "inc_batch.hset",
+        "tlsh_opt2.hset",
+    ];
+    for name in names {
+        let path = dir.join(name);
+        let Ok(file) = std::fs::read(&path) else {
+            eprintln!("skipping {}: not found", path.display());
+            continue;
+        };
+        let (rows, payload) = tlsh_section(&file).unwrap_or_else(|| panic!("{name}: no TLSH TIVF"));
+        let ivf = build_tlsh_ivf(&rows, &IvfBuildOptions::default()).expect("build");
+        assert!(ivf.to_bytes() == payload, "{name}: rebuilt TIVF differs from C++'s");
+    }
 }
