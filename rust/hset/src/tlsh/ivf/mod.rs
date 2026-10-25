@@ -76,6 +76,10 @@ pub mod bisect;
 pub mod merge;
 pub mod search;
 
+pub use bisect::{IvfBuildOptions, build_tlsh_ivf, nearer};
+pub use merge::merge_tlsh_ivf;
+pub use search::{MIN_BOUNDED_LIST, knn_ivf, list_bound};
+
 use std::fmt;
 use std::ops::Range;
 
