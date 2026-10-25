@@ -220,21 +220,31 @@ the sorted list 13.5 s.
 ## vs_knn_eval: TLSH kNN eval against a real hset
 
 `vs_knn_eval.cpp` times TLSH k-nearest-neighbour queries one at a time against
-the TLSH hash set of an hset with `TVEC` vectors and a `TIVF` index (the
-VirusShare hset, or a synthetic one), with three methods per query:
+the TLSH hash set of an hset with a `TIVF` index (the VirusShare hset, or a
+synthetic one), with three methods per query:
 
 * `brute`: `sfhash_hashset_tlsh_knn_with(..., SFHASH_TLSH_KNN_BRUTE)`, every
   row, exact; the TLSH ground truth.
 * `index`: `sfhash_hashset_tlsh_knn_with(..., SFHASH_TLSH_KNN_INDEX)`, the
   `TIVF` search, exact (docs/TLSH_EMBEDDING.md section 4).
 * `embed`: approximate kNN in embedding space, CrowdStrike style:
-  `sfhash_tlsh_embed` of the query, squared Euclidean distance to every row of
-  the `TVEC` matrix (`sfhash_hashset_tlsh_vectors`, all 264 dims, the length
-  dim only with `--include-length true`), top k in a bounded max-heap on
-  (dist2, row), so ties go to the lower row. The distance is a plain loop with
-  float reassociation allowed for that one function, so that GCC vectorizes
-  it (SSE here); `--embed-kernel lib` uses the library's strictly ordered,
-  scalar `sfhash_tlsh_embed_dist2` instead (about 2.5x slower per row).
+  `sfhash_tlsh_embed` of the query, squared Euclidean distance to every row's
+  embedding (all 264 dims, the length dim only with `--include-length true`),
+  top k in a bounded max-heap on (dist2, row), so ties go to the lower row.
+  The distance is a plain loop with float reassociation allowed for that one
+  function, so that GCC vectorizes it (SSE here); `--embed-kernel lib` uses
+  the library's strictly ordered, scalar `sfhash_tlsh_embed_dist2` instead
+  (about 2.5x slower per row). hset files do not store the embeddings (the
+  `TVEC` chunk was removed, docs/DESIGN_DECISIONS.md), so the driver computes
+  every row's embedding with `sfhash_tlsh_embed` into a 4096-aligned
+  n x 264 float32 matrix in memory (1,056 bytes per row) before the timed
+  passes, untimed and on `--threads` threads; it is computed only when the
+  `embed` method or the deep ranking (`--deep-k`) needs it, and its time is
+  `hset.embed_seconds` in `run.json`. The outputs are the same as with the
+  stored matrix: on a 5,000-row hset, queries, results, deep and hist CSVs
+  were byte-identical to a run of the previous driver over the same file
+  with a `TVEC` chunk added. Budget memory for the matrix on top of the
+  hset: a run that used the stored matrix had it in the mapped file instead.
 
 Two query sets of `--queries` (1,000) each: `member`, rows sampled uniformly
 without replacement from the non-null rows (the query is that row's digest),
@@ -284,7 +294,7 @@ Outputs in `--out` (CSV with a header; `read_csv_auto` in DuckDB; ranks are
 | `results.csv` | `qset, qid, method, rank, row_idx, tlsh_dist, emb_dist2` (`tlsh_dist` from `sfhash_tlsh_diff` with the length setting, computed after timing; `emb_dist2` with the embed kernel, for all three methods) |
 | `deep.csv` | `qset, qid, rank, row_idx, emb_dist2, tlsh_dist`: embedding top `--deep-k` |
 | `hist.csv` | `qset, qid, tlsh_dist, n_rows`: the full distance histogram, nonzero bins (`--no-hist` to skip) |
-| `run.json` | hset path, size, name, rows, null rows, lists; parameters; seeds (hex strings); warm-up passes and settings; timer overhead; CPU, affinity, MemTotal/MemAvailable, residency; date, git commit, argv; per pass n/mean/median/stddev/p99/max/min in us; checks |
+| `run.json` | hset path, size, name, rows, null rows, lists, row-embedding seconds; parameters; seeds (hex strings); warm-up passes and settings; timer overhead; CPU, affinity, MemTotal/MemAvailable, residency; date, git commit, argv; per pass n/mean/median/stddev/p99/max/min in us; checks |
 | `summary.txt` | the printed summary |
 
 With ties at the k-th distance (identical digests are common in real

@@ -11,9 +11,11 @@
  *   index  sfhash_hashset_tlsh_knn_with(..., SFHASH_TLSH_KNN_INDEX): exact,
  *          TIVF lists pruned with the embedding via the triangle inequality.
  *   embed  approximate, CrowdStrike style: phi(query) by sfhash_tlsh_embed,
- *          squared Euclidean distance to every row of the TVEC matrix
- *          (sfhash_hashset_tlsh_vectors), top k in a bounded max-heap on
- *          (dist2, row), so ties go to the lower row.
+ *          squared Euclidean distance to every row's embedding, top k in a
+ *          bounded max-heap on (dist2, row), so ties go to the lower row.
+ *          The rows' embeddings are computed in memory with
+ *          sfhash_tlsh_embed, untimed and on --threads threads, before the
+ *          timed passes (hset files do not store them).
  *
  * Query sets
  *   member  rows sampled uniformly without replacement from the TLSH hash
@@ -23,7 +25,8 @@
  *
  * After the timed passes, an untimed multi-threaded analysis pass scans
  * every row for every query: the full TLSH distance histogram (for d_k,
- * count_lt, count_le), and the embedding top --deep-k.
+ * count_lt, count_le), and the embedding top --deep-k (over the same
+ * in-memory embeddings).
  *
  * See bench/README.md ("TLSH kNN eval") for usage and the output schema.
  */
@@ -122,7 +125,8 @@ R"(usage: vs_knn_eval --hset FILE --out DIR [options]
   --deep-k N            depth of the untimed embedding ranking (1000; 0 = off)
   --embed-kernel K      vec (plain loop, compiler-vectorized) or
                         lib (sfhash_tlsh_embed_dist2, scalar) (vec)
-  --threads N           threads of the untimed analysis pass (all CPUs)
+  --threads N           threads of the untimed row embedding and analysis
+                        pass (all CPUs)
   --pin-cpu C           pin the timing thread to CPU C (analysis threads are not pinned)
   --no-populate         mmap without MAP_POPULATE
   --no-analysis         skip the untimed analysis pass (no deep/hist, no d_k)
@@ -438,7 +442,8 @@ struct EmbTopK {
   }
 };
 
-// the timed embedding kNN: phi(q), a scan of every TVEC row, a bounded heap
+// the timed embedding kNN: phi(q), a scan of every row's embedding, a
+// bounded heap
 template <Kernel K>
 std::vector<EmbHit> embed_knn(const float* vecs, uint64_t n, const void* digest, size_t k, bool include_length) {
   alignas(16) float q[DIMS];
@@ -450,6 +455,38 @@ std::vector<EmbHit> embed_knn(const float* vecs, uint64_t n, const void* digest,
   }
   return top.sorted();
 }
+
+// the n x DIMS embedding matrix of rows, computed on threads threads; the
+// memory is 4096-byte aligned, as the TVEC data of older hset files was
+struct EmbeddingMatrix {
+  float* data = nullptr;
+
+  EmbeddingMatrix() = default;
+  EmbeddingMatrix(const EmbeddingMatrix&) = delete;
+  EmbeddingMatrix& operator=(const EmbeddingMatrix&) = delete;
+  ~EmbeddingMatrix() { std::free(data); }
+
+  void compute(const TlshDigest* rows, uint64_t n, unsigned threads) {
+    const size_t bytes = ((n * DIMS * sizeof(float) + 4095) / 4096) * 4096;
+    data = static_cast<float*>(std::aligned_alloc(4096, bytes ? bytes : 4096));
+    if (!data) {
+      throw std::runtime_error("cannot allocate " + std::to_string(bytes) + " bytes for the row embeddings");
+    }
+    std::vector<std::thread> pool;
+    const uint64_t per = (n + threads - 1) / threads;
+    for (unsigned t = 0; t < threads; ++t) {
+      const uint64_t lo = std::min(n, t * per), hi = std::min(n, lo + per);
+      pool.emplace_back([this, rows, lo, hi]() {
+        for (uint64_t r = lo; r < hi; ++r) {
+          sfhash_tlsh_embed(rows + r, data + r * DIMS);
+        }
+      });
+    }
+    for (auto& th: pool) {
+      th.join();
+    }
+  }
+};
 
 //
 // queries
@@ -695,8 +732,6 @@ int main(int argc, char** argv) {
     }
     const TlshDigest* rows = static_cast<const TlshDigest*>(sfhash_hashset_hash(hset.get(), tidx, 0));
     const uint32_t strategies = sfhash_hashset_tlsh_knn_strategies(hset.get(), tidx);
-    size_t dims = 0;
-    const float* vecs = sfhash_hashset_tlsh_vectors(hset.get(), tidx, &dims);
     const auto& hs_tuple = hset->holder.hsets[tidx];
     const TlshIvfView& ivf_view = std::get<TlshIvfView>(hs_tuple);
 
@@ -706,15 +741,7 @@ int main(int argc, char** argv) {
         std::cerr << "WARNING: hset has no TIVF index; skipping method index\n";
         continue;
       }
-      if (m == "embed" && (!vecs || dims != DIMS)) {
-        std::cerr << "WARNING: hset has no TVEC vectors; skipping method embed\n";
-        continue;
-      }
       methods.push_back(m);
-    }
-    const bool have_vecs = vecs && dims == DIMS;
-    if (opt.analysis && opt.deep_k && !have_vecs) {
-      throw std::runtime_error("the analysis pass needs TVEC vectors (or --deep-k 0)");
     }
 
     // null rows sort first (all-zero bytes)
@@ -725,7 +752,20 @@ int main(int argc, char** argv) {
 
     std::cerr << "TLSH rows " << n << " (" << null_rows << " null), index "
               << ((strategies & SFHASH_TLSH_KNN_INDEX) ? "yes" : "no") << " (" << ivf_view.lists
-              << " lists), vectors " << (have_vecs ? "yes" : "no") << ", load " << load_s << " s\n";
+              << " lists), load " << load_s << " s\n";
+
+    // the rows' embeddings, for the embed method and the deep ranking:
+    // untimed, before the timed passes
+    EmbeddingMatrix emb;
+    double embed_s = 0;
+    if (std::find(methods.begin(), methods.end(), "embed") != methods.end() || (opt.analysis && opt.deep_k)) {
+      const auto et0 = Clock::now();
+      emb.compute(rows, n, opt.threads);
+      embed_s = secs_since(et0);
+      std::cerr << "row embeddings: " << n * DIMS * sizeof(float) / 1048576.0 << " MiB in " << embed_s
+                << " s on " << opt.threads << " threads\n";
+    }
+    const float* vecs = emb.data;
 
     // 3. queries
     std::unordered_set<uint64_t> none;
@@ -1102,13 +1142,16 @@ int main(int argc, char** argv) {
           for (size_t j = 0; j < p.rows[i].size(); ++j) {
             const uint64_t r = p.rows[i][j];
             const int td = sfhash_tlsh_diff(&q.d, &rows[r], opt.include_length);
-            const float ed = p.method == "embed" ? p.edist[i][j]
-                           : have_vecs ? kernel(qv, vecs + r * DIMS, opt.include_length)
-                           : std::nanf("");
-            std::fprintf(f.f, "%s,%zu,%s,%zu,%llu,%d,", p.set.c_str(), i, p.method.c_str(), j + 1,
-                         static_cast<unsigned long long>(r), td);
-            if (!std::isnan(ed)) std::fprintf(f.f, "%.9g", ed);
-            std::fputc('\n', f.f);
+            // the row's embedding: from the matrix when it was computed,
+            // else computed here (the same values)
+            alignas(16) float rv[DIMS];
+            const float* v = vecs ? vecs + r * DIMS : rv;
+            if (!vecs) {
+              sfhash_tlsh_embed(&rows[r], rv);
+            }
+            const float ed = p.method == "embed" ? p.edist[i][j] : kernel(qv, v, opt.include_length);
+            std::fprintf(f.f, "%s,%zu,%s,%zu,%llu,%d,%.9g\n", p.set.c_str(), i, p.method.c_str(), j + 1,
+                         static_cast<unsigned long long>(r), td, ed);
           }
         }
       }
@@ -1212,7 +1255,7 @@ int main(int argc, char** argv) {
         << ", \"tlsh_rows\": " << n << ", \"null_rows\": " << null_rows
         << ", \"has_index\": " << ((strategies & SFHASH_TLSH_KNN_INDEX) ? "true" : "false")
         << ", \"ivf_lists\": " << ivf_view.lists
-        << ", \"has_vectors\": " << (have_vecs ? "true" : "false")
+        << ", \"embed_seconds\": " << embed_s
         << ", \"load_seconds\": " << load_s << "},\n";
       j << "  \"params\": {\"k\": " << opt.k << ", \"max_distance\": " << opt.max_distance
         << ", \"include_length\": " << (opt.include_length ? "true" : "false")
