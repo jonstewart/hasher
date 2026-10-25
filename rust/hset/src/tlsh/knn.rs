@@ -1,11 +1,19 @@
-//! Exact brute-force TLSH k-nearest-neighbour search over sorted rows
-//! (`tlsh_search.cpp`), the reference every indexed search must equal.
+//! Exact TLSH k-nearest-neighbour search over sorted rows: the result
+//! type [`TlshMatch`], the top-k collector [`TopK`] every search shares,
+//! brute force [`knn_brute`] (`tlsh_search.cpp`), the reference every
+//! indexed search must equal, and the cell-index search [`knn_cells`]
+//! (`tlsh_cell_search.cpp`).
+//!
+//! All searches return the at most k rows with distance at most
+//! `max_distance`, ordered by `(distance, index)`; that is a total order,
+//! so every strategy returns the same list. They return nothing for
+//! `k == 0` or a null query.
 
 use std::cmp::Ordering;
 use std::collections::BinaryHeap;
 
-use super::digest::{DIGEST_LENGTH, TlshDigest};
 use super::CELL_COUNT;
+use super::digest::{DIGEST_LENGTH, TlshDigest};
 use super::distance::{BodyQuery, l_cost, mod_diff, q_cost};
 use super::order::HeaderOrder;
 

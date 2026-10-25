@@ -269,7 +269,7 @@ fn non_null(d: TlshDigest) -> TlshDigest {
 /// random checksum; never null.
 pub fn random_digest_with_header(rng: &mut SplitMix64, l: u8, q1: u8, q2: u8) -> TlshDigest {
     let mut codes = [0u8; 128];
-    for chunk in codes.chunks_exact_mut(32) {
+    for chunk in codes.as_chunks_mut::<32>().0 {
         let mut bits = rng.next_u64();
         for c in chunk {
             *c = (bits & 3) as u8;
@@ -593,7 +593,12 @@ mod tests {
     fn generated_digests_are_canonical_and_never_null() {
         let mut all = corpus(5, 1003);
         assert_eq!(all.len(), 1003);
-        all.extend(perturb_corpus(6, &all.clone(), 500, &Perturbation::default()));
+        all.extend(perturb_corpus(
+            6,
+            &all.clone(),
+            500,
+            &Perturbation::default(),
+        ));
         all.extend(cell_corpus(7, 200, (0, 0, 0), 3, 0.5));
         for d in &all {
             assert!(!d.is_null());

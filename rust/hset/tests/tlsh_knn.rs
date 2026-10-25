@@ -368,7 +368,15 @@ fn cells_within_a_huge_radius_return_every_row_in_order() {
     let cells = naive_cell_index(&rows);
     let q = TlshDigest(rows[5]);
     let mut stats = KnnStats::default();
-    let all = knn_cells(&rows, &cells, &q, rows.len(), 1 << 30, true, Some(&mut stats));
+    let all = knn_cells(
+        &rows,
+        &cells,
+        &q,
+        rows.len(),
+        1 << 30,
+        true,
+        Some(&mut stats),
+    );
     assert_eq!(all.len(), rows.len());
     assert_eq!(all, knn_brute(&rows, &q, rows.len(), 1 << 30, true));
     // every nonempty cell is visited and every row scanned
