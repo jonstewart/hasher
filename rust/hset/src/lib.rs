@@ -36,6 +36,7 @@ pub mod key;
 pub mod lookup;
 pub mod ops;
 pub mod synth;
+pub mod tlsh;
 
 pub use builder::{BuildOptions, Builder};
 pub use error::{Error, Result};
