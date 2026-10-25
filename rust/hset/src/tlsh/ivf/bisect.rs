@@ -1,5 +1,9 @@
 //! The BISECT builder of TIVF indexes (`build_tlsh_ivf`).
 
+use std::num::NonZeroUsize;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::thread;
+
 use super::{DEFAULT_SEED, FLAT_MAX, TARGET_LIST_SIZE, TlshIvf};
 use crate::error::{Error, Result};
 use crate::tlsh::CELL_COUNT;
@@ -75,18 +79,24 @@ pub fn build_tlsh_ivf(rows: &[Row], opts: &IvfBuildOptions) -> Result<TlshIvf> {
         .filter(|&c| cells[c] != cells[c + 1])
         .collect();
 
-    let results: Vec<CellLists> = nonempty
-        .iter()
-        .map(|&c| {
-            let mut rng = Mt19937_64::new(opts.seed ^ (c as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15));
-            bisect_cell(
-                &rows[cells[c]..cells[c + 1]],
-                cells[c] as u32,
-                opts.target_list_size,
-                &mut rng,
-            )
-        })
-        .collect();
+    // each cell has its own RNG, so cells are independent and the result
+    // does not depend on which thread builds which cell
+    let work = |i: usize| {
+        let c = nonempty[i];
+        let mut rng = Mt19937_64::new(opts.seed ^ (c as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15));
+        bisect_cell(
+            &rows[cells[c]..cells[c + 1]],
+            cells[c] as u32,
+            opts.target_list_size,
+            &mut rng,
+        )
+    };
+    let threads = match opts.threads {
+        0 => thread::available_parallelism().map_or(1, NonZeroUsize::get),
+        t => t,
+    }
+    .min(nonempty.len().max(1));
+    let results = run_cells(nonempty.len(), threads, work);
 
     // concatenate in cell order
     let mut ivf = TlshIvf {
@@ -114,6 +124,47 @@ pub fn build_tlsh_ivf(rows: &[Row], opts: &IvfBuildOptions) -> Result<TlshIvf> {
     }
     ivf.cell_lists[CELL_COUNT] = ivf.lists() as u32;
     Ok(ivf)
+}
+
+/// `work(0..count)` in index order, on `threads` scoped threads taking the
+/// next index from a shared counter (as the C++ pool does); a panic in a
+/// worker is resumed here.
+fn run_cells<T, F>(count: usize, threads: usize, work: F) -> Vec<T>
+where
+    T: Send,
+    F: Fn(usize) -> T + Sync,
+{
+    if threads <= 1 {
+        return (0..count).map(work).collect();
+    }
+    let next = AtomicUsize::new(0);
+    let mut slots: Vec<Option<T>> = (0..count).map(|_| None).collect();
+    thread::scope(|s| {
+        let workers: Vec<_> = (0..threads)
+            .map(|_| {
+                s.spawn(|| {
+                    let mut done = Vec::new();
+                    loop {
+                        let i = next.fetch_add(1, Ordering::Relaxed);
+                        if i >= count {
+                            return done;
+                        }
+                        done.push((i, work(i)));
+                    }
+                })
+            })
+            .collect();
+        for w in workers {
+            let done = w.join().unwrap_or_else(|e| std::panic::resume_unwind(e));
+            for (i, r) in done {
+                slots[i] = Some(r);
+            }
+        }
+    });
+    slots
+        .into_iter()
+        .map(|r| r.expect("every cell is built"))
+        .collect()
 }
 
 /// The start of each cell's rows in sorted `rows`, `CELL_COUNT + 1`

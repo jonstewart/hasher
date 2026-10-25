@@ -10,7 +10,7 @@ use hset::tlsh::ivf::bisect::{IvfBuildOptions, build_tlsh_ivf, nearer};
 use hset::tlsh::CELL_COUNT;
 use hset::tlsh::ivf::{FLAT_MAX, IvfIndex, TlshIvf};
 use hset::tlsh::mt64::Mt19937_64;
-use hset_testkit::tlsh::random_digest_with_header;
+use hset_testkit::tlsh::{corpus, random_digest_with_header, sorted_rows};
 
 /// `n` random rows of the one cell (L 0x40, Q 0x21), sorted and
 /// deduplicated (C++ `one_cell_corpus`).
@@ -370,7 +370,7 @@ fn rows_go_to_the_nearest_mean_not_the_nearest_medoid() {
     assert_eq!(d(&rows[0], &f), 7);
     rows.sort_unstable();
 
-    for seed in [1, 7, 99] {
+    for seed in [1u64, 7, 99] {
         let ivf = build(&rows, 16, seed);
         assert_eq!(ivf.lists(), 2, "seed {seed}");
         for l in 0..2 {
@@ -381,3 +381,28 @@ fn rows_go_to_the_nearest_mean_not_the_nearest_medoid() {
         }
     }
 }
+
+/// Build with explicit options.
+fn build_with(rows: &[[u8; 36]], t: usize, seed: u64, threads: usize) -> TlshIvf {
+    let opts = IvfBuildOptions {
+        target_list_size: t,
+        seed,
+        threads,
+    };
+    build_tlsh_ivf(rows, &opts).expect("build")
+}
+
+#[test]
+fn the_build_does_not_depend_on_the_thread_count() {
+    let rows = sorted_rows(&corpus(9, 6000));
+    let a = build_with(&rows, 32, 1, 1);
+    assert!(a.lists() > 1);
+    assert_eq!(build_with(&rows, 32, 1, 4), a);
+    assert_eq!(build_with(&rows, 32, 1, 0), a);
+    // more threads than nonempty cells
+    let few = one_cell_corpus(64, 100);
+    assert_eq!(build_with(&few, 32, 1, 16), build_with(&few, 32, 1, 1));
+    // the same build again
+    assert_eq!(build_with(&rows, 32, 1, 1), a);
+}
+
