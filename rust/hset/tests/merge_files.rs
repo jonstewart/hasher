@@ -20,7 +20,7 @@ use hset::hashset::KnnStrategy;
 use hset::merge::{MergeOptions, TlshIndexPolicy, merge};
 use hset::tlsh::ivf::{DEFAULT_COALESCE, check_invariant};
 use hset::tlsh::{IvfIndex, TlshDigest, emb_body_dist2};
-use hset::{BuildOptions, Builder, Error, HashType, Hashset, SetOp};
+use hset::{BuildOptions, Builder, Error, HashType, Hashset, HintSpec, SetOp};
 use hset_testkit::tlsh::{Perturbation, corpus, naive_cell_index, perturb_corpus};
 
 #[test]
@@ -837,4 +837,120 @@ fn an_overlong_name_is_an_error() {
     let mut o = opts();
     o.name = "x".repeat(65536);
     assert_contains(&merge_err(&ho, &ho, &o), "too long");
+}
+
+// ---------------------------------------------------------------------------
+// Write flags, hints, invalid indexes
+// ---------------------------------------------------------------------------
+
+/// C++ hset_builder_setops_write_flags: without the record table the
+/// operation is still applied to the records, rows follow them and are
+/// then written once each; without sections the records are those of the
+/// full merge.
+#[test]
+fn write_flags_select_the_record_table_and_the_sections() {
+    let c = tlsh_corpus();
+    let a = build_input(&c, 0..800, &MD5_TLSH, REC);
+    let b = build_input(&c, 400..1200, &MD5_TLSH, REC);
+    let mut ho_opts = opts();
+    ho_opts.write_records = false;
+    let mut ro_opts = opts();
+    ro_opts.write_hashsets = false;
+    for op in OPS {
+        let full = merged(op, &a, &b, &opts());
+        let full = load(&full);
+
+        let ho = merged(op, &a, &b, &ho_opts);
+        let hs = check_loads(&ho);
+        assert!(hs.record_header().is_none());
+        assert_eq!(count_tag(&ho, chunk::RIDX), 0);
+        assert_eq!(hs.section_count(), full.section_count());
+        for t in MD5_TLSH {
+            let want: Rows = unique(&rows_of(&full, t)).into_iter().collect();
+            assert_eq!(rows_of(&hs, t), want, "{t} of the {}", op.name());
+        }
+        let t = hs.index_for_type(HashType::Tlsh).unwrap();
+        check_tlsh_section(&hs, t, true, true);
+
+        let ro = merged(op, &a, &b, &ro_opts);
+        let hs = check_loads(&ro);
+        assert_eq!(hs.section_count(), 0);
+        assert_eq!(hs.record_header(), full.record_header());
+        assert_eq!(hs.file().rdat, full.file().rdat);
+    }
+}
+
+#[test]
+fn digest_sections_get_the_hint_of_the_options_and_tlsh_the_cell_index() {
+    let c = tlsh_corpus();
+    let types = [HashType::Md5, HashType::Size, HashType::Tlsh];
+    let a = build_input(&c, 0..300, &types, REC);
+    let b = build_input(&c, 200..500, &types, REC);
+    for (hint, md5_tag) in [
+        (HintSpec::LEGACY, Some(0x6208)),
+        (HintSpec::Hull { bits: 4 }, Some(0x6804)),
+        (HintSpec::None, None),
+    ] {
+        let mut o = opts();
+        o.hint = hint;
+        let out = merged(SetOp::Union, &a, &b, &o);
+        check_output(&out, &a, &b, SetOp::Union, true);
+        let hs = load(&out);
+        let tag = |t| {
+            hs.section(hs.index_for_type(t).unwrap())
+                .hint
+                .map(|h| h.tag())
+        };
+        assert_eq!(tag(HashType::Md5), md5_tag, "{hint:?}");
+        assert_eq!(tag(HashType::Size), None, "{hint:?}");
+        assert_eq!(tag(HashType::Tlsh), Some(0x7400), "{hint:?}");
+    }
+}
+
+/// `bytes` with the first two ids of its TIVF equal, so that the index
+/// fails validation (a row twice, another missing) while its header
+/// still parses.
+fn with_a_repeated_tivf_id(bytes: &[u8]) -> Vec<u8> {
+    let f = hset::format::decode(bytes).unwrap();
+    let t = f.section_for(HashType::Tlsh).unwrap();
+    let n = f.sections[t].len();
+    let &(off, _) = f.toc.iter().find(|&&(_, tag)| tag == chunk::TIVF).unwrap();
+    let chunk = chunk::read_chunk(bytes, off as usize).unwrap();
+    let ids = off as usize + chunk::CHUNK_HEADER_LEN + chunk.data.len() - 4 * n;
+    let mut out = bytes.to_vec();
+    out.copy_within(ids + 4..ids + 8, ids);
+    out
+}
+
+/// Rust validates an input index before merging it (controller ruling
+/// 5); C++ trusts it. An invalid index fails a merge that carries it and
+/// is ignored by one that does not.
+#[test]
+fn an_invalid_input_index_fails_only_the_merges_that_carry_it() {
+    let c = tlsh_corpus();
+    let a = with_a_repeated_tivf_id(&build_input(&c, 0..300, &MD5_TLSH, HO));
+    assert!(load(&a).tlsh_index(1).is_err());
+    let b = build_input(&c, 200..500, &MD5_TLSH, HO);
+    let b_bare = build_input(&c, 200..500, &MD5_TLSH, HO.index(false));
+    let mut o = opts();
+    for (r, policy, ok) in [
+        (&b, TlshIndexPolicy::Inherit, false),
+        (&b, TlshIndexPolicy::Write, false),
+        (&b, TlshIndexPolicy::Omit, true),
+        (&b_bare, TlshIndexPolicy::Inherit, true),
+        (&b_bare, TlshIndexPolicy::Write, true),
+    ] {
+        o.tlsh_index = policy;
+        match merge(SetOp::Union, &load(&a), &load(r), &o) {
+            Ok(out) => {
+                assert!(ok, "{policy:?}");
+                check_loads(&out);
+            }
+            Err(e) => {
+                assert!(!ok, "{policy:?}: {e}");
+                assert!(matches!(e, Error::Format(_)), "{e}");
+                assert_contains(&e.to_string(), "TIVF");
+            }
+        }
+    }
 }
