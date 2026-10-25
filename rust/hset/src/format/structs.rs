@@ -37,6 +37,17 @@ impl FieldDescriptor {
     pub fn stride(&self) -> usize {
         1 + self.length as usize
     }
+
+    /// The first hash type `fields` lists more than once, if any. Fields are
+    /// found by type, so such a list is malformed.
+    pub fn repeated_type(fields: &[FieldDescriptor]) -> Option<HashType> {
+        fields.iter().enumerate().find_map(|(i, f)| {
+            fields[..i]
+                .iter()
+                .any(|g| g.htype == f.htype)
+                .then_some(f.htype)
+        })
+    }
 }
 
 /// Contents of the `RHDR` chunk.
@@ -64,6 +75,12 @@ impl RecordHeader {
     /// Record length implied by the field descriptors.
     pub fn computed_record_length(&self) -> usize {
         self.fields.iter().map(FieldDescriptor::stride).sum()
+    }
+
+    /// The first hash type the fields list more than once, if any
+    /// ([`FieldDescriptor::repeated_type`]).
+    pub fn repeated_type(&self) -> Option<HashType> {
+        FieldDescriptor::repeated_type(&self.fields)
     }
 }
 

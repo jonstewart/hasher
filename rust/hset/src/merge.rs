@@ -482,11 +482,20 @@ impl OutSection {
 
 /// The output fields of merging two record tables: the left fields followed
 /// by the right fields the left lacks (fields are matched by type). A field
-/// with different lengths on the two sides is an error.
+/// with different lengths on the two sides is an input error; a header that
+/// lists a type twice ([`RecordHeader::repeated_type`]) is a format error.
 pub fn merged_record_fields(
     left: &RecordHeader,
     right: &RecordHeader,
 ) -> Result<Vec<FieldDescriptor>> {
+    for (hdr, side) in [(left, "left"), (right, "right")] {
+        if let Some(t) = hdr.repeated_type() {
+            return Err(Error::format(format!(
+                "the {side} RHDR lists the {} field twice",
+                t.name()
+            )));
+        }
+    }
     let mut fields = left.fields.clone();
     for f in &right.fields {
         match fields.iter().find(|o| o.htype == f.htype) {
@@ -645,6 +654,16 @@ impl Widened {
         let mut ooff = 0;
         for f in fields {
             if let Some(ioff) = hdr.field_offset(f.htype) {
+                // merged_record_fields guarantees this; a mismatch would read
+                // past the input record or misplace its bytes
+                let ilen = hdr.fields.iter().find(|g| g.htype == f.htype);
+                if ilen.map(|g| g.length) != Some(f.length) {
+                    return Err(Error::format(format!(
+                        "the {side} {} field is not {} bytes long",
+                        f.htype.name(),
+                        f.length
+                    )));
+                }
                 moves.push((ooff, ioff, f.stride()));
             }
             ooff += f.stride();

@@ -345,6 +345,11 @@ impl Builder {
                 "at least one of records and hash sets must be written",
             ));
         }
+        // fields are found by type, and the reader rejects an RHDR naming a
+        // type twice (with_fields does not check, so check here)
+        if let Some(t) = FieldDescriptor::repeated_type(&self.fields) {
+            return Err(Error::input(format!("duplicate hash type {t}")));
+        }
         let rl = self.record_length;
         let records = sorted_rows(&self.records, rl, true);
         let record_count = records.len() / rl;
@@ -604,6 +609,23 @@ pub fn format_utc(secs: u64) -> String {
 mod tests {
     use super::*;
     use crate::format::decode;
+
+    #[test]
+    fn build_refuses_fields_that_repeat_a_type() {
+        // the reader rejects such an RHDR, so the writer must not produce one
+        let md5 = |name: &str| FieldDescriptor {
+            htype: HashType::Md5,
+            name: name.into(),
+            length: 16,
+        };
+        let b = Builder::with_fields(vec![md5("a"), md5("b")]);
+        for with_hashsets in [false, true] {
+            let opts = BuildOptions::new("", "").hashsets(with_hashsets);
+            let e = b.build(&opts).unwrap_err();
+            assert!(matches!(e, Error::Input(_)), "{e}");
+            assert!(e.to_string().contains("duplicate hash type MD5"), "{e}");
+        }
+    }
 
     #[test]
     fn timestamp_formatting() {

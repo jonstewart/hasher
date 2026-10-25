@@ -39,14 +39,6 @@ fn parse_rhdr(ch: &Chunk<'_>) -> Result<RecordHeader> {
                 "record field '{name}' has absurd length {length}"
             )));
         }
-        // a type named twice is ambiguous: lookups and merges find a field
-        // by its type (mkhashset refuses to write one)
-        if fields.iter().any(|f: &FieldDescriptor| f.htype == htype) {
-            return Err(Error::format(format!(
-                "RHDR lists the {} field twice",
-                htype.name()
-            )));
-        }
         total = total
             .checked_add(1 + length)
             .ok_or_else(|| Error::format("record length overflows"))?;
@@ -61,11 +53,20 @@ fn parse_rhdr(ch: &Chunk<'_>) -> Result<RecordHeader> {
             "RHDR record length {record_length} does not match fields ({total})"
         )));
     }
-    Ok(RecordHeader {
+    let rhdr = RecordHeader {
         record_length,
         record_count,
         fields,
-    })
+    };
+    // a type named twice is ambiguous: lookups and merges find a field by
+    // its type (mkhashset refuses to write one)
+    if let Some(t) = rhdr.repeated_type() {
+        return Err(Error::format(format!(
+            "RHDR lists the {} field twice",
+            t.name()
+        )));
+    }
+    Ok(rhdr)
 }
 
 fn parse_hhdr(ch: &Chunk<'_>) -> Result<HashsetHeader> {

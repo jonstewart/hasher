@@ -366,6 +366,28 @@ fn record_merge_rejects_headers_that_disagree_with_the_data() {
     assert!(matches!(e, Error::Format(_)), "{e}");
 }
 
+#[test]
+fn record_merge_rejects_a_header_listing_a_type_twice() {
+    // decode rejects such an RHDR; merge_records is public, so it checks too
+    let md5 = |len| field(HashType::Md5, "md5", len);
+    let mixed = header(vec![md5(4), md5(16)], 1);
+    let single = header(vec![md5(4)], 1);
+    let same = header(vec![md5(1), fb(), md5(1)], 1);
+    let cases: [(&RecordHeader, &[u8], &RecordHeader, &[u8]); 4] = [
+        (&mixed, &[0; 22], &single, &[0; 5]),
+        (&single, &[0; 5], &mixed, &[0; 22]),
+        (&same, &[1, 1, 1, 2, 1, 3], &single, &[0; 5]),
+        (&single, &[0; 5], &same, &[1, 1, 1, 2, 1, 3]),
+    ];
+    for (l, ld, r, rd) in cases {
+        for op in [SetOp::Union, SetOp::Intersect, SetOp::Subtract] {
+            let e = merge_records(op, l, ld, r, rd).unwrap_err();
+            assert!(matches!(e, Error::Format(_)), "{e}");
+            assert!(e.to_string().contains("lists the MD5 field twice"), "{e}");
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // proptests against BTreeSet / BTreeMap models
 
