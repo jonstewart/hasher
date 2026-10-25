@@ -8,7 +8,7 @@
 
 use hset::builder::{format_value, parse_value, write_value};
 use hset::format::{FieldDescriptor, Hint, decode};
-use hset::tlsh::TlshDigest;
+use hset::tlsh::{IvfIndex, TivfView, TlshDigest};
 use hset::{BuildOptions, Builder, Error, HashType, HintSpec};
 use hset_testkit::tlsh::{VEC_HEX, example_digests, example_text, fake_md5, naive_cell_index};
 use sha2::{Digest, Sha256};
@@ -210,6 +210,8 @@ struct SectionShas {
     hdat: String,
     hint: Option<String>,
     ridx: Option<String>,
+    /// The TIVF payload's SHA-256 and list count.
+    tivf: Option<(String, usize)>,
 }
 
 /// The payload SHA-256s of a file: RDAT, the md5 and TLSH sections, and
@@ -230,6 +232,10 @@ fn payload_shas(bytes: &[u8]) -> FileShas {
             hdat: sha256(s.data),
             hint: s.hint.map(|h| sha256(&hint_payload(h))),
             ridx: s.ridx.map(sha256),
+            tivf: s.tivf.map(|t| {
+                let lists = TivfView::parse(t, s.len() as u64).unwrap().lists();
+                (sha256(t), lists)
+            }),
         }
     };
     FileShas {
@@ -257,6 +263,8 @@ fn build_example(tlsh_first: bool, with_records: bool) -> Vec<u8> {
 const TLSH_HDAT: &str = "1fff9e9fd92b2476394602397d5b50da43c541228f673d04c6e750453edfd8eb";
 const TLSH_HINT: &str = "8259168b3f4538826c863bfdfbad819ca9007f80a421c31f124ce9317aec4669";
 const MD5_HDAT: &str = "e078787ee34651399985009d7378dd4ebbc5cb946093e35cbd73cbd3ab74d467";
+/// The TIVF payload of the records files (76 lists over 81 rows).
+const TLSH_TIVF: &str = "4526562d16fc0251141dd786fc6a810f8bdda64dbd1db43dac06928bc7d901ef";
 const MD5_LEGACY_HINT: &str = "42b51c20c1c4fa6b9c11f24e56eb5f3af6987b6aa4e21cb07a656b2cb824b4fe";
 
 fn some(x: &str) -> Option<String> {
@@ -280,6 +288,7 @@ fn md5_tlsh_payloads_equal_the_cpp_encoders() {
             hdat: TLSH_HDAT.into(),
             hint: some(TLSH_HINT),
             ridx: some("25bf41f60bad0e594fab58cfd12b94becb4e9c9fbab619f9bdd50c0d41636694"),
+            tivf: Some((TLSH_TIVF.into(), 76)),
         }
     );
     assert_eq!(
@@ -289,6 +298,7 @@ fn md5_tlsh_payloads_equal_the_cpp_encoders() {
             hdat: MD5_HDAT.into(),
             hint: some(MD5_LEGACY_HINT),
             ridx: some("46dcdd0fd4a6c98d5e49ec05a41487b7d38bd67c1aff3efa400ed7ce1917231a"),
+            tivf: None,
         }
     );
 }
@@ -311,6 +321,7 @@ fn tlsh_md5_payloads_equal_the_cpp_encoders() {
             hdat: TLSH_HDAT.into(),
             hint: some(TLSH_HINT),
             ridx: some("047ed8f99a69dd4e7e6dd0a9b59fe6958a52379bc2bf281f77b1dc318fe38498"),
+            tivf: Some((TLSH_TIVF.into(), 76)),
         }
     );
     assert_eq!(
@@ -320,6 +331,7 @@ fn tlsh_md5_payloads_equal_the_cpp_encoders() {
             hdat: MD5_HDAT.into(),
             hint: some(MD5_LEGACY_HINT),
             ridx: some("3a2c8daacc6449a3ac403ed5e69f8a6a33792edd242c5762b88d20f59f93e8ef"),
+            tivf: None,
         }
     );
 }
@@ -338,6 +350,10 @@ fn md5_tlsh_hashsets_only_payloads_equal_the_cpp_encoders() {
             hdat: "dfd6efe8bb7bc40136077922ea3cfa77c7e46a2bcc9886c5ccb1fb83a3cb980b".into(),
             hint: some("1c91d0c2f3f28dd89e301a02da13adfd903a57cdc7d8702ba2ff729d158d8258"),
             ridx: None,
+            tivf: Some((
+                "06f4d2ff581774066559d1094f0eda30e3421836615e255069c32026ec1d0d88".into(),
+                76
+            )),
         }
     );
     assert_eq!(
@@ -347,6 +363,7 @@ fn md5_tlsh_hashsets_only_payloads_equal_the_cpp_encoders() {
             hdat: MD5_HDAT.into(),
             hint: some(MD5_LEGACY_HINT),
             ridx: None,
+            tivf: None,
         }
     );
 }
@@ -367,7 +384,7 @@ fn only_the_md5_hint_depends_on_the_hint_spec() {
 }
 
 /// The C++ files themselves, when `make check` has written them: every
-/// payload but the TIVF (built in a later step) is the C++ encoder's.
+/// payload, the TIVF index included, is the C++ encoder's.
 #[test]
 fn payloads_equal_the_cpp_fixtures_when_present() {
     for (name, tlsh_first, with_records) in [
@@ -395,6 +412,13 @@ fn payloads_equal_the_cpp_fixtures_when_present() {
             assert_eq!(x.data, y.data, "{name} {}", x.header.name);
             assert_eq!(x.hint, y.hint, "{name} {}", x.header.name);
             assert_eq!(x.ridx, y.ridx, "{name} {}", x.header.name);
+            assert_eq!(x.tivf, y.tivf, "{name} {}", x.header.name);
+            assert_eq!(
+                x.tivf.is_some(),
+                x.header.htype == HashType::Tlsh,
+                "{name} {}",
+                x.header.name
+            );
         }
     }
 }

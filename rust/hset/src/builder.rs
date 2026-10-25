@@ -11,6 +11,7 @@ use crate::hex;
 use crate::key::key64_dyn;
 use crate::lookup::{self, BitsPolicy, HintSpec};
 use crate::tlsh::cells::{cell_index, cell_table};
+use crate::tlsh::ivf::{IvfBuildOptions, build_tlsh_ivf};
 use crate::tlsh::{CELL_HINT_TAG, DIGEST_LENGTH as TLSH_LENGTH, TlshDigest};
 
 /// Options controlling how a file is written.
@@ -30,6 +31,10 @@ pub struct BuildOptions {
     /// even with [`HintSpec::None`].
     pub hint: HintSpec,
     pub bits_policy: BitsPolicy,
+    /// Write the `TIVF` kNN index of every TLSH section (default true).
+    pub tlsh_index: bool,
+    /// How the `TIVF` index is built.
+    pub tlsh_ivf: IvfBuildOptions,
 }
 
 impl BuildOptions {
@@ -43,6 +48,8 @@ impl BuildOptions {
             with_hashsets: true,
             hint: HintSpec::Hull { bits: u8::MAX },
             bits_policy: BitsPolicy::default(),
+            tlsh_index: true,
+            tlsh_ivf: IvfBuildOptions::default(),
         }
     }
 
@@ -69,6 +76,20 @@ impl BuildOptions {
     pub fn bits_policy(mut self, policy: BitsPolicy) -> Self {
         self.bits_policy = policy;
         self
+    }
+
+    pub fn tlsh_index(mut self, yes: bool) -> Self {
+        self.tlsh_index = yes;
+        self
+    }
+
+    pub fn tlsh_ivf(mut self, ivf: IvfBuildOptions) -> Self {
+        self.tlsh_ivf = ivf;
+        self
+    }
+
+    pub fn tlsh_options(self, _bits: u32) -> Result<Self> {
+        Ok(self)
     }
 }
 
@@ -283,6 +304,7 @@ impl Builder {
             data: Vec<u8>,
             ridx: Option<Vec<u8>>,
             hint: Option<(u16, Vec<u8>)>,
+            tivf: Option<Vec<u8>>,
         }
 
         let mut prepared: Vec<Prepared> = Vec::new();
@@ -313,12 +335,17 @@ impl Builder {
                         ri.extend_from_slice(&u64::from(r).to_le_bytes());
                     }
                 }
+                let mut tivf = None;
                 let hint = if is_tlsh(f) {
                     // C++ writes the cell index on every TLSH section,
-                    // whatever hint the other sections get. `data` holds
-                    // the sorted rows (duplicates included in a records
-                    // file) that the TIVF index will also be built from.
+                    // whatever hint the other sections get. The cell
+                    // index and the TIVF index are both built over the
+                    // sorted rows in `data`, duplicates included in a
+                    // records file, which are exactly the HDAT rows.
                     let (rows, _) = data.as_chunks::<TLSH_LENGTH>();
+                    if opts.tlsh_index {
+                        tivf = Some(build_tlsh_ivf(rows, &opts.tlsh_ivf)?.to_bytes());
+                    }
                     Some((CELL_HINT_TAG, cell_table(&cell_index(rows)?)))
                 } else if f.htype.is_digest() {
                     let spec = lookup::resolve_bits(opts.hint, idx.len(), hlen, &opts.bits_policy);
@@ -333,6 +360,7 @@ impl Builder {
                     data,
                     ridx,
                     hint,
+                    tivf,
                 });
                 off += f.stride();
             }
@@ -357,10 +385,7 @@ impl Builder {
                     data: &p.data,
                     hint: p.hint.as_ref().map(|(t, b)| (*t, b.as_slice())),
                     ridx: p.ridx.as_deref(),
-                    // The TIVF index of a TLSH section is not written yet;
-                    // when it is, it is built over `p.data`'s rows, the
-                    // same sorted rows the cell hint was computed from.
-                    tivf: None,
+                    tivf: p.tivf.as_deref(),
                 })
                 .collect(),
         };
