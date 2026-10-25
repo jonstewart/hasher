@@ -2,9 +2,12 @@
 //! (the `test/*.hset` fixtures in the repository root).
 
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
-use hset::format::{Hint, decode};
+use hset::format::{Document, HashsetIn, Hint, RecordsIn, decode, encode};
+use hset::tlsh::cells::{cell_index, cell_table};
 use hset::{BuildOptions, Builder, HashType, Hashset, HintSpec, SetOp, hex, ops};
+use sha2::{Digest, Sha256};
 
 fn fixture_path(name: &str) -> PathBuf {
     hset_testkit::fixtures::fixtures_dir().join(name)
@@ -75,47 +78,190 @@ fn good_hset_matches_reference_expectations() {
     assert!(report.is_ok(), "{:?}", report.problems);
 }
 
+/// The chunk tags a file's FTOC lists, read from the bytes without the
+/// decoder: the FTOC chunk sits at offset 40 (`"FTOC"`, `u64 LE` length),
+/// and each entry is a `u64 LE` offset and a `u32 BE` tag.
+fn ftoc_tags(bytes: &[u8]) -> Vec<[u8; 4]> {
+    if bytes.len() < 52 || &bytes[..8] != b"SetOHash" || &bytes[40..44] != b"FTOC" {
+        return Vec::new();
+    }
+    let len = u64::from_le_bytes(bytes[44..52].try_into().unwrap()) as usize;
+    let Some(entries) = bytes.get(52..52 + len) else {
+        return Vec::new();
+    };
+    entries
+        .as_chunks::<12>()
+        .0
+        .iter()
+        .map(|e| e[8..].try_into().unwrap())
+        .collect()
+}
+
+/// Check one fixture; true if it loaded and verified.
+fn check_fixture(name: &str, bytes: &[u8]) -> bool {
+    // tlsh_bad.hset is what the C++ hset_tlsh_bad_digest_throws test
+    // leaves behind when the writer throws partway through
+    if name == "bogus.hset" || name == "tlsh_bad.hset" {
+        assert!(Hashset::load(bytes).is_err(), "{name} should not load");
+        return false;
+    }
+    // Older C++ builds wrote TLSH embedding vectors; the format dropped
+    // them, and the decoder refuses them by name.
+    if ftoc_tags(bytes).contains(b"TVEC") {
+        let e = Hashset::load(bytes).expect_err(name).to_string();
+        assert!(e.contains("TVEC chunk"), "{name}: {e}");
+        return false;
+    }
+    let hs = match Hashset::load(bytes) {
+        Ok(hs) => hs,
+        // 0123456789_*.hset and test1.hset are version-1 files, which
+        // neither this crate nor the C++ decoder reads.
+        Err(e) if e.to_string().contains("version 1") => return false,
+        Err(e) => panic!("{name}: {e}"),
+    };
+    let report = hs.verify();
+    // Every invariant must hold, including soundness of the legacy
+    // hints and the record indices (the C++ encoder scrambled RIDX
+    // until tlsh-embedding's 300ace3 fixed its proxy-iterator sort).
+    assert!(report.problems.is_empty(), "{name}: {:?}", report.problems);
+    assert!(report.digest_ok, "{name}: digest");
+    for (i, s) in hs.sections().iter().enumerate() {
+        for j in 0..s.len() {
+            assert!(hs.contains(i, s.hash(j)), "{name}: section {i} hash {j}");
+        }
+        // The C++ cell index is the one Rust computes from the rows.
+        if let Some(Hint::TlshCells { table }) = s.hint {
+            let rows = s.data.as_chunks::<36>().0;
+            assert_eq!(
+                cell_table(&cell_index(rows).unwrap()),
+                table,
+                "{name}: cells"
+            );
+        }
+    }
+    true
+}
+
 #[test]
 fn all_fixtures_decode_and_verify() {
     let dir = fixture_path("");
-    let mut seen = 0;
-    for entry in std::fs::read_dir(&dir).unwrap() {
-        let p = entry.unwrap().path();
-        let name = p.file_name().unwrap().to_string_lossy().into_owned();
+    let paths: Vec<PathBuf> = std::fs::read_dir(&dir)
+        .unwrap()
+        .map(|e| e.unwrap().path())
         // Skip macOS AppleDouble sidecar files that may accompany the fixtures.
-        if p.extension().is_some_and(|e| e == "hset") && !name.starts_with("._") {
-            let bytes = std::fs::read(&p).unwrap();
-            // tlsh_bad.hset is what the C++ hset_tlsh_bad_digest_throws test
-            // leaves behind when the writer throws partway through
-            if name == "bogus.hset" || name == "tlsh_bad.hset" {
-                assert!(Hashset::load(&bytes).is_err(), "{name} should not load");
-                continue;
-            }
-            let hs = match Hashset::load(&bytes) {
-                Ok(hs) => hs,
-                // 0123456789_*.hset and test1.hset are version-1 files, which
-                // neither this crate nor the C++ decoder reads.
-                Err(e) if e.to_string().contains("version 1") => continue,
-                // The C++ suite also writes TLSH hash sets with TIVF
-                // chunks, which this crate does not read yet.
-                Err(e) if e.to_string().ends_with("unknown chunk type TIVF") => continue,
-                Err(e) => panic!("{name}: {e}"),
-            };
-            let report = hs.verify();
-            // Every invariant must hold, including soundness of the legacy
-            // hints and the record indices (the C++ encoder scrambled RIDX
-            // until tlsh-embedding's 300ace3 fixed its proxy-iterator sort).
-            assert!(report.problems.is_empty(), "{name}: {:?}", report.problems);
-            assert!(report.digest_ok, "{name}: digest");
-            for (i, s) in hs.sections().iter().enumerate() {
-                for j in 0..s.len() {
-                    assert!(hs.contains(i, s.hash(j)), "{name}: section {i} hash {j}");
+        .filter(|p| {
+            p.extension().is_some_and(|e| e == "hset")
+                && !p.file_name().unwrap().to_string_lossy().starts_with("._")
+        })
+        .collect();
+    // The TLSH fixtures make this walk take half a minute serially in a
+    // debug build, so the files are shared out over the cores.
+    let next = AtomicUsize::new(0);
+    let seen = AtomicUsize::new(0);
+    let workers = std::thread::available_parallelism().map_or(1, |n| n.get());
+    std::thread::scope(|scope| {
+        for _ in 0..workers {
+            scope.spawn(|| {
+                while let Some(p) = paths.get(next.fetch_add(1, Ordering::Relaxed)) {
+                    let name = p.file_name().unwrap().to_string_lossy();
+                    let bytes = std::fs::read(p).unwrap();
+                    if check_fixture(&name, &bytes) {
+                        seen.fetch_add(1, Ordering::Relaxed);
+                    }
                 }
-            }
-            seen += 1;
+            });
         }
-    }
+    });
+    let seen = seen.into_inner();
     assert!(seen >= 6, "expected the reference fixtures, found {seen}");
+}
+
+/// The SHA-256 of `b` in hex.
+fn sha256(b: &[u8]) -> String {
+    hex::encode(&Sha256::digest(b))
+}
+
+/// md5_tlsh.hset, written by the C++ test_hset_tlsh suite from the 80
+/// vendored digests: its TLSH payloads are the golden values of the Rust
+/// parity plan (3.1), so the decoder hands out exactly the C++ bytes, and
+/// writing them back through the Rust encoder decodes to the same payloads.
+#[test]
+fn cpp_tlsh_section_payloads_decode_byte_exact_and_reencode() {
+    let path = fixture_path("md5_tlsh.hset");
+    if !path.exists() {
+        eprintln!(
+            "SKIP: {} is absent (run the C++ make check)",
+            path.display()
+        );
+        return;
+    }
+    let bytes = std::fs::read(&path).unwrap();
+    let f = decode(&bytes).unwrap();
+    let t = f.section_for(HashType::Tlsh).unwrap();
+    let s = &f.sections[t];
+    assert_eq!(s.header.name, "tlsh");
+    assert_eq!(s.len(), 81);
+    let Some(Hint::TlshCells { table }) = s.hint else {
+        panic!("TLSH hint is {:?}", s.hint.map(|h| h.tag()));
+    };
+    let mut hint = 0x7400u16.to_be_bytes().to_vec();
+    hint.extend_from_slice(table);
+    assert_eq!(
+        sha256(&hint),
+        "8259168b3f4538826c863bfdfbad819ca9007f80a421c31f124ce9317aec4669"
+    );
+    assert_eq!(
+        sha256(s.data),
+        "1fff9e9fd92b2476394602397d5b50da43c541228f673d04c6e750453edfd8eb"
+    );
+    assert_eq!(
+        sha256(s.ridx.unwrap()),
+        "25bf41f60bad0e594fab58cfd12b94becb4e9c9fbab619f9bdd50c0d41636694"
+    );
+    assert_eq!(
+        sha256(s.tivf.unwrap()),
+        "4526562d16fc0251141dd786fc6a810f8bdda64dbd1db43dac06928bc7d901ef"
+    );
+    assert_eq!(
+        sha256(f.rdat.unwrap()),
+        "408953dc8344947baffec8bb2c03081998cd0425dabcad56661e289bf437eae7"
+    );
+
+    let rhdr = f.rhdr.as_ref().unwrap();
+    let doc = Document {
+        version: f.fhdr.version,
+        name: &f.fhdr.name,
+        desc: &f.fhdr.desc,
+        time: &f.fhdr.time,
+        records: Some(RecordsIn {
+            fields: &rhdr.fields,
+            record_length: rhdr.record_length as usize,
+            data: f.rdat.unwrap(),
+        }),
+        hashsets: f
+            .sections
+            .iter()
+            .map(|s| HashsetIn {
+                htype: s.header.htype,
+                name: &s.header.name,
+                hash_length: s.hash_length(),
+                data: s.data,
+                hint: s.hint.map(|h| match h {
+                    Hint::Block { table, .. }
+                    | Hint::Hull { table, .. }
+                    | Hint::TlshCells { table } => (h.tag(), table),
+                    Hint::Unknown { tag, data } => (tag, data),
+                }),
+                ridx: s.ridx,
+                tivf: s.tivf,
+            })
+            .collect(),
+    };
+    let ours = encode(&doc).unwrap();
+    let g = decode(&ours).unwrap();
+    assert_eq!(g.sections, f.sections);
+    assert_eq!(g.rdat, f.rdat);
+    assert!(Hashset::load(&ours).unwrap().verify().is_ok());
 }
 
 #[test]
