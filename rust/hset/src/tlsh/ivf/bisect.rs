@@ -597,25 +597,23 @@ impl<'a> CellBisector<'a> {
 
 /// `x . s` in `i32` (no overflow: `|s_j| <= FLAT_MAX`).
 ///
-/// The hot loop of the build. A plain indexed loop over fixed-size arrays
-/// keeps unoptimized (test) builds several times faster than an iterator
-/// chain, and optimizes to the same vector code.
+/// The hot loop of the build. Eight lane accumulators, summed once at the
+/// end: the optimizer keeps them in vector registers across the whole
+/// loop (a sum per chunk of 8 instead reduced the vector to a scalar
+/// every 8 dims, 1.4x slower than the C++ build), and the plain indexed
+/// loop over fixed-size arrays keeps unoptimized (test) builds several
+/// times faster than an iterator chain.
 #[inline]
 fn dot(x: &[i8; EMBED_BODY_DIMS], s: &[i32; EMBED_BODY_DIMS]) -> i32 {
     let (xs, sx) = (x.as_chunks::<8>().0, s.as_chunks::<8>().0);
-    let mut d = 0;
+    let mut acc = [0i32; 8];
     for j in 0..EMBED_BODY_DIMS / 8 {
         let (x, s) = (&xs[j], &sx[j]);
-        d += i32::from(x[0]) * s[0]
-            + i32::from(x[1]) * s[1]
-            + i32::from(x[2]) * s[2]
-            + i32::from(x[3]) * s[3]
-            + i32::from(x[4]) * s[4]
-            + i32::from(x[5]) * s[5]
-            + i32::from(x[6]) * s[6]
-            + i32::from(x[7]) * s[7];
+        for l in 0..8 {
+            acc[l] += i32::from(x[l]) * s[l];
+        }
     }
-    d
+    acc.iter().sum()
 }
 
 /// The lists of one cell's rows by coarse bisection and flat integer
