@@ -9,3 +9,4 @@ pub mod doc;
 pub mod fixtures;
 pub mod oracle;
 pub mod strategies;
+pub mod tlsh;
