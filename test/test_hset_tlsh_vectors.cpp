@@ -333,6 +333,30 @@ TEST_CASE("hset_tlsh_options_bit_1_is_ignored") {
   }
 }
 
+TEST_CASE("hset_tlsh_ftoc_reserves_one_entry_per_tlsh_field") {
+  // The FTOC (at 40, after the magic and the SHA-256) is sized before the
+  // TLSH options are known, with room for the TIVF of the TLSH field
+  // whether or not it is written, and FHDR follows the room. For md5 and
+  // tlsh with records the room is FTOC FHDR RHDR RDAT, HH HINT HDAT RIDX
+  // per field, TIVF, FEND: 14 entries. Hashsets only, it is FTOC FHDR,
+  // HH HINT HDAT per field, TIVF, FEND and the one spare entry that
+  // count_chunks_hashsets_only has always reserved: 11. Reserving two
+  // entries per TLSH field (as when TVEC existed) moves FHDR by 12.
+  for (const bool records: { true, false }) {
+    const uint64_t reserved = records ? 14 : 11;
+    for (const uint32_t opts: { 0u, INDEX }) {
+      INFO("records " << records << ", options " << opts);
+      const Built b = build(true, "test/tlsh_ftoc_room.hset", records, true, opts);
+      REQUIRE(b.toc.entries.size() >= 2);
+      CHECK(b.toc.entries[0] == std::make_pair(uint64_t(40), uint32_t(Chunk::FTOC)));
+      CHECK(b.toc.entries[1] == std::make_pair(40 + 12 + 12 * reserved, uint32_t(Chunk::FHDR)));
+      // the entries written: the room less the TIVF when it is not
+      // written, and less the spare hashsets-only entry
+      CHECK(b.toc.entries.size() == reserved - (opts & INDEX ? 0 : 1) - (records ? 0 : 1));
+    }
+  }
+}
+
 TEST_CASE("hset_tlsh_vectors_non_tlsh_only") {
   // a file without a TLSH field never has a TIVF (nor a TVEC), whatever the
   // options
