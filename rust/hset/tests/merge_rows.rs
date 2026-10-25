@@ -428,7 +428,7 @@ proptest! {
             let first = j == 0 || r[j - 1] != *row;
             let at = want.iter().position(|w| w == row);
             let expect = match at {
-                Some(k) if first && !ls.contains(&row.to_vec()) => k as u32,
+                Some(k) if first && !ls.contains(row.as_slice()) => k as u32,
                 _ => D,
             };
             prop_assert_eq!(m.rmap[j], expect, "right row {}", j);
@@ -537,7 +537,7 @@ fn table_bytes(types: &[HashType], recs: &[ModelRecord]) -> (RecordHeader, Vec<V
 fn unlayout(types: &[HashType], bytes: &[u8]) -> ModelRecord {
     types
         .iter()
-        .zip(bytes.chunks_exact(2))
+        .zip(bytes.as_chunks::<2>().0)
         .map(|(&t, pv)| (t, (pv[0] == 1).then_some(pv[1])))
         .collect()
 }
