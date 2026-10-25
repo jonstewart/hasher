@@ -288,14 +288,18 @@ impl Builder {
             let mut off = 0usize;
             for f in &self.fields {
                 let hlen = f.length as usize;
-                // (record index, hash) for present values, sorted by hash then index.
+                // Record indices of the present values, sorted by hash, and
+                // equal hashes by descending record index: the C++ encoder
+                // sorts (hash, index) pairs with `HashRecordProxy::cmp`
+                // (record_iterator.h), which orders equal hashes that way
+                // for every type, so the RIDX payloads match.
                 let mut idx: Vec<u32> = (0..record_count)
                     .filter(|&r| records[r * rl + off] == 1)
                     .map(|r| r as u32)
                     .collect();
                 let hash_of =
                     |r: u32| &records[r as usize * rl + off + 1..r as usize * rl + off + 1 + hlen];
-                idx.sort_unstable_by(|&a, &b| hash_of(a).cmp(hash_of(b)).then(a.cmp(&b)));
+                idx.sort_unstable_by(|&a, &b| hash_of(a).cmp(hash_of(b)).then(b.cmp(&a)));
                 if !opts.with_records {
                     idx.dedup_by(|a, b| hash_of(*a) == hash_of(*b));
                 }
@@ -636,15 +640,20 @@ mod tests {
         let md5s = &f.sections[0];
         assert_eq!(md5s.len(), 2); // md5 present in two distinct records
         // Records sort bytewise, so the record with an absent md5 (presence
-        // byte 0) is record 0; the two md5-bearing records are 1 and 2.
-        assert_eq!(md5s.record_index(0), Some(1));
-        assert_eq!(md5s.record_index(1), Some(2));
+        // byte 0) is record 0; the two md5-bearing records are 1 and 2,
+        // and equal hashes list their records in descending order, as the
+        // C++ encoder's `HashRecordProxy::cmp` sorts them.
+        assert_eq!(md5s.record_index(0), Some(2));
+        assert_eq!(md5s.record_index(1), Some(1));
         assert!(md5s.hint.is_some());
         let shas = &f.sections[1];
         assert_eq!(shas.len(), 2);
-        // Records are sorted bytewise: the record with absent md5 (presence 0) sorts first.
+        // Records are sorted bytewise: the record with absent md5 (presence
+        // 0) sorts first, and the sha is in it and in record 2, listed
+        // descending.
         assert_eq!(f.record(0).unwrap()[0], 0);
-        assert_eq!(shas.record_index(0), Some(0));
+        assert_eq!(shas.record_index(0), Some(2));
+        assert_eq!(shas.record_index(1), Some(0));
     }
 
     #[test]

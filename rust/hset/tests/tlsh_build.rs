@@ -10,7 +10,8 @@ use hset::builder::{format_value, parse_value, write_value};
 use hset::format::{FieldDescriptor, Hint, decode};
 use hset::tlsh::TlshDigest;
 use hset::{BuildOptions, Builder, Error, HashType, HintSpec};
-use hset_testkit::tlsh::{VEC_HEX, example_digests, fake_md5, naive_cell_index};
+use hset_testkit::tlsh::{VEC_HEX, example_digests, example_text, fake_md5, naive_cell_index};
+use sha2::{Digest, Sha256};
 
 fn tlsh_field() -> FieldDescriptor {
     FieldDescriptor::for_type(HashType::Tlsh).unwrap()
@@ -182,4 +183,132 @@ fn the_tlsh_section_gets_the_cell_hint_whatever_hint_the_options_ask_for() {
             assert_eq!(m.hint.is_none(), spec == HintSpec::None, "{spec:?}");
         }
     }
+}
+
+/// The SHA-256 of `b` in hex.
+fn sha256(b: &[u8]) -> String {
+    hset::hex::encode(&Sha256::digest(b))
+}
+
+/// A HINT chunk's payload: the tag, big-endian, then the table.
+fn hint_payload(h: Hint) -> Vec<u8> {
+    let (tag, table) = match h {
+        Hint::Block { table, .. } | Hint::Hull { table, .. } | Hint::TlshCells { table } => {
+            (h.tag(), table)
+        }
+        Hint::Unknown { tag, data } => (tag, data),
+    };
+    let mut v = tag.to_be_bytes().to_vec();
+    v.extend_from_slice(table);
+    v
+}
+
+/// The SHA-256s of one section's payloads: HDAT, HINT, RIDX.
+#[derive(Debug, PartialEq)]
+struct SectionShas {
+    rows: usize,
+    hdat: String,
+    hint: Option<String>,
+    ridx: Option<String>,
+}
+
+/// The payload SHA-256s of a file: RDAT, the md5 and TLSH sections, and
+/// the record count.
+struct FileShas {
+    rdat: Option<String>,
+    md5: SectionShas,
+    tlsh: SectionShas,
+    records: usize,
+}
+
+fn payload_shas(bytes: &[u8]) -> FileShas {
+    let f = decode(bytes).unwrap();
+    let shas = |t| {
+        let s = &f.sections[f.section_for(t).unwrap()];
+        SectionShas {
+            rows: s.len(),
+            hdat: sha256(s.data),
+            hint: s.hint.map(|h| sha256(&hint_payload(h))),
+            ridx: s.ridx.map(sha256),
+        }
+    };
+    FileShas {
+        rdat: f.rdat.map(sha256),
+        md5: shas(HashType::Md5),
+        tlsh: shas(HashType::Tlsh),
+        records: f.record_count(),
+    }
+}
+
+/// The file `test_hset_tlsh.cpp` writes from `example_text(tlsh_first)`,
+/// built here with the legacy hint so the md5 section's hint is C++'s too.
+fn build_example(tlsh_first: bool, with_records: bool) -> Vec<u8> {
+    let types = if tlsh_first {
+        [HashType::Tlsh, HashType::Md5]
+    } else {
+        [HashType::Md5, HashType::Tlsh]
+    };
+    let mut b = Builder::new(&types).unwrap();
+    assert_eq!(b.add_text(&example_text(tlsh_first)).unwrap(), 83);
+    b.build(&opts().hint(HintSpec::LEGACY).records(with_records))
+        .unwrap()
+}
+
+const TLSH_HDAT: &str = "1fff9e9fd92b2476394602397d5b50da43c541228f673d04c6e750453edfd8eb";
+const TLSH_HINT: &str = "8259168b3f4538826c863bfdfbad819ca9007f80a421c31f124ce9317aec4669";
+const MD5_HDAT: &str = "e078787ee34651399985009d7378dd4ebbc5cb946093e35cbd73cbd3ab74d467";
+const MD5_LEGACY_HINT: &str = "42b51c20c1c4fa6b9c11f24e56eb5f3af6987b6aa4e21cb07a656b2cb824b4fe";
+
+fn some(x: &str) -> Option<String> {
+    Some(x.to_string())
+}
+
+/// md5_tlsh.hset: the parity plan's golden payloads (3.1); the md5 RIDX
+/// SHA is the C++ fixture's.
+#[test]
+fn md5_tlsh_payloads_equal_the_cpp_encoders() {
+    let got = payload_shas(&build_example(false, true));
+    assert_eq!(got.records, 83);
+    assert_eq!(
+        got.rdat,
+        some("408953dc8344947baffec8bb2c03081998cd0425dabcad56661e289bf437eae7")
+    );
+    assert_eq!(
+        got.tlsh,
+        SectionShas {
+            rows: 81,
+            hdat: TLSH_HDAT.into(),
+            hint: some(TLSH_HINT),
+            ridx: some("25bf41f60bad0e594fab58cfd12b94becb4e9c9fbab619f9bdd50c0d41636694"),
+        }
+    );
+    assert_eq!(
+        got.md5,
+        SectionShas {
+            rows: 83,
+            hdat: MD5_HDAT.into(),
+            hint: some(MD5_LEGACY_HINT),
+            ridx: some("46dcdd0fd4a6c98d5e49ec05a41487b7d38bd67c1aff3efa400ed7ce1917231a"),
+        }
+    );
+}
+
+/// The duplicated digest 7 is two rows, one per record, the later record
+/// first (the plan's rows 57 and 58, records 82 and 7: md5s are distinct
+/// and sort the records, and fake_md5(82) sorts last of the 83).
+#[test]
+fn duplicate_tlsh_rows_list_their_records_in_descending_order() {
+    let bytes = build_example(false, true);
+    let f = decode(&bytes).unwrap();
+    let s = &f.sections[f.section_for(HashType::Tlsh).unwrap()];
+    let dup = TlshDigest::from_hex(&example_digests()[7]).unwrap();
+    let rows: Vec<usize> = (0..s.len())
+        .filter(|&i| s.hash(i) == dup.as_bytes())
+        .collect();
+    assert_eq!(rows, [57, 58]);
+    assert_eq!(s.record_index(57), Some(82));
+    assert_eq!(s.record_index(58), Some(7));
+    let md5_of = |r: u64| hset::hex::encode(&f.record(r as usize).unwrap()[1..17]);
+    assert_eq!(md5_of(82), fake_md5(82));
+    assert_eq!(md5_of(7), fake_md5(7));
 }

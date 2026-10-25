@@ -171,7 +171,9 @@ impl Doc {
                     .filter(|(_, r)| r[off] == 1)
                     .map(|(i, r)| (r[off + 1..off + 1 + hlen].to_vec(), i as u64))
                     .collect();
-                present.sort();
+                // By hash, equal hashes by descending record index (the
+                // C++ encoder's HashRecordProxy::cmp, record_iterator.h).
+                present.sort_by(|a, b| a.0.cmp(&b.0).then(b.1.cmp(&a.1)));
                 if !opts.with_records {
                     present.dedup_by(|a, b| a.0 == b.0);
                 }
@@ -430,7 +432,8 @@ pub(crate) mod tests {
         assert_eq!(md5.name, "md5");
         assert_eq!(md5.hash_length, 16);
         assert_eq!(md5.hashes, vec![MD5.to_vec(), MD5.to_vec()]);
-        assert_eq!(md5.ridx, Some(vec![2, 3]));
+        // Equal hashes list their records in descending order.
+        assert_eq!(md5.ridx, Some(vec![3, 2]));
         let sizes = &e.sections[1];
         assert_eq!(sizes.htype, HashType::Size);
         assert_eq!(sizes.name, "sizes");
@@ -482,8 +485,9 @@ pub(crate) mod tests {
         );
         let md5 = &f.sections[f.section_for(HashType::Md5).unwrap()];
         assert_eq!(md5.len(), 2);
-        assert_eq!(md5.record_index(0), Some(2));
-        assert_eq!(md5.record_index(1), Some(3));
+        // Equal hashes list their records in descending order.
+        assert_eq!(md5.record_index(0), Some(3));
+        assert_eq!(md5.record_index(1), Some(2));
     }
 
     #[test]
