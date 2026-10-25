@@ -600,3 +600,21 @@ fn query_takes_t1_hex_for_a_tlsh_section() {
     let o = run(&["query", p(&f), "-t", "tlsh", &format!("{present}0")]);
     assert_eq!(o.status.code(), Some(2), "{}", stdout(&o));
 }
+
+#[test]
+fn info_reports_the_tlsh_cell_hint_and_index() {
+    let dir = tmpdir("tlsh-info");
+    let f = dir.join("t.hset");
+    made_tlsh(&f, &[]);
+    let o = run(&["info", p(&f)]);
+    assert!(o.status.success(), "{}", stderr(&o));
+    // 76 lists over 81 rows (plan 3.1): 32 + 262148 + 48*76 + 8 + 4*81
+    // = 266160 bytes.
+    let s = stdout(&o);
+    assert!(
+        s.contains("      tlsh: cell hint yes; index TIVF, 76 lists (259.9 KiB)\n"),
+        "{s}"
+    );
+    // The md5 section has no TLSH line.
+    assert_eq!(s.matches("tlsh: ").count(), 1, "{s}");
+}

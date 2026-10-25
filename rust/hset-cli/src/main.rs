@@ -9,7 +9,7 @@ use std::time::Instant;
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use hset::format::{self, Document, HashsetIn, HsetFile};
 use hset::lookup::{self, BatchMode, BitsPolicy, HintSpec, SearchConfig, SingleMode};
-use hset::tlsh::{DIGEST_LENGTH as TLSH_LENGTH, TlshDigest};
+use hset::tlsh::{DIGEST_LENGTH as TLSH_LENGTH, IvfIndex, TivfView, TlshDigest};
 use hset::{BuildOptions, Builder, HashType, Hashset, SetOp, builder, hex, ops, synth};
 
 #[derive(Parser)]
@@ -361,6 +361,31 @@ fn cmd_make(a: MakeArgs) -> CliResult<()> {
     summarize(&bytes, &a.out.output)
 }
 
+/// What `info` says of TLSH section `idx` beyond its hint: whether it has
+/// the `0x7400` cell hint, and its `TIVF` index's list count and size;
+/// `None` for a section that is not a TLSH section of 36-byte digests.
+/// The index is not validated here (`verify` does that).
+fn tlsh_info(hs: &Hashset<'_>, idx: usize) -> CliResult<Option<String>> {
+    let Ok(rows) = hs.tlsh_rows(idx) else {
+        return Ok(None);
+    };
+    let s = hs.section(idx);
+    let cells = if matches!(s.hint, Some(format::Hint::TlshCells { .. })) {
+        "yes"
+    } else {
+        "no"
+    };
+    let index = match s.tivf {
+        // Hashset::load parsed the header, so this cannot fail.
+        Some(payload) => {
+            let view = TivfView::parse(payload, rows.len() as u64).map_err(|e| e.to_string())?;
+            format!("TIVF, {} lists ({})", view.lists(), human(payload.len()))
+        }
+        None => "none".to_string(),
+    };
+    Ok(Some(format!("cell hint {cells}; index {index}")))
+}
+
 fn cmd_info(a: InfoArgs) -> CliResult<()> {
     let m = map_file(&a.file)?;
     let hs = load(&m, &a.file)?;
@@ -423,6 +448,9 @@ fn cmd_info(a: InfoArgs) -> CliResult<()> {
             lk.describe(),
             human(lk.table_bytes())
         );
+        if let Some(line) = tlsh_info(&hs, i)? {
+            let _ = writeln!(w, "      tlsh: {line}");
+        }
     }
     if a.chunks {
         let _ = writeln!(w, "chunks:");
