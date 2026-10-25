@@ -209,8 +209,10 @@ impl Builder {
     }
 
     /// Add a record from a line of text: one space-separated column per
-    /// field, hex for digests and a decimal integer for sizes. An empty
-    /// column means the value is absent; blank lines are ignored. One line
+    /// field, hex for digests, the `T1` hex form for TLSH (see
+    /// [`parse_value`]) and a decimal integer for sizes. An empty column
+    /// means the value is absent, as does `"TNULL"` or any other null
+    /// digest in a TLSH column; blank lines are ignored. One line
     /// ending (`"\n"`, `"\r\n"` or a lone `'\r'`) is stripped; any further
     /// `'\r'` is part of the last column. Called directly, this is the
     /// whole rule; through [`add_text`](Self::add_text) or the CLI,
@@ -355,6 +357,9 @@ impl Builder {
                     data: &p.data,
                     hint: p.hint.as_ref().map(|(t, b)| (*t, b.as_slice())),
                     ridx: p.ridx.as_deref(),
+                    // The TIVF index of a TLSH section is not written yet;
+                    // when it is, it is built over `p.data`'s rows, the
+                    // same sorted rows the cell hint was computed from.
                     tivf: None,
                 })
                 .collect(),
