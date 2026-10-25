@@ -27,6 +27,9 @@ pub mod mt64;
 pub mod order;
 
 pub use digest::{DIGEST_LENGTH, HEX_LENGTH, TlshDigest};
+pub use distance::{
+    BodyQuery, body_diff, diff, emb_body_dist2, header_diff, l_cost, mod_diff, q_cost,
+};
 
 /// Number of cells: one per (L, Q) header, `cell = (L << 8) | Q`.
 pub const CELL_COUNT: usize = 65536;

@@ -3,8 +3,24 @@
 //! the reference implementation's vendored scores, the cost tables, and
 //! the body kernel against a bucket-by-bucket reference.
 
-use hset::tlsh::TlshDigest;
-use hset_testkit::tlsh::{VEC_HEX, example_digests};
+use hset::tlsh::{TlshDigest, diff};
+use hset_testkit::tlsh::{VEC_HEX, example_digest_of, example_digests, example_scores};
+
+fn digest(hex: &str) -> TlshDigest {
+    TlshDigest::from_hex(hex).unwrap()
+}
+
+#[test]
+fn diff_matches_reference_scores() {
+    for include_length in [true, false] {
+        for (a, b, score) in example_scores(include_length) {
+            let da = digest(&example_digest_of(&a));
+            let db = digest(&example_digest_of(&b));
+            assert_eq!(diff(&da, &db, include_length), Some(score), "{a} {b}");
+            assert_eq!(diff(&db, &da, include_length), Some(score), "{b} {a}");
+        }
+    }
+}
 
 #[test]
 fn hex_round_trips() {

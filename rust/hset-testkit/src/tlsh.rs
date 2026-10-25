@@ -68,7 +68,11 @@ pub fn example_scores(include_length: bool) -> Vec<(String, String, u32)> {
     };
     let text = read_data(name);
     let tokens: Vec<&str> = text.split_whitespace().collect();
-    assert_eq!(tokens.len() % 3, 0, "{name} has a token count not a multiple of 3");
+    assert_eq!(
+        tokens.len() % 3,
+        0,
+        "{name} has a token count not a multiple of 3"
+    );
     let v: Vec<(String, String, u32)> = tokens
         .chunks(3)
         .map(|t| {
@@ -137,7 +141,10 @@ mod tests {
         assert_eq!(lines[81], format!("{} ", fake_md5(81)));
         assert_eq!(lines[82].split(' ').nth(1), lines[7].split(' ').nth(1));
         let f = example_text(true);
-        assert_eq!(f.lines().nth(81), Some(format!(" {}", fake_md5(81)).as_str()));
+        assert_eq!(
+            f.lines().nth(81),
+            Some(format!(" {}", fake_md5(81)).as_str())
+        );
         assert_eq!(
             f.lines().next(),
             Some(format!("{VEC_HEX} {}", fake_md5(0)).as_str())
