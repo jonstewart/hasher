@@ -171,6 +171,149 @@ fn golden_bisect_large() {
 }
 
 //
+// Cells above FLAT_MAX shaped to reach particular BISECT branches. The
+// expected values are those of C++ mkhashset (default HSET_TLSH_OPTIONS,
+// so a default BISECT TIVF) on the same rows written as `md5 tlsh` text,
+// one record per row with a distinct MD5 (so equal rows are kept), and
+// read back with utils/hschunks.py (x86-64 Linux / gcc): the HDAT digest
+// checks that the rows are the ones given, the TIVF digest is the golden.
+//
+
+/// A row of cell (`l`, `q`) whose body is `body` (the hi and lo planes)
+/// with `flips` random body bits flipped, and checksum `checksum`.
+fn shaped_row(
+    g: &mut Mt19937_64,
+    (l, q): (u8, u8),
+    body: &[u8; 32],
+    flips: u64,
+    checksum: u8,
+) -> [u8; 36] {
+    let mut d = [0u8; 36];
+    d[0] = l;
+    d[1] = q;
+    d[HI..HI + 32].copy_from_slice(body);
+    d[CHECKSUM] = checksum;
+    for _ in 0..flips {
+        let bit = (g.next_u64() % 256) as usize;
+        let plane = if bit < 128 { HI } else { LO };
+        d[plane + ((bit % 128) >> 3)] ^= 1u8 << (bit & 7);
+    }
+    d
+}
+
+fn random_body(g: &mut Mt19937_64) -> [u8; 32] {
+    std::array::from_fn(|_| (g.next_u64() & 0xFF) as u8)
+}
+
+/// `n` rows around `body`, each with up to 7 random bit flips and a random
+/// checksum (equal rows possible and kept).
+fn blob(g: &mut Mt19937_64, cell: (u8, u8), body: &[u8; 32], n: usize) -> Vec<[u8; 36]> {
+    (0..n)
+        .map(|_| {
+            let flips = g.next_u64() % 8;
+            let checksum = (g.next_u64() & 0xFF) as u8;
+            shaped_row(g, cell, body, flips, checksum)
+        })
+        .collect()
+}
+
+/// Three cells above FLAT_MAX, sorted, equal rows kept:
+///
+/// * (10, 0x11), 4800 rows: blobs of 600 and 4200 rows around two random
+///   bodies. Whichever blob the random first pivot falls in, the split
+///   puts the 600-row blob on one side, exactly an eighth of the node:
+///   kept (`600 * 8 < 4800` is false), not replaced by a median split.
+/// * (20, 0x22), 4800 rows: blobs of 250 and 4550, a split leaving less
+///   than an eighth, so a median split.
+/// * (30, 0x33), 4600 rows, duplicate-heavy: 3000 rows of body A (all
+///   buckets 0), 800 of body B1 (buckets of bytes 0..8 of both planes 3),
+///   800 of body B2 (bytes 8..16), checksums 0..4, no flips, so hundreds of
+///   copies of each row. A and B1, A and B2 are 320 apart, B1 and B2 640:
+///   from a first pivot in A, B1 and B2 tie as the farthest, and the
+///   tie (to the smaller index) decides which joins A.
+fn shaped_corpus() -> Vec<[u8; 36]> {
+    let mut g = Mt19937_64::new(0x5eed03);
+    let mut rows = Vec::new();
+    for (cell, small, large) in [((10, 0x11), 600, 4200), ((20, 0x22), 250, 4550)] {
+        let (a, b) = (random_body(&mut g), random_body(&mut g));
+        rows.extend(blob(&mut g, cell, &a, small));
+        rows.extend(blob(&mut g, cell, &b, large));
+    }
+    let mut b1 = [0u8; 32];
+    b1[..8].fill(0xFF);
+    b1[16..24].fill(0xFF);
+    let mut b2 = [0u8; 32];
+    b2[8..16].fill(0xFF);
+    b2[24..32].fill(0xFF);
+    for (body, n) in [([0u8; 32], 3000), (b1, 800), (b2, 800)] {
+        for _ in 0..n {
+            let checksum = (g.next_u64() % 4) as u8;
+            rows.push(shaped_row(&mut g, (30, 0x33), &body, 0, checksum));
+        }
+    }
+    rows.sort_unstable();
+    rows
+}
+
+/// One cell (40, 0x44) of 9000 rows in families of 20 (as
+/// [`golden_corpus`]), more than twice FLAT_MAX, so splits nest at least
+/// two deep before the nodes fit FLAT_MAX.
+fn deep_corpus() -> Vec<[u8; 36]> {
+    golden_corpus(0x5eed04, &[CellSpec { l: 40, rows: 9000 }], 20)
+        .into_iter()
+        .map(|mut r| {
+            r[1] = 0x44;
+            r
+        })
+        .collect()
+}
+
+/// SHA-256 of `rows` as an HDAT payload.
+fn hdat_sha(rows: &[[u8; 36]]) -> String {
+    sha256_hex(rows.as_flattened())
+}
+
+#[test]
+fn golden_bisect_shaped_cells() {
+    let rows = shaped_corpus();
+    assert_eq!(
+        hdat_sha(&rows),
+        "ca02ee035a9f61628829d53d2824e2ab2df89e0a9e62b9dcc65979e1c6437e26",
+        "the rows differ from those given to mkhashset"
+    );
+    let ivf = build_tlsh_ivf(&rows, &IvfBuildOptions::default()).expect("build");
+    assert_eq!(max_cell_rows(&ivf), 4800);
+    check_golden(
+        &rows,
+        &ivf,
+        14200,
+        305,
+        "64db8bbfb78a9fbc4c9dcc2e9bc3cda12abbfcc04fa3010524b0d0741ed9e1e2",
+    );
+    (&ivf).validate(&rows).expect("valid");
+}
+
+#[test]
+fn golden_bisect_deep_cell() {
+    let rows = deep_corpus();
+    assert_eq!(
+        hdat_sha(&rows),
+        "00c40d2e485911ee9526971fe31b2afc0c1451151e2ec75bd933cb186e53a23b",
+        "the rows differ from those given to mkhashset"
+    );
+    let ivf = build_tlsh_ivf(&rows, &IvfBuildOptions::default()).expect("build");
+    assert!(max_cell_rows(&ivf) > 2 * FLAT_MAX as u64);
+    check_golden(
+        &rows,
+        &ivf,
+        8996,
+        283,
+        "68688620e4f46a377ebc2356af2412fdd471ea024dc5d741a7db2a74efb84b46",
+    );
+    (&ivf).validate(&rows).expect("valid");
+}
+
+//
 // C++-written fixtures (`make check` in the repository root; untracked, so
 // absent files are skipped)
 //
