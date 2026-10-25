@@ -30,11 +30,14 @@ pub enum HashType {
     /// File size, 8-byte little-endian unsigned integer.
     Size = 1 << 13,
     QuickMd5 = 1 << 14,
+    /// TLSH locality-sensitive digest in libhasher's 36-byte canonical form
+    /// (see [`crate::tlsh::TlshDigest`]).
+    Tlsh = 1 << 15,
 }
 
 impl HashType {
     /// Every type, in ascending bit order.
-    pub const ALL: [HashType; 15] = [
+    pub const ALL: [HashType; 16] = [
         HashType::Md5,
         HashType::Sha1,
         HashType::Sha2_224,
@@ -50,6 +53,7 @@ impl HashType {
         HashType::Entropy,
         HashType::Size,
         HashType::QuickMd5,
+        HashType::Tlsh,
     ];
 
     /// The bit-flag value.
@@ -93,6 +97,7 @@ impl HashType {
             HashType::Entropy => "Entropy",
             HashType::Size => "Size",
             HashType::QuickMd5 => "Quick MD5",
+            HashType::Tlsh => "TLSH",
         }
     }
 
@@ -115,6 +120,7 @@ impl HashType {
             HashType::Entropy => "entropy",
             HashType::Size => "sizes",
             HashType::QuickMd5 => "quick_md5",
+            HashType::Tlsh => "tlsh",
         }
     }
 
@@ -128,14 +134,20 @@ impl HashType {
             HashType::Sha2_384 | HashType::Sha3_384 => Some(48),
             HashType::Sha2_512 | HashType::Sha3_512 => Some(64),
             HashType::Entropy | HashType::Size => Some(8),
+            HashType::Tlsh => Some(36),
             HashType::Fuzzy => None,
         }
     }
 
     /// Whether values of this type are cryptographic digests, i.e. uniformly
     /// distributed, which is what makes position prediction worthwhile.
+    /// TLSH rows are not: they cluster by their (L, Q) header, and their
+    /// sections use the cell index hint instead.
     pub const fn is_digest(self) -> bool {
-        !matches!(self, HashType::Fuzzy | HashType::Entropy | HashType::Size)
+        !matches!(
+            self,
+            HashType::Fuzzy | HashType::Entropy | HashType::Size | HashType::Tlsh
+        )
     }
 
     /// Whether this type can be stored as a fixed-width field in an `.hset`.
@@ -168,6 +180,7 @@ impl HashType {
             "entropy" => HashType::Entropy,
             "size" | "sizes" => HashType::Size,
             "quickmd5" => HashType::QuickMd5,
+            "tlsh" => HashType::Tlsh,
             _ => return Err(Error::input(format!("unknown hash type '{name}'"))),
         };
         Ok(t)
@@ -229,6 +242,21 @@ mod tests {
         assert!(!HashType::Size.is_digest());
         assert!(HashType::Blake3.is_digest());
     }
+
+    #[test]
+    fn tlsh_is_type_2_15_of_36_bytes() {
+        assert_eq!(HashType::from_log2(15), Some(HashType::Tlsh));
+        assert_eq!(HashType::from_bits(1 << 15), Some(HashType::Tlsh));
+        assert_eq!(HashType::Tlsh.length(), Some(36));
+        assert_eq!(HashType::Tlsh.name(), "TLSH");
+        assert_eq!(HashType::Tlsh.field_name(), "tlsh");
+        assert_eq!(HashType::parse("tlsh").ok(), Some(HashType::Tlsh));
+        assert_eq!(HashType::parse("TLSH").ok(), Some(HashType::Tlsh));
+        assert!(HashType::Tlsh.is_storable());
+        assert!(!HashType::Tlsh.is_digest());
+        assert_eq!(HashType::ALL.len(), 16);
+        assert_eq!(HashType::ALL.last(), Some(&HashType::Tlsh));
+    }
 }
 
 #[cfg(test)]
@@ -266,7 +294,7 @@ mod proptests {
         }
 
         #[test]
-        fn from_log2_rejects_out_of_range(v in 15u16..) {
+        fn from_log2_rejects_out_of_range(v in 16u16..) {
             prop_assert_eq!(HashType::from_log2(v), None);
         }
     }
@@ -278,7 +306,7 @@ mod proofs {
 
     /// Over one minute: about 63 s of verification under Kani 0.68.
     #[kani::proof]
-    #[kani::unwind(16)]
+    #[kani::unwind(17)]
     fn from_log2_and_from_bits_invert_accessors() {
         for t in HashType::ALL {
             assert!(HashType::from_log2(t.log2()) == Some(t));
@@ -287,18 +315,18 @@ mod proofs {
     }
 
     #[kani::proof]
-    #[kani::unwind(16)]
+    #[kani::unwind(17)]
     fn from_log2_none_out_of_range() {
         let v: u16 = kani::any();
-        kani::assume(v >= 15);
+        kani::assume(v >= 16);
         assert!(HashType::from_log2(v).is_none());
     }
 
     #[kani::proof]
-    #[kani::unwind(16)]
+    #[kani::unwind(17)]
     fn from_bits_none_for_non_members() {
         let bits: u32 = kani::any();
-        kani::assume(bits.count_ones() != 1 || bits >= 1 << 15);
+        kani::assume(bits.count_ones() != 1 || bits >= 1 << 16);
         assert!(HashType::from_bits(bits).is_none());
     }
 }

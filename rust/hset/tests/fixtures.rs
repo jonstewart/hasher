@@ -96,9 +96,9 @@ fn all_fixtures_decode_and_verify() {
                 // 0123456789_*.hset and test1.hset are version-1 files, which
                 // neither this crate nor the C++ decoder reads.
                 Err(e) if e.to_string().contains("version 1") => continue,
-                // The C++ suite also writes files with TLSH (2^15) hash sets
-                // or record fields, which this crate does not read yet.
-                Err(e) if e.to_string().ends_with("type 2^15") => continue,
+                // The C++ suite also writes TLSH hash sets with TIVF
+                // chunks, which this crate does not read yet.
+                Err(e) if e.to_string().ends_with("unknown chunk type TIVF") => continue,
                 Err(e) => panic!("{name}: {e}"),
             };
             let report = hs.verify();
