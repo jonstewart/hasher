@@ -2,6 +2,7 @@
 //! (merge_rows_sets, merge_rows_records, the differing-fields record
 //! merges) plus proptests against `BTreeSet` / `BTreeMap` models.
 
+use hset::Error;
 use hset::merge::{DROPPED, RECORD_DROPPED, RowMerge, RowMode, RowOwners, merge_rows};
 use hset::ops::SetOp;
 
@@ -87,4 +88,90 @@ fn record_rows_follow_their_records_and_left_precedes_right_on_ties() {
     assert_eq!(m.n, 4);
     assert_eq!(m.lmap, [0, D, 1, 3]);
     assert_eq!(m.rmap, [2, D]);
+}
+
+#[test]
+fn record_rows_with_collapse_equal_emit_equal_rows_once() {
+    let (lr, rr) = (ridx(&[0, 1, 2, 3]), ridx(&[0, 1]));
+    let lo = RowOwners {
+        ridx: &lr,
+        recmap: &L4_RECMAP,
+    };
+    let ro = RowOwners {
+        ridx: &rr,
+        recmap: &R2_RECMAP,
+    };
+    let m = records(&L4, lo, &R2, ro, true);
+    // 0,1 (l0) 0,3 (l2) 0,5 (l3); r0 equals l2 and is dropped
+    assert_eq!(m.n, 3);
+    assert_eq!(m.lmap, [0, D, 1, 2]);
+    assert_eq!(m.rmap, [D, D]);
+
+    // equal rows of kept records on one side: both stay unless collapsed
+    let lr = ridx(&[1, 0]);
+    let lo = RowOwners {
+        ridx: &lr,
+        recmap: &[0, 1],
+    };
+    let ro = RowOwners {
+        ridx: &[],
+        recmap: &[],
+    };
+    assert_eq!(records(&[0, 3, 0, 3], lo, &[], ro, false).lmap, [0, 1]);
+    assert_eq!(records(&[0, 3, 0, 3], lo, &[], ro, true).lmap, [0, D]);
+}
+
+#[test]
+fn merge_rows_rejects_bad_row_shapes() {
+    let set = RowMode::Set(SetOp::Union);
+    assert!(matches!(merge_rows(&[], &[], 0, set), Err(Error::Input(_))));
+    assert!(matches!(
+        merge_rows(&[0, 1, 2], &[], 2, set),
+        Err(Error::Input(_))
+    ));
+    assert!(matches!(
+        merge_rows(&[], &[0], 2, set),
+        Err(Error::Input(_))
+    ));
+}
+
+#[test]
+fn merge_rows_rejects_owners_that_disagree_with_the_rows() {
+    let none = RowOwners {
+        ridx: &[],
+        recmap: &[],
+    };
+    let mode = |left, right| RowMode::Records {
+        left,
+        right,
+        collapse_equal: false,
+    };
+    // a record index shorter than the rows, or ragged
+    let short = ridx(&[0]);
+    let lo = RowOwners {
+        ridx: &short,
+        recmap: &[0, 1],
+    };
+    assert!(matches!(
+        merge_rows(&L4[..4], &[], 2, mode(lo, none)),
+        Err(Error::Input(_))
+    ));
+    let ragged = [0u8; 15];
+    let ro = RowOwners {
+        ridx: &ragged,
+        recmap: &[0, 1],
+    };
+    assert!(matches!(
+        merge_rows(&[], &R2, 2, mode(none, ro)),
+        Err(Error::Input(_))
+    ));
+    // a row naming a record past the record map
+    let far = ridx(&[0, 2]);
+    let ro = RowOwners {
+        ridx: &far,
+        recmap: &[0, 1],
+    };
+    let e = merge_rows(&[], &R2, 2, mode(none, ro)).unwrap_err();
+    assert!(matches!(e, Error::Format(_)), "{e}");
+    assert!(e.to_string().contains("right row 1 names record 2"), "{e}");
 }

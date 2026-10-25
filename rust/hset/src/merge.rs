@@ -61,7 +61,10 @@ pub struct RowMerge {
 /// Merges two sorted runs of `len`-byte rows (`left` and `right` hold the
 /// rows back to back). Output row `k` is the input row mapped to `k`.
 pub fn merge_rows(left: &[u8], right: &[u8], len: usize, mode: RowMode<'_>) -> Result<RowMerge> {
-    let (l, r) = (Rows::new(left, len), Rows::new(right, len));
+    let (l, r) = (
+        Rows::new(left, len, "left")?,
+        Rows::new(right, len, "right")?,
+    );
     let mut m = RowMerge {
         n: 0,
         lmap: vec![DROPPED; l.n],
@@ -120,12 +123,21 @@ struct Rows<'a> {
 }
 
 impl<'a> Rows<'a> {
-    fn new(data: &'a [u8], len: usize) -> Self {
-        Rows {
+    fn new(data: &'a [u8], len: usize, side: &str) -> Result<Self> {
+        if len == 0 {
+            return Err(Error::input("zero-length rows"));
+        }
+        if data.len() % len != 0 {
+            return Err(Error::input(format!(
+                "the {side} rows have {} bytes, not a multiple of the row length {len}",
+                data.len()
+            )));
+        }
+        Ok(Rows {
             data,
             len,
             n: data.len() / len,
-        }
+        })
     }
 
     fn get(&self, i: usize) -> &'a [u8] {
