@@ -37,6 +37,8 @@ import svgchart as sc  # noqa: E402
 SQL_DIR = os.path.join(HERE, 'sql')
 BUILD_COMMIT = '5351b8d'   # configure: -O3 and -mpopcnt
 CROWDSTRIKE_RECALL = 0.99
+M5_US = 13.0       # the user's M5 figure: kNN at 1M synthetic rows, k = 10, T = 144
+M5_ROWS = 4659     # rows scanned per query at 1M, BISECT (docs/BENCHMARKS.md §9)
 TEXT_COLUMNS = {'qset', 'method', 'metric', 'pass', 'comparison', 'check_name', 'which', 'sha256', 'digest'}
 INT_RE = re.compile(r'^-?[0-9]+$')
 METHODS = ['brute', 'index', 'embed']
@@ -167,6 +169,13 @@ def qset_order(qsets):
     return sorted(qsets, key=lambda q: (pref.get(q, 9), q))
 
 
+def load_json(path):
+    if not path:
+        return None
+    with open(path) as f:
+        return json.load(f)
+
+
 def git(repo, *args):
     try:
         r = subprocess.run(['git', '-C', repo, *args], text=True, capture_output=True)
@@ -186,6 +195,22 @@ def build_db(db, args, run):
         db.script(load_sql('knn_metrics.sql', {
             '@K@': str(run['params']['k']), '@N_ROWS@': str(n_rows),
             '@N_NONNULL@': str(n_rows - run['hset'].get('null_rows', 0))}), 'knn_metrics.sql')
+    if args.knn and args.hset:
+        csv_path = os.path.join(args.out, 'header_split.csv')
+        env = dict(os.environ)
+        env['LD_LIBRARY_PATH'] = args.libdir + (':' + env['LD_LIBRARY_PATH'] if env.get('LD_LIBRARY_PATH') else '')
+        cmd = [sys.executable, '-I', os.path.join(HERE, 'header_split.py'), '--hset', args.hset, '--knn', args.knn,
+               '--out', csv_path, '--repo', args.repo,
+               '--include-length', 'true' if run['params'].get('include_length', True) else 'false']
+        r = subprocess.run(cmd, env=env)
+        if r.returncode != 0:
+            sys.exit('vs_report: header_split.py failed')
+        db.script(load_sql('header_split.sql', {'@HS_CSV@': sql_str(os.path.abspath(csv_path))}), 'header_split.sql')
+    if args.knn_k10:
+        with open(os.path.join(args.knn_k10, 'run.json')) as f:
+            k10 = json.load(f)
+        db.script(load_sql('knn_k10.sql', {'@K10_DIR@': sql_str(os.path.abspath(args.knn_k10)),
+                                           '@K10_K@': str(k10['params']['k'])}), 'knn_k10.sql')
     if args.found or args.notfound:
         s = load_sql('lookup.sql', {'@FOUND_CSV@': sql_str(os.path.abspath(args.found or '')),
                                     '@NOTFOUND_CSV@': sql_str(os.path.abspath(args.notfound or '')),
@@ -212,11 +237,13 @@ def parse_summary(path):
             p = line.split()
             if len(p) >= 4 and p[1] in METHODS and p[2].isdigit():
                 out['mean_us'][(p[0], p[1])] = float(p[3])
+            m = re.match(r'(\S+): brute/index mismatches (\d+) of (\d+)', line)
+            if m:
+                out['mismatch'][m.group(1)] = int(m.group(2))
             m = re.match(r'(\S+): brute/index mismatches (\d+) of (\d+); embed recall@\d+ naive ([\d.]+), '
                          r'tie-aware ([\d.]+)', line)
             if m:
                 out['recall'][m.group(1)] = (float(m.group(4)), float(m.group(5)))
-                out['mismatch'][m.group(1)] = int(m.group(2))
     return out
 
 
@@ -227,6 +254,9 @@ class Report:
         self.db, self.args, self.run = db, args, run
         self.mf, self.mn = meta_found, meta_notfound
         self.sections = []      # (id, title, html)
+        self.judgements = load_json(args.judgements) or {}
+        self.build_costs = load_json(args.build_costs)
+        self.corpus = load_json(args.corpus)
         self.validation = []    # (item, detail, ok)
         self.facts = {}
 
@@ -590,7 +620,129 @@ distance bounds, so it should get faster as d_k shrinks.</p>{t1}{t2}{fig1}{fig2}
 queries, the number of queries it covers is given in parentheses.</p>{t_ir}{t_frac}{fig_rh}
 <h3>How deep must the embedding ranking go?</h3>{fig_curve}{t_curve}{t_depth}
 <h3>Distance error</h3>{fig_de}{fig_ki}
-<h3>Ranking quality: an example PR curve</h3>{fig_pr}""")
+<h3>Ranking quality: an example PR curve</h3>{fig_pr}{self.header_split_html(qsets)}""")
+
+    def header_split_html(self, qsets):
+        """The header-split diagnostic (--hset): where embed's errors come from."""
+        db = self.db
+        if not db.has_table('header_split_summary'):
+            return ''
+        S = by(db.q('from header_split_summary'), 'qset', 'cat')
+        for c in db.q('from header_split_check order by qset'):
+            self.validation.append((f'header split, {c["qset"]}: header + body/checksum rest = tlsh_dist',
+                                    f'{fint(c["sum_mismatch"])} of {fint(c["n"])} rows differ; library distance '
+                                    f'differs from tlsh_dist on {fint(c["full_mismatch"])}',
+                                    c['sum_mismatch'] == 0 and c['full_mismatch'] == 0
+                                    and c['length_over_header'] == 0))
+        label = {'FP': 'FP: embed result beyond d<sub>k</sub>', 'TP': 'TP: embed result within d<sub>k</sub>',
+                 'MISS': 'MISS: brute result embed missed'}
+        rows = []
+        for q in qsets:
+            for c in ('FP', 'MISS', 'TP'):
+                r = S.get((q, c))
+                if r:
+                    rows.append([escape(q), label[c], fint(r['n']), f'{r["mean_tlsh"]:.1f}', f'{r["mean_header"]:.1f}',
+                                 f'{r["mean_length"]:.1f}', f'{r["mean_quartile"]:.1f}', f'{r["mean_rest"]:.1f}',
+                                 f3(r['header_share']), fpct(r['frac_header_differs']),
+                                 fpct(r['frac_length_differs'])])
+        t = table(['set', 'rows', 'n', 'mean TLSH distance', 'mean header cost', 'of which L', 'of which Q1, Q2',
+                   'mean body + checksum', 'header share', 'header differs', 'L differs'], rows, num_from=2)
+        q0 = qsets[0]
+        fp, miss, tp = S.get((q0, 'FP')), S.get((q0, 'MISS')), S.get((q0, 'TP'))
+        prose = ''
+        if fp and miss and tp:
+            prose = (f'<p>On the {escape(q0)} set, {fpct(fp["frac_header_differs"])} of embed\'s false positives '
+                     f'have a header different from the query\'s, and the header terms make up '
+                     f'{fp["mean_header"]:.1f} TLSH units ({fpct(fp["header_share"], 0)}) of their distance on '
+                     f'average ({fp["mean_length"]:.1f} from the length, {fp["mean_quartile"]:.1f} from the '
+                     f'quartile ratios), while the true neighbours embed misses carry only '
+                     f'{miss["mean_header"]:.1f} units of header cost ({fpct(miss["header_share"], 0)}) and the '
+                     f'true positives {tp["mean_header"]:.1f}. Embed trades rows whose header matches the query and '
+                     f'whose body differs a little more for rows with a closer body and a different length or '
+                     f'quartile ratio, which TLSH charges heavily.</p>')
+        return f"""
+<h3>Why embed misses: the header terms</h3>
+<p>The embedding is a lower bound on TLSH distance built for safe pruning, and its header coordinates are
+much weaker than TLSH's header terms (docs/TLSH_EMBEDDING.md §1): a length difference of k costs k² in the
+embedding against TLSH's 12k for k ≥ 2 (4 against 24 at k = 2), and a quartile-ratio step of 2 costs a chord²
+of 3.85 against 12 (8.11 against 24 for a step of 3). The table splits the TLSH distance of each row into the
+header terms (L, Q1, Q2) and the body + checksum rest, through the library:
+header = tlsh_diff(q, r<sub>header</sub> + q<sub>body</sub>), rest = tlsh_diff(q, q<sub>header</sub> +
+r<sub>body</sub>); the two add up to the row's TLSH distance (checked in Validation). "Header share" is the
+total header cost over the total distance of the rows.</p>{t}{prose}"""
+
+    def knn_k10(self):
+        """The run at the M5 benchmark's settings (--knn-k10)."""
+        db = self.db
+        with open(os.path.join(self.args.knn_k10, 'run.json')) as f:
+            run = json.load(f)
+        self.k10_run = run
+        p = run['params']
+        k = p['k']
+        T = p['max_distance']
+        st = by(db.q('from k10_stats'), 'qset', 'method')
+        ex = by(db.q('from k10_exactness'), 'qset')
+        qsets = qset_order({r['qset'] for r in st.values()})
+        for q in qsets:
+            e = ex[q]
+            self.validation.append((f'k = {k}, T = {T} run, {q}: brute vs index identical (rows, distances, counts)',
+                                    f'rows differ on {fint(e["row_mismatches"])}, distances on '
+                                    f'{fint(e["dist_mismatches"])}, result counts on {fint(e["count_mismatches"])} '
+                                    f'of {fint(e["n_queries"])} queries',
+                                    e['row_mismatches'] == 0 and e['dist_mismatches'] == 0
+                                    and e['count_mismatches'] == 0))
+        summ = parse_summary(os.path.join(self.args.knn_k10, 'summary.txt'))
+        if summ['mean_us']:
+            worst = max(abs(st[key]['mean_us'] - v) for key, v in summ['mean_us'].items() if key in st)
+            self.validation.append((f'k = {k}, T = {T} run: latency means agree with its summary.txt',
+                                    f'largest difference {worst:.2f} µs', worst <= 0.1))
+        if summ['mismatch']:
+            self.validation.append((f'k = {k}, T = {T} run: no mismatches in its summary.txt',
+                                    ', '.join(f'{q} {n}' for q, n in summ['mismatch'].items()),
+                                    all(n == 0 for n in summ['mismatch'].values())))
+        rows = []
+        for q in qsets:
+            for m in ('brute', 'index'):
+                r = st.get((q, m))
+                if not r:
+                    continue
+                rows.append([escape(q), METHOD_LABEL[m], fint(r['n']), us(r['mean_us']), us(r['median_us']),
+                             us(r['p90_us']), us(r['p99_us']), us(r['max_us']),
+                             fint(r['rows_mean']) if m == 'index' else '–',
+                             fint(r['rows_median']) if m == 'index' else '–',
+                             f'{r["mean_results"]:.2f}', f'{fint(r["n_short"])} ({fpct(r["n_short"] / r["n"])})',
+                             f'{fint(r["n_empty"])} ({fpct(r["n_empty"] / r["n"])})'])
+        t = table(['set', 'method', 'n', 'mean', 'median', 'p90', 'p99', 'max', 'rows scanned mean',
+                   'rows scanned median', 'mean results', f'fewer than {k}', 'none'], rows, num_from=2)
+        mi, mb = st.get(('member', 'index')), st.get(('member', 'brute'))
+        ri = st.get(('random', 'index'))
+        note = ''
+        if mi and mb:
+            rows_ratio = mi['rows_median'] / M5_ROWS
+            ns_row = mi['median_us'] * 1000 / mi['rows_median'] if mi['rows_median'] else None
+            note = (f'<p>The M5 reference figure is ~{M5_US:g} µs per query on 1M synthetic digests at these '
+                    f'settings (k = 10, T = 144); the repo\'s own figures for 1M rows are 8.3 µs (the minimum of '
+                    f'repeated passes) with {fint(M5_ROWS)} rows scanned per query for the default BISECT build '
+                    f'(4,848 for KMEANS; docs/BENCHMARKS.md §9, docs/TLSH_EMBEDDING.md §5). Here, on '
+                    f'{fint(run["hset"]["tlsh_rows"])} real digests, the index\'s median member query takes '
+                    f'{us(mi["median_us"])} (mean {us(mi["mean_us"])}) and scans {fint(mi["rows_median"])} rows '
+                    f'(mean {fint(mi["rows_mean"])}): {rows_ratio:.3g}× the M5\'s rows for '
+                    f'{run["hset"]["tlsh_rows"] / 1e6:.3g}× the data, about {ns_row:.3g} ns per scanned row '
+                    f'against {8.3 * 1000 / M5_ROWS:.2g}–{M5_US * 1000 / M5_ROWS:.2g} ns on the M5. Brute force '
+                    f'takes {us(mb["median_us"])}, so the index is {faster(mb["median_us"] / mi["median_us"])} '
+                    f'brute by the medians.')
+            if ri:
+                note += (f' Random queries are fast (median {us(ri["median_us"])}) because '
+                         f'{fpct(ri["n_empty"] / ri["n"])} of them have no row within {T} at all and '
+                         f'{fpct(ri["n_short"] / ri["n"])} have fewer than {k}; the index prunes them almost at '
+                         f'once (median {fint(ri["rows_median"])} rows scanned).')
+            note += '</p>'
+            self.facts['k10'] = {'member_index_median_us': mi['median_us'], 'rows_median': mi['rows_median']}
+        self.add('k10', f'At the M5 benchmark\'s settings: k = {k}, max distance {T}', f"""
+<p>A second run of the same eval on the same hset with k = {k} and max_distance = {T}, brute and index only,
+without the analysis pass (so no recall metrics; brute and index are exact and identical, see Validation).
+With a distance bound a query returns fewer than k results when fewer than k rows lie within {T}.</p>
+{t}{note}""")
 
     def definitions(self, k, deep_k, n_rows):
         return f"""
@@ -676,7 +828,8 @@ inflation</b> = max TLSH distance in E − d<sub>k</sub>; the ratio divides inst
         allb = [b for pn in panels for b in pn['bins']]
         fig2 = figure(sc.hist(panels, sc.fmt_ns, 'latency (log scale, 20 bins per decade)', 'share of lookups (log)',
                               log_x=True, log_y=True, x_domain=(min(b[0] for b in allb), max(b[1] for b in allb)),
-                              yfmt=lambda v: f'{v:g}', label='lookup histogram'),
+                              yfmt=lambda v: f'{v:g}' if v >= 0.001 else f'{v:.0e}'.replace('e-0', 'e-'),
+                              label='lookup histogram'),
                       'Share of lookups per log-spaced latency bin, log y so that the tail shows. The bins beyond '
                       'a few µs are mostly the VM\'s interference (see the noise floor), not the lookup.')
         # timer and noise
@@ -749,6 +902,48 @@ for a few seconds, counting the gaps where the CPU was taken away.</p>{t2}""")
 
     # ------------------------------------------------------------ answers
 
+    def build_cost_rows(self):
+        """--build-costs: the variants, and TVEC / TIVF as differences from the TLSH-only build."""
+        b = self.build_costs
+        if not b or not b.get('variants'):
+            return None
+        V = b['variants']
+        base = next((v for v in V if not v.get('options')), None)
+        if base is None:
+            return None
+        out = {'base': {'wall': base['wall_s'], 'user': base['user_s'], 'bytes': base['bytes']}}
+        rows = []
+        for v in V:
+            d = {'wall': v['wall_s'] - base['wall_s'], 'user': v['user_s'] - base['user_s'],
+                 'bytes': v['bytes'] - base['bytes']}
+            if v.get('options') == 1:
+                out['tvec'] = d
+            elif v.get('options') == 2:
+                out['tivf'] = d
+            rows.append([escape(v['name']), str(v.get('options', '')), f'{v["wall_s"]:,.2f} s', f'{v["user_s"]:,.2f} s',
+                         f'{v["maxrss_kb"] / 2**20:,.2f} GiB' if v['maxrss_kb'] >= 2**20 else
+                         f'{v["maxrss_kb"] / 1024:,.0f} MiB', f'{v["bytes"]:,}',
+                         '–' if v is base else f'{d["wall"]:+,.2f} s',
+                         '–' if v is base else f'{d["user"]:+,.2f} s',
+                         '–' if v is base else f'{d["bytes"] / 1e6:+,.1f} MB'])
+        t = table(['build', 'options', 'wall', 'user CPU', 'max RSS', 'file bytes', 'wall over none',
+                   'CPU over none', 'size over none'], rows, num_from=2)
+        rows_note = ''
+        hrows = (self.run or {}).get('hset', {}).get('tlsh_rows')
+        if b.get('rows') and hrows and b['rows'] != hrows:
+            rows_note = (f' The builds hold {fint(b["rows"])} rows: the {fint(b.get("input_digests"))} input '
+                         f'digests with duplicates collapsed, against {fint(hrows)} TLSH rows in the evaluated '
+                         f'hset (which keeps one row per record), so they understate its costs by about '
+                         f'{fpct(hrows / b["rows"] - 1)}.')
+        out['table'] = (t + f'<p class="note">{escape(b.get("description", ""))}.{rows_note}</p>')
+        return out
+
+    def judgement(self, key, placeholder):
+        j = self.judgements.get(key)
+        if j:
+            return (f'<div class="judgement authored"><p class="jlabel">Author\'s judgement</p>{j}</div>')
+        return f'<p class="judgement">Judgement: {todo(placeholder)}</p>'
+
     def answers(self):
         F, k = self.facts, self.facts.get('k')
         out = []
@@ -795,10 +990,10 @@ which {verdict} the &gt;0.99 CrowdStrike reported. {fpct(fr['p99'])} of queries 
 enough?</h3>
 <p><b>Index (exact).</b> {idx_s}</p>
 <p><b>Pure embedding kNN (approximate).</b></p>{''.join(q1)}
-<p class="judgement">Judgement: {todo('is this close enough for the intended use (e.g. family triage vs '
-                                          'exact near-duplicate search)? Weigh the member set, which resembles '
-                                          'queries for samples like those in the set, against the random set, '
-                                          'which probes far-away client queries (see Caveats).')}</p>
+{self.judgement('q1', 'is this close enough for the intended use (e.g. family triage vs exact '
+                                'near-duplicate search)? Weigh the member set, which resembles queries for samples '
+                                'like those in the set, against the random set, which probes far-away client '
+                                'queries (see Caveats).')}
 </section>""")
 
             n_rows = F['n_rows']
@@ -824,16 +1019,35 @@ brute by the means, {faster(ib['paired_geomean'])} by the per-query geometric me
                     f'{fint(hset["tlsh_rows"])} TLSH rows; the TVEC vectors alone are {fint(n_rows)} × 264 float32 = '
                     f'{tvec / 2**30:.2f} GiB ({fpct(tvec / hset["size_bytes"])} of the file), and TIVF has '
                     f'{fint(hset.get("ivf_lists"))} lists. ')
-            if self.args.build_seconds:
+            bc = self.build_cost_rows()
+            tivf_s = self.args.build_seconds or (bc['tivf']['wall'] if bc and bc.get('tivf') else None)
+            if bc:
+                parts = []
+                if bc.get('tivf'):
+                    parts.append(f'adding TIVF costs {bc["tivf"]["wall"]:,.0f} s of wall time '
+                                 f'({bc["tivf"]["user"]:,.0f} extra CPU-seconds, multithreaded) and '
+                                 f'{bc["tivf"]["bytes"] / 1e6:,.1f} MB')
+                if bc.get('tvec'):
+                    parts.append(f'adding TVEC costs {bc["tvec"]["wall"]:,.0f} s and '
+                                 f'{bc["tvec"]["bytes"] / 1e9:,.2f} GB')
+                cost += (f'Measured separately (table below), over a TLSH-only build of '
+                         f'{bc["base"]["wall"]:,.0f} s, ' + '; '.join(parts) + '. ')
+                rec = (self.build_costs or {}).get('records_build')
+                if rec and rec.get('wall_s'):
+                    cost += (f'The full records hset build ({escape(rec.get("tool", ""))}) took '
+                             f'{rec["wall_s"]:,.0f} s. ')
+            if tivf_s:
                 save = (L[(self.qsets[0], 'brute')]['mean_us'] - L[(self.qsets[0], 'index')]['mean_us']) / 1e6
-                cost += (f'Building the vectors and index took {self.args.build_seconds:,.0f} s; at the '
-                         f'{self.qsets[0]} set\'s mean saving of {save * 1e3:.3g} ms per query, the index repays '
-                         f'that after about {self.args.build_seconds / save:,.0f} queries' if save > 0 else
-                         'The index saves no time per query on average, so the build is never repaid')
+                cost += (f'At the {self.qsets[0]} set\'s mean saving of {save * 1e3:.3g} ms per query, the index '
+                         f'repays its {tivf_s:,.0f} s of build time after about {tivf_s / save:,.0f} queries'
+                         if save > 0 else 'The index saves no time per query on average, so its build is never '
+                         'repaid')
                 cost += '.</p>'
             else:
-                cost += (todo('the TVEC/TIVF build time (pass --build-seconds S to compute the number of queries '
-                              'that repay it)') + '</p>')
+                cost += (todo('the TIVF build time (pass --build-costs FILE or --build-seconds S to compute the '
+                              'number of queries that repay it)') + '</p>')
+            if bc:
+                cost += bc['table']
             ib0 = sp[(self.qsets[0], 'index vs brute')]
             eb0 = sp[(self.qsets[0], 'embed vs brute')]
             out.append(f"""<section class="answer"><h3>2. Do the embeddings give enough of a speed win to justify
@@ -843,9 +1057,9 @@ their construction?</h3>{''.join(q2)}{cost}
 embeddings pay for themselves {'through the index' if ib0['paired_geomean'] > 1.05 else 'in neither use'}
 {'and not as a kNN method of their own' if eb0['ratio_of_means'] < 1.05 else 'and also as a kNN method of their own'}
 on this hardware.</p>
-<p class="judgement">Judgement: {todo('is the index speedup enough to justify the build time and the storage, '
-                                          'and how does it compare with the M5 figure (~13 µs at 1M synthetic, '
-                                          'k = 10, T = 144) given k = 100 and unbounded distance here?')}</p>
+{self.judgement('q2', 'is the index speedup enough to justify the build time and the storage, and how '
+                                'does it compare with the M5 figure (~13 µs at 1M synthetic, k = 10, T = 144) given '
+                                'k = 100 and unbounded distance here?')}
 </section>""")
         if hasattr(self, 'LK'):
             f = self.LK.get('found')
@@ -907,7 +1121,34 @@ on this hardware.</p>
                                'p99 measure the code; p99.9 and max measure the platform.'],
             ['Dates', f'kNN {escape(str(run.get("date", "–")))}; lookup {escape(str(mf.get("date", "–")))}'],
         ]
-        return flag_note + table(['', ''], rows, num_from=99, cls='kv wrap')
+        return flag_note + table(['', ''], rows, num_from=99, cls='kv wrap') + self.corpus_html()
+
+    def corpus_html(self):
+        c = self.corpus
+        if not c:
+            return ''
+        s = (f'<h3>Corpus</h3><p>{fint(c["zips"])} zip archives ({escape(c.get("name", ""))}) with '
+             f'{fint(c["entries"])} entries, hashed into {fint(c["records"])} records')
+        lost = c['entries'] - c['records']
+        if lost:
+            s += (f'; {fint(lost)} entries were lost to {escape(c.get("lost_cause", "damage"))} in '
+                  f'{escape(c.get("lost_zip", "?"))}')
+        s += (f'. {fint(c["tnull"])} samples have no TLSH digest (TNULL), leaving '
+              f'{fint(c["records"] - c["tnull"])} TLSH rows, of which {fint(c["distinct_tlsh"])} are distinct '
+              f'digests. ')
+        s += ('No SHA-256 occurs twice. ' if c.get('duplicate_sha256') == 0 else
+              f'{fint(c.get("duplicate_sha256"))} duplicate SHA-256 values. ')
+        s += ' '.join(c.get('notes', [])) + '</p>'
+        hrows = (self.run or {}).get('hset', {}).get('tlsh_rows')
+        if hrows is not None:
+            self.validation.append(('corpus: records − TNULL = TLSH rows in the hset',
+                                    f'{fint(c["records"])} − {fint(c["tnull"])} = {fint(c["records"] - c["tnull"])}; '
+                                    f'hset {fint(hrows)}', c['records'] - c['tnull'] == hrows))
+        if self.mf:
+            self.validation.append(('corpus: records = SHA-256 rows looked up',
+                                    f'{fint(c["records"])} records; {fint(self.mf.get("sha256_count"))} SHA-256 rows',
+                                    c['records'] == self.mf.get('sha256_count')))
+        return s
 
     def caveats(self):
         syn = ('<li><b>This sample report is built from SYNTHETIC data</b> (generated digests and hsets); '
@@ -937,7 +1178,7 @@ the hset in the page cache; other work on the VM (the scan, other agents) adds n
 The embedding scan reads 1,056 bytes per row and is memory-bound; brute TLSH reads 36.</li>
 <li><b>k = 100, unbounded distance.</b> The index's pruning depends on the distance bound; a smaller k or a
 max_distance (e.g. 144) would prune far more, so these index timings are not comparable with the M5 figure
-(k = 10, T = 144).</li></ul>"""
+(k = 10, T = 144){'; the k = 10, T = 144 section is' if self.args.knn_k10 else ''}.</li></ul>"""
 
     def median_dk(self, q):
         r = self.db.q(f"select median(d_k) as m from knn_queries where qset = '{q}'") if hasattr(self, 'L') else []
@@ -948,6 +1189,14 @@ max_distance (e.g. 144) would prune far more, so these index timings are not com
         cmds = []
         if run.get('argv'):
             cmds.append('# kNN eval (as recorded in run.json)\n' + ' '.join(run['argv']).replace(' --', ' \\\n    --'))
+        k10 = getattr(self, 'k10_run', None)
+        if k10 and k10.get('argv'):
+            cmds.append('# kNN eval at the M5 settings (as recorded in its run.json)\n'
+                        + ' '.join(k10['argv']).replace(' --', ' \\\n    --'))
+        if self.args.hset and self.args.knn:
+            cmds.append(f'# header split (run by vs_report with --hset)\nLD_LIBRARY_PATH={self.args.libdir} '
+                        f'python3 -I bench/vs_report/header_split.py --hset {self.args.hset} \\\n'
+                        f'    --knn {self.args.knn} --out {os.path.join(self.args.out, "header_split.csv")}')
         cmds.append('# lookup eval (step 2)\nE=/work/bench/vs_lookup_eval; H=<vs.hset>; D=/work/vs-eval\n'
                     'taskset -c 3 $E export $H --out $D/vs_sha256.txt\n'
                     'taskset -c 3 $E found $H --list $D/vs_sha256.txt --csv $D/lookup/lookup_found.csv '
@@ -976,6 +1225,9 @@ max_distance (e.g. 144) would prune far more, so these index timings are not com
 
     def html(self):
         answers = self.answers()
+        methods = self.methods()      # adds the corpus checks
+        note_tail = ('; passages marked <span class="todo">[TO FINISH]</span> need a human judgement.'
+                     if 'class="todo"' in answers else '; the judgements are the author\'s and labelled as such.')
         val_rows = [[escape(a), b, badge(ok)] for a, b, ok in self.validation]
         n_fail = sum(1 for *_, ok in self.validation if ok is False)
         n_warn = sum(1 for *_, ok in self.validation if ok == 'warn')
@@ -1006,11 +1258,10 @@ max_distance (e.g. 144) would prune far more, so these index timings are not com
 <p class="sub">Generated {gen} by <code>bench/vs_report</code>. {' · '.join(src)}</p>
 <nav>{navh}</nav></header>
 <section id="answers"><h2>Answers</h2>
-<p class="note">The prose below is generated from the computed numbers; passages marked
-<span class="todo">[TO FINISH]</span> need a human judgement.</p>{answers}</section>
+<p class="note">The prose below is generated from the computed numbers{note_tail}</p>{answers}</section>
 <section id="validation"><h2>Validation</h2>{val}</section>
 {secs}
-<section id="methods"><h2>Methods</h2>{self.methods()}
+<section id="methods"><h2>Methods</h2>{methods}
 <p>Three kNN methods per query: <b>brute</b>, the TLSH distance to every row (exact, the ground truth);
 <b>index</b>, the TIVF search, which uses the embedding only as a lower bound to prune lists and cells and
 returns exactly brute's answer; <b>embed</b>, the CrowdStrike-style approximate kNN, squared Euclidean
@@ -1035,7 +1286,14 @@ def main():
     ap.add_argument('--db', help='DuckDB file (default OUT/vs.duckdb)')
     ap.add_argument('--title', default='VirusShare reality check: TLSH kNN and SHA-256 lookups')
     ap.add_argument('--synthetic', action='store_true', help='mark the report as built from synthetic data')
-    ap.add_argument('--build-seconds', type=float, help='time to build the TVEC/TIVF sections, for the break-even')
+    ap.add_argument('--build-seconds', type=float,
+                    help='extra build time of the TIVF index, for the break-even (default: from --build-costs)')
+    ap.add_argument('--build-costs', help='JSON: mkhashset builds with and without TVEC / TIVF (see README)')
+    ap.add_argument('--judgements', help='JSON {"q1": html, "q2": html}: the author\'s judgements')
+    ap.add_argument('--corpus', help='JSON: corpus counts for the Methods section')
+    ap.add_argument('--knn-k10', help='a second vs_knn_eval directory at the M5 settings (k 10, max distance 144)')
+    ap.add_argument('--hset', help='the evaluated hset, for the header-split diagnostic (needs libhasher)')
+    ap.add_argument('--libdir', help='directory of libhasher.so for --hset (default REPO/src/lib/.libs)')
     ap.add_argument('--threads', type=int, default=4, help='DuckDB threads (default %(default)s)')
     ap.add_argument('--memory', default='8GB', help='DuckDB memory_limit (default %(default)s)')
     ap.add_argument('--duckdb', default=shutil.which('duckdb') or 'duckdb', help='DuckDB CLI')
@@ -1046,6 +1304,7 @@ def main():
         ap.error('give at least one of --knn, --found, --notfound')
     os.makedirs(args.out, exist_ok=True)
     args.db = args.db or os.path.join(args.out, 'vs.duckdb')
+    args.libdir = args.libdir or os.path.join(args.repo, 'src', 'lib', '.libs')
 
     run = None
     if args.knn:
@@ -1070,6 +1329,8 @@ def main():
     rep = Report(db, args, run, mf, mn)
     if args.knn:
         rep.knn()
+    if args.knn_k10:
+        rep.knn_k10()
     if args.found or args.notfound:
         rep.lookup()
     out = os.path.join(args.out, 'index.html')

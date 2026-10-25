@@ -344,10 +344,34 @@ python3 -I bench/vs_report/vs_report.py \
     --found /work/vs-eval/lookup/lookup_found.csv \
     --notfound /work/vs-eval/lookup/lookup_notfound.csv \
     --out /work/vs-eval/report          # writes index.html and vs.duckdb
-# --build-seconds S  TVEC/TIVF build time, for the break-even query count
+# --build-seconds S  extra build time of the TIVF index, for the break-even query count
 # --synthetic        banner and caveat for a pipeline check
 # --threads 4 --memory 8GB (DuckDB), --reuse-db (re-render from an existing --db)
+# optional inputs:
+#   --build-costs F    JSON: mkhashset builds with HSET_TLSH_OPTIONS 0 / 1 / 2
+#   --judgements F     JSON {"q1": html, "q2": html}, the author's judgements
+#   --corpus F         JSON: corpus counts for Methods
+#   --knn-k10 DIR      a vs_knn_eval run at k 10, --max-distance 144 (--no-analysis is fine)
+#   --hset H           the evaluated hset: the header-split diagnostic (--libdir, default src/lib/.libs)
 ```
+
+The optional inputs add to the report and change nothing without them; the
+judgement and build-time placeholders stay marked `[TO FINISH]` then.
+`--build-costs` is `{"description", "input_digests", "rows", "variants":
+[{"name", "options", "wall_s", "user_s", "maxrss_kb", "bytes"}, ...],
+"records_build": {"tool", "wall_s"}}`; TVEC and TIVF are the variants with
+options 1 and 2 minus the one with 0, and the break-even uses the TIVF wall
+time unless `--build-seconds` is given. `--corpus` is `{"name", "zips",
+"entries", "records", "lost_zip", "lost_cause", "tnull", "distinct_tlsh",
+"duplicate_sha256", "notes": [html, ...]}` and is checked against the hset's
+TLSH rows and the lookup's SHA-256 count. `--hset` runs
+`vs_report/header_split.py` (libhasher through the repo's `python/`
+package), which splits the TLSH distance of embed's results and of brute's
+results that embed missed into the header terms (L, Q1, Q2:
+`tlsh_diff(q, r[:2] + q[2:])`) and the body + checksum rest
+(`tlsh_diff(q, q[:2] + r[2:])`); the report checks that the two add up to
+every row's distance. `--knn-k10` adds the run at the M5 benchmark's
+settings with its own exactness checks.
 
 Any of `--knn`, `--found`, `--notfound` may be left out. The exit status is
 1 when a validation check fails: brute/index mismatches (rows, and distance
@@ -388,4 +412,4 @@ lookup CSV it takes about 2 minutes on 4 threads, most of it loading the
 * `bench_lookup.cpp`     — (legacy) standalone benchmark driver
 * `vs_lookup_eval.cpp`   — per-query lookup eval against a real hset (`make bench/vs_lookup_eval`)
 * `vs_knn_eval.cpp`      — TLSH kNN eval (brute / index / embed) against a real hset (`make bench/vs_knn_eval`)
-* `vs_report/`           — DuckDB analysis and static HTML report of the two evals (`vs_report.py`, `sql/`, `svgchart.py`, `report.css`)
+* `vs_report/`           — DuckDB analysis and static HTML report of the two evals (`vs_report.py`, `header_split.py`, `sql/`, `svgchart.py`, `report.css`)

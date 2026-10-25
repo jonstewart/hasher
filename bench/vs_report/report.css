@@ -51,6 +51,9 @@ nav a:hover { text-decoration: underline; }
 .warn { background: var(--todo-bg); color: var(--todo-ink); padding: 8px 12px; border-radius: 8px; }
 .todo { background: var(--todo-bg); color: var(--todo-ink); padding: 1px 5px; border-radius: 4px; font-weight: 600; }
 .judgement { margin-top: 0.8em; }
+.judgement.authored { border-left: 3px solid var(--axis); padding: 2px 0 2px 14px; margin: 14px 0 6px; }
+.jlabel { color: var(--ink2); font-size: 0.8rem; font-weight: 600; text-transform: uppercase;
+  letter-spacing: 0.04em; margin: 0.3em 0; }
 .answer { background: var(--surface); border: 1px solid var(--border); border-radius: 10px; padding: 4px 18px 10px;
   margin: 14px 0; }
 
