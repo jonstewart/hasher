@@ -1476,6 +1476,34 @@ fn coalesce_threshold_comes_from_the_flag_or_hset_coalesce() {
     }
 }
 
+#[test]
+fn coalesce_4294967295_is_hsetops_default_sentinel() {
+    // hsetop passes HSET_COALESCE to sfhash_merge_hashsets, which reads
+    // 0xFFFFFFFF (SFHASH_HSET_COALESCE_DEFAULT) as the default 64
+    let dir = tmpdir("setop-coalesce-sentinel");
+    // one list of 32 rows a side: kept apart at C = 64 (32 is not below
+    // 64 / 2), coalesced at any C above 64
+    let (master, batch) = (dir.join("master.hset"), dir.join("batch.hset"));
+    make_text(&master, "tlsh", &one_cell_text(3, 32), &[]);
+    make_text(&batch, "tlsh", &one_cell_text(4, 32), &[]);
+    assert_eq!(
+        (tivf_lists(&master), tivf_lists(&batch)),
+        (Some(1), Some(1))
+    );
+    let out = dir.join("o.hset");
+    for (extra, env, lists) in [
+        (&[][..], &[][..], 2),
+        (&["--coalesce", "4294967294"][..], &[][..], 1),
+        (&["--coalesce", "4294967295"][..], &[][..], 2),
+        (&[][..], &[("HSET_COALESCE", "4294967294")][..], 1),
+        (&[][..], &[("HSET_COALESCE", "4294967295")][..], 2),
+    ] {
+        setop_ok("union", &master, &batch, &out, extra, env);
+        assert_eq!(tivf_lists(&out), Some(lists), "{extra:?} {env:?}");
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// The lines `hset dump f extra..` prints, as a set.
 fn dump_set(f: &Path, extra: &[&str]) -> std::collections::BTreeSet<String> {
     let mut args = vec!["dump", p(f)];

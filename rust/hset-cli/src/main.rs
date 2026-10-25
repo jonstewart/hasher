@@ -361,7 +361,8 @@ struct SetOpArgs {
     #[arg(long, value_enum)]
     tlsh_index: Option<TlshIndexKind>,
     /// Coalescing threshold C of a merged TIVF index: per header cell,
-    /// lists of fewer than C/2 rows are coalesced; 0 disables coalescing
+    /// lists of fewer than C/2 rows are coalesced; 0 disables coalescing,
+    /// 4294967295 selects the default, as in hsetop
     /// [default: HSET_COALESCE when set, else 64]
     #[arg(long, value_parser = parse_count, allow_negative_numbers = true)]
     coalesce: Option<u32>,
@@ -947,7 +948,8 @@ fn cmd_verify(a: FileArg) -> CliResult<ExitCode> {
 /// flags, hint and budget, and the description `desc`; the TLSH index
 /// policy of `--tlsh-index`, else of `HSET_TLSH_OPTIONS` (`tlsh_env`) when
 /// it is set, else inherited; the coalescing threshold of `--coalesce`,
-/// else of `HSET_COALESCE` (`coalesce_env`), else the default. A variable
+/// else of `HSET_COALESCE` (`coalesce_env`), else the default, which
+/// `u32::MAX` also selects (C++ `SFHASH_HSET_COALESCE_DEFAULT`). A variable
 /// is read only when its flag is absent.
 fn setop_options(
     a: &SetOpArgs,
@@ -972,10 +974,14 @@ fn setop_options(
             .map_err(|e| format!("{TLSH_OPTIONS_ENV}: {e}"))?,
         (None, None) => TlshIndexPolicy::Inherit,
     };
-    match (a.coalesce, coalesce_env) {
-        (Some(c), _) => o.coalesce_threshold = c,
-        (None, Some(v)) => o.coalesce_threshold = env_count(COALESCE_ENV, &v)?,
-        (None, None) => {}
+    let c = match (a.coalesce, coalesce_env) {
+        (Some(c), _) => Some(c),
+        (None, Some(v)) => Some(env_count(COALESCE_ENV, &v)?),
+        (None, None) => None,
+    };
+    // hsetop's SFHASH_HSET_COALESCE_DEFAULT: the library has no sentinel
+    if let Some(c) = c.filter(|&c| c != u32::MAX) {
+        o.coalesce_threshold = c;
     }
     Ok(o)
 }
