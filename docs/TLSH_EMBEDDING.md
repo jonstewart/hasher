@@ -2,8 +2,8 @@
 
 This document completes the "TLSH Similarity Sections" spec for libhasher's
 hset format: it defines the derived Euclidean embedding (the spec's pending
-section 8), the `TVEC` vectors section and the `TIVF` index section, and the
-indexed kNN procedure. Sections 1–7 of the spec (canonical digest, exact
+section 8), the `TIVF` index section, and the indexed kNN procedure. The
+embedding itself is not stored in the file (section 2). Sections 1–7 of the spec (canonical digest, exact
 distance, cell index, record map) are implemented as described in
 `HASHSET_FORMAT` and `include/hasher/tlsh.h`, with two adaptations:
 
@@ -89,41 +89,35 @@ For `include_length = false` the distance is computed over all dims except
 On near pairs from the synthetic family corpus the squared embedding distance
 averages about 0.78 of the TLSH distance (see `test/test_tlsh_embedding.cpp`).
 
-## 2. Section TVEC (vectors)
+## 2. The embedding is computed, not stored
 
-Optional, one per TLSH hash set, following that set's `HDAT`/`RIDX`. Like
-every section it is an hset chunk: a 4-byte type `"TVEC"` (0x54564543), a
-little-endian u64 payload length, then the payload below. It may only follow
-a TLSH hash set; readers reject it elsewhere. Payload:
+An earlier version of the format had an optional `TVEC` chunk
+(0x54564543) after a TLSH hash set's `HDAT`/`RIDX`: a 32-byte header and the
+n × 264 float32 matrix of `phi(HDAT row r)`, page aligned in the file so
+that it could be memory-mapped and handed to numpy or faiss. It was removed
+before TLSH support was released (docs/DESIGN_DECISIONS.md, "No stored TLSH
+embedding"): it cost 1,056 bytes per row on disk, about four fifths of a
+TLSH-heavy file (9.3 GiB of the 11.7 GiB VirusShare hset), for data any
+consumer can compute from the rows, and nothing in the library reads it:
+the `TIVF` search embeds digests as it goes. No writer emits `TVEC`, and a
+reader rejects a file that has one, as any chunk the format does not allow.
+Bit 1 of the TLSH options, which selected it, is reserved and ignored.
 
-| offset | type | field    | meaning                                  |
-|--------|------|----------|------------------------------------------|
-| 0      | u16  | version  | 1                                        |
-| 2      | u8   | variant  | 0 (128 buckets, 1-byte checksum)         |
-| 3      | u8   | flags    | 0                                        |
-| 4      | u32  | dims     | 264                                      |
-| 8      | u64  | n        | row count, equals the HDAT hash count    |
-| 16     | u32  | dtype    | 1 = float32, little-endian               |
-| 20     | u32  | reserved | 0                                        |
-| 24     | u64  | reserved | 0                                        |
-| 32     | f32  | data     | n × dims, row-major, row r is phi(HDAT row r) |
-
-The chunk is positioned so that `data` begins on a 4096-byte boundary in the
-file; `offset(TVEC chunk) + 12 + 32` is page aligned, with zero padding
-inserted before the chunk as needed. A consumer can therefore memory-map the
-file and hand `numpy.memmap(path, np.float32, offset=..., shape=(n, 264))`
-or a `float*` straight to faiss, hnswlib, scikit-learn, HDBSCAN, UMAP, etc.
-In C, `sfhash_hashset_tlsh_vectors` returns the pointer.
-
-The writer emits `TVEC` by default for TLSH fields; see
-`sfhash_hashset_builder_set_tlsh_options` (`SFHASH_HSET_TLSH_VECTORS`).
+To get the embedding, compute it from the rows: `sfhash_tlsh_embed` in C
+(`include/hasher/tlsh.h`) for one digest, `hasher.tlsh_embed` in Python,
+and `HSet.tlsh_embeddings()` for the whole n × 264 matrix of a TLSH hash
+set (section 6). On one core of a Xeon E5645 `sfhash_tlsh_embed` takes
+0.56–0.63 µs per digest (1,000,000 random digests, three runs), so the
+9.4 million rows of the VirusShare hset embed in about 6 s on one core;
+`bench/vs_knn_eval` does that, on all CPUs, before its timed passes.
 
 ## 3. Section TIVF (inverted-file index)
 
-Optional, following `TVEC` (or `HDAT`/`RIDX` when no vectors are stored; the
-index does not need the vectors, it embeds digests on the fly). The chunk type
-is `"TIVF"` (0x54495646), framed like `TVEC`, and likewise only valid after a
-TLSH hash set.
+Optional, one per TLSH hash set, following that set's `HDAT`/`RIDX`; the
+index embeds digests on the fly. Like every section it is an hset chunk: a
+4-byte type `"TIVF"` (0x54495646), a little-endian u64 payload length, then
+the payload; it may only follow a TLSH hash set, and readers reject it
+elsewhere.
 
 Lists are grouped by header cell, the same (L, Q1, Q2) cells the 0x7400
 `HINT` indexes, so the header part of the TLSH distance is exact for every
@@ -416,9 +410,9 @@ either 24 hourly batches of 18,000 rows or 7 daily batches of 432,000 rows
 by successive unions (`sfhash_hashset_merge`, index carried through and
 coalesced). Each batch is half new families from the corpus generator and
 half digest-space perturbations of master rows (near-duplicates). Files are
-hashsets-only with the index and no vectors: the TVEC matrix is 1 KiB per
-row of plain I/O that kNN never reads and would hide the index cost both in
-the merge (a copy) and in the build (an embedding pass). The master and the
+hashsets-only with the index (and, while the format still had it, without
+the TVEC matrix of section 2, whose 1 KiB per row of plain I/O would have
+hidden the index cost in the merge and the build). The master and the
 batches are built with the target list size T under test; C is the
 coalescing threshold. "Rebuild" is one from-scratch build of the final rows
 through the builder (sort, dedup, parallel index build, file write); the merge is
@@ -547,29 +541,34 @@ T = 32, C = 64:
   in all six C = T configurations.) C = 2T remains the query-time minimum
   of the merged index at T = 32 (29.6 us; C = T 32.3, 4T 34.2).
 
-## 6. Using the vectors from Python
+## 6. Using the embedding from Python
 
-`hasher.hsvectors` (`python/hasher/hsvectors.py`) walks the chunks of an hset
-in pure Python, with no dependency on libhasher, and hands the `TVEC` matrix
-to numpy as a read-only memory map of the file:
+The ctypes bindings compute the embedding from the rows: `hasher.tlsh_embed`
+for one digest, and `HSet.tlsh_embeddings(tidx=None)` for a whole TLSH hash
+set as a new (n, 264) float32 numpy array whose row r is the embedding of row
+r (about 1 KiB per row in memory):
 
 ```python
+import hasher
 from hasher import hsvectors
-X = hsvectors.load_tlsh_vectors('corpus.hset')   # (n, 264) float32 memmap
+with hasher.HSet.open('corpus.hset') as hset:
+    X = hset.tlsh_embeddings()                    # (n, 264) float32
 D = hsvectors.load_tlsh_digests('corpus.hset')   # (n, 36) uint8, row r <-> X[r]
 R = hsvectors.load_tlsh_record_index('corpus.hset')  # (n,) uint64 RIDX, or None
 ```
 
 `X` can go straight into numpy, scikit-learn, faiss, HDBSCAN or UMAP; drop
 column 256 (`hasher.TLSH_EMBEDDING_L_DIM`, the length coordinate) for the
-`include_length = false` distance. `hsvectors.tlsh_hex(bytes(D[r]))`
-renders a row as `"T1..."`, `hsvectors.read_toc(path)` lists every chunk,
-and `utils/hschunks.py` prints that table. `utils/hsvectors_example.py` runs
-brute-force kNN, `NearestNeighbors` and HDBSCAN over a file.
+`include_length = false` distance. `hasher.hsvectors`
+(`python/hasher/hsvectors.py`) walks the chunks of an hset in pure Python,
+with no dependency on libhasher, and maps the rows and record index into
+numpy; `hsvectors.tlsh_hex(bytes(D[r]))` renders a row as `"T1..."`,
+`hsvectors.read_toc(path)` lists every chunk, and `utils/hschunks.py` prints
+that table. `utils/hsvectors_example.py` runs brute-force kNN,
+`NearestNeighbors` and HDBSCAN over the embeddings of a file.
 
-The C library's view of the same data is `HSet.tlsh_vectors()` in the ctypes
-bindings, next to `HSet.tlsh_knn(digest, k, max_distance, include_length,
-strategy)`, the exact kNN of section 4:
+Next to them, `HSet.tlsh_knn(digest, k, max_distance, include_length,
+strategy)` is the exact kNN of section 4:
 
 ```python
 import hasher

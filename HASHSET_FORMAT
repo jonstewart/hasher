@@ -68,44 +68,33 @@ A lookup binary-searches the digest's cell. Nearest-neighbour search
 (sfhash_hashset_tlsh_knn) scans all rows unless the hashset has a TIVF
 index (below).
 
-Optional chunks: TVEC and TIVF
-------------------------------
+Optional chunk: TIVF
+--------------------
 
-A TLSH hashset section may be followed by two optional chunks, in this
-order, each belonging to the section whose HDAT precedes it:
+A TLSH hashset section may be followed by one optional chunk, belonging to
+the section whose HDAT precedes it:
 
-  HHnn HINT HDAT [RIDX] [TVEC] [TIVF]
+  HHnn HINT HDAT [RIDX] [TIVF]
 
-Neither may appear in a section of any other hash type (a reader rejects
-the file). Both are written by default for TLSH fields when hashsets are
-written; sfhash_hashset_builder_set_tlsh_options (or HSET_TLSH_OPTIONS for
-mkhashset) turns either off: SFHASH_HSET_TLSH_VECTORS (1) and
-SFHASH_HSET_TLSH_INDEX (2). SFHASH_HSET_TLSH_INDEX_KMEANS (8) builds the
+It may not appear in a section of any other hash type (a reader rejects the
+file). It is written by default for TLSH fields when hashsets are written;
+sfhash_hashset_builder_set_tlsh_options (or HSET_TLSH_OPTIONS for
+mkhashset) turns it off: SFHASH_HSET_TLSH_INDEX (2) selects it, and 0
+writes none. Bit 1 is reserved and ignored (it once selected TVEC, below),
+so 3 means the same as 2. SFHASH_HSET_TLSH_INDEX_KMEANS (8) builds the
 TIVF with the float k-means instead of the default integer clustering;
 the index is equally exact, builds in time quadratic in the largest header
 cell, and its bytes depend on compiler and platform, whereas the default
-build's bytes are the same everywhere for the same rows. The FTOC reserves room for both whether or not
-they are written, so the FTOC chunk may be shorter than the gap before
-FHDR.
+build's bytes are the same everywhere for the same rows. The builder's
+FTOC reserves room for the TIVF of every TLSH field whether or not it is
+written, so the FTOC chunk may be shorter than the gap before FHDR.
 
-TVEC ("TVEC", 0x54564543): the lower-bound Euclidean embedding of every
-row, see docs/TLSH_EMBEDDING.md sections 1-2. Payload:
-
-   0 version   uint16_t, 1
-   2 variant   uint8_t, 0 (128 buckets, 1-byte checksum)
-   3 flags     uint8_t, 0
-   4 dims      uint32_t, 264
-   8 n         uint64_t, equals the section's hash count
-  16 dtype     uint32_t, 1 = float32 little-endian
-  20 reserved  uint32_t, 0
-  24 reserved  uint64_t, 0
-  32 data      float32[n][dims], row r is the embedding of HDAT row r
-
-The chunk is placed so that data starts on a 4096-byte boundary of the
-file: offset(TVEC) + 12 + 32 is a multiple of 4096, with zero padding
-before the chunk as needed. The matrix can therefore be memory-mapped and
-handed directly to numpy, faiss, etc.; sfhash_hashset_tlsh_vectors returns
-a pointer to it.
+TVEC ("TVEC", 0x54564543) is not allowed. Before TLSH support was released
+it held the n x 264 float32 lower-bound embedding of every row, page
+aligned, between RIDX and TIVF; it was removed (docs/DESIGN_DECISIONS.md),
+no writer emits it, and a reader rejects a file that has one, as any other
+chunk out of place. The embedding is computed from the rows when needed,
+with sfhash_tlsh_embed (docs/TLSH_EMBEDDING.md sections 1-2).
 
 TIVF ("TIVF", 0x54495646): an inverted-file index over the body embedding
 for exact pruned kNN, see docs/TLSH_EMBEDDING.md sections 3-4. Lists are
@@ -162,8 +151,8 @@ sfhash_hashset_merge (and the hsetop tool) computes the union, intersection
 or difference (left minus right) of two hset files by merging, not by
 rebuilding: every HDAT is the two-pointer merge of the inputs' sorted rows,
 and each derived structure is carried through that merge by the row map
-(old row -> new row, or dropped) in O(n) with no sort, no re-embedding and
-no re-clustering. The builder-shaped sfhash_hashset_builder_union_open,
+(old row -> new row, or dropped) in O(n) with no sort and no
+re-clustering. The builder-shaped sfhash_hashset_builder_union_open,
 _intersect_open and _subtract_open are the same operation behind the
 builder's open / write / destroy sequence: the context remembers the two
 inputs and the operation, sfhash_hashset_builder_write performs the merge
@@ -196,10 +185,8 @@ the hashsets-only output then has each row once.
 Cell index (HINT 0x7400) is recomputed from the merged rows as a prefix
 sum.
 
-TVEC rows are copied from the input that contributed the row; a row from
-an input without vectors is embedded with tlsh_embed. TIVF lists are
-carried through merge_tlsh_ivf (docs/TLSH_EMBEDDING.md, section 3): per
-cell, the left input's lists followed by the right's, ids remapped,
+TIVF lists are carried through merge_tlsh_ivf (docs/TLSH_EMBEDDING.md,
+section 3): per cell, the left input's lists followed by the right's, ids remapped,
 dropped ids removed, lists that become empty omitted; a list that lost
 members keeps its medoid and gets its radius recomputed exactly over the
 remaining members, the others keep medoid and radius unchanged. Then small
@@ -218,10 +205,10 @@ medoid, so the indexed search stays exact. If either input lacks a TIVF
 and the output wants one, build_tlsh_ivf clusters the merged rows from
 scratch instead.
 
-Options. tlsh_options selects the optional TLSH sections of the output as
-for the builder (SFHASH_HSET_TLSH_VECTORS, SFHASH_HSET_TLSH_INDEX), or
-SFHASH_HSET_TLSH_INHERIT (hsetop's default) writes each section iff every
-input that has a TLSH section has it. SFHASH_HSET_TLSH_INDEX_KMEANS
+Options. tlsh_options selects the optional TLSH index of the output as for
+the builder (SFHASH_HSET_TLSH_INDEX; bit 1 is ignored), or
+SFHASH_HSET_TLSH_INHERIT (hsetop's default) writes it iff every input that
+has a TLSH section has one. SFHASH_HSET_TLSH_INDEX_KMEANS
 selects the build method of an index built from scratch because an input
 lacks one; under SFHASH_HSET_TLSH_INHERIT the index is always merged, so
 it has no effect there. coalesce_threshold is C above
@@ -232,8 +219,8 @@ formal bound and is measured in docs/TLSH_EMBEDDING.md section 5; a merged
 index never becomes incorrect.
 
 Layout is as for a built file: HDAT chunks start on a 4096-byte boundary,
-TVEC data is 4096-aligned, the FTOC lists exactly the chunks written, and
-the SHA-256 covers the file from offset 40.
+the FTOC lists exactly the chunks written (with no room reserved), and the
+SHA-256 covers the file from offset 40.
 
 sfhash_hashset_tlsh_knn uses the TIVF index when present and brute force
 otherwise; both are exact for every max_distance. sfhash_hashset_tlsh_knn_with

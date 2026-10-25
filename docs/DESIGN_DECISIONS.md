@@ -40,8 +40,9 @@ and `docs/TLSH_EMBEDDING.md`.
   distances 1, so 5 is the best integer placement. L: linear, k² ≤ 12k for
   k ≤ 12; a unit-step chain bounds any realization by k², so this is optimal
   up to the 144 cap. Q1/Q2: regular 16-gons with unit edges. Checksum: three
-  bits scaled by 1/√3. Float32, 264 dims, row-major, page aligned, so numpy,
-  faiss, scikit-learn and HDBSCAN consume it without conversion.
+  bits scaled by 1/√3. Float32, 264 dims, so numpy, faiss, scikit-learn and
+  HDBSCAN consume it without conversion; it is computed from the rows on
+  demand, not stored (see "Storage").
 - **Rejected:** a thermometer (unary) code for L (valid for all k but 12x
   looser at k = 1); bit-plane coordinates for the body (α+β ≤ 1 forces a
   looser bound than the staircase).
@@ -61,9 +62,9 @@ and `docs/TLSH_EMBEDDING.md`.
   §9, puts T = 16 and 32 within 4% of each other, 32 ahead by the
   summary's minimum and 16 by Criterion-style means; 32 builds in half
   the time with half the lists).
-- **Vectors are optional and the index does not need them.** TIVF embeds
-  digests on the fly, so very large sets can carry the index without the
-  1 KiB/row TVEC.
+- **The index does not need stored vectors.** TIVF embeds digests on the
+  fly, so very large sets carried the index without the 1 KiB/row TVEC, and
+  removing TVEC (see "Storage") cost the search nothing.
 - **Default builder: integer k-means under a coarse bisection (BISECT).**
   A cell of more than `TLSH_IVF_BISECT_FLAT_MAX` = 4096 rows is split in two
   around two far-apart member pivots (A farthest from a random member, B
@@ -147,7 +148,7 @@ and `docs/TLSH_EMBEDDING.md`.
 ## Set operations
 
 - **Merge, don't rebuild.** Sections are merged two-pointer style; the cell
-  index is a prefix sum; TVEC rows follow their digests; TIVF lists are
+  index is a prefix sum; TIVF lists are
   concatenated per cell with ids remapped, medoids and radii kept (a radius
   depends only on a list's members, so exactness is preserved; a medoid need
   not be a member).
@@ -162,9 +163,51 @@ and `docs/TLSH_EMBEDDING.md`.
   measured, not bounded. The sweep (BENCHMARKS §7) picked C = 2T as the
   minimum merged-index query time; C = 4T trades lists for 40–70% more rows
   scanned, C = 0 triples the lists.
-- **Known wart:** builder set-op contexts default to writing vectors and
-  index; `sfhash_hashset_merge` and `hsetop` default to inheriting from the
+- **Known wart:** builder set-op contexts default to writing the index;
+  `sfhash_hashset_merge` and `hsetop` default to inheriting it from the
   inputs.
+
+## Storage
+
+- **No stored TLSH embedding: the TVEC chunk is removed.** TLSH hash sets
+  used to carry an optional, default-on `TVEC` chunk with the 264-dim
+  float32 embedding of every row, page aligned for memory-mapping into
+  numpy or faiss. It went before TLSH support was ever released, so with no
+  backwards compatibility:
+  - *Cost.* 1,056 bytes per row against 36 for the digest: in the
+    VirusShare hset, 9.28 GiB of 11.69 GiB (79.4%) for 9,435,507 rows; on a
+    TLSH-only build of 9,084,273 rows, 345 s of wall time and 9.59 GB over
+    the 49 s, 328 MB build without it (the TIVF index costs 108 s and
+    51 MB). A merge copied or re-embedded it row by row.
+  - *No use that needs it stored.* Nothing in the library reads it: the
+    TIVF search embeds digests on the fly. The only consumer was the
+    approximate embed method of `bench/vs_knn_eval`, which the evaluation
+    showed to be both slower and less accurate than exact TLSH: on the
+    synthetic 1M-row hset, 152 / 156 ms per query against 8.2 / 8.6 ms for
+    brute force (member / random, commit 5351b8d), with recall@100 of 0.90
+    and 0.21 (commit 0104c88). External tools can compute the matrix from
+    the rows at about 0.6 µs per digest per core (`sfhash_tlsh_embed` on a
+    Xeon E5645; about 6 s for the VirusShare rows on one core) into memory
+    they own.
+  - *Rejected:* keeping TVEC optional and off by default (a format feature
+    with no writer worth defaulting on, and a second layout constraint, the
+    4096-aligned data, for every reader and writer to honour); float16
+    vectors (half the cost, still most of the file, and not what consumers
+    take without conversion).
+  - *Consequences.* Writers (builder, mkhashset, vsscan build, hsetop and
+    `sfhash_hashset_merge`, the builder-shaped set operations) never write
+    TVEC, and the builder's FTOC reserves room for the TIVF alone. Readers
+    reject a file with a TVEC chunk ("unexpected chunk type TVEC"), as any
+    chunk out of place. `SFHASH_HSET_TLSH_VECTORS` and
+    `sfhash_hashset_tlsh_vectors` are gone; bit 1 of the TLSH options is
+    reserved and ignored, so `HSET_TLSH_OPTIONS=3` still works and means the
+    index; `SFHASH_HSET_TLSH_INDEX` (2), `_INHERIT` (4) and `_INDEX_KMEANS`
+    (8) keep their values, and `INHERIT` now inherits only the index. The
+    embedding stays (`sfhash_tlsh_embed`, the body embedding of TIVF);
+    Python gets `HSet.tlsh_embeddings()`, which computes the matrix, and
+    `bench/vs_knn_eval` computes it in memory before its timed passes, with
+    byte-identical outputs. `docs/BENCHMARKS.md` keeps the numbers measured
+    with TVEC as a historical record.
 
 ## Open issues
 

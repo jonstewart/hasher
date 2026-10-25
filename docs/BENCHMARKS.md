@@ -109,6 +109,10 @@ the merge, parallel k-means for the rebuild:
 | HDAT + HINT + TIVF | 12–19 ms | 190 ms |
 | + TVEC (1 KiB/row, 315 MiB file) | 172 ms | 504 ms |
 
+(TVEC, the stored embedding matrix, has since been removed from the format,
+so the second row describes files that can no longer be written or read;
+see docs/DESIGN_DECISIONS.md, "Storage". The numbers stay as measured.)
+
 Criterion `hset_incremental_merge`: master 999,975 rows + batch 18,000:
 incremental union 41.5 ms vs rebuild 1.45 s (35x); kNN on the merged index
 19.8 µs vs 19.0 µs on the rebuilt one.
