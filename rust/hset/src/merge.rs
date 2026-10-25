@@ -115,16 +115,43 @@ pub fn merge(
     right: &Hashset<'_>,
     opts: &MergeOptions,
 ) -> Result<Vec<u8>> {
+    for (s, what) in [(&opts.name, "name"), (&opts.desc, "desc")] {
+        if s.len() > usize::from(u16::MAX) {
+            return Err(Error::input(format!(
+                "{what} is too long, maximum length is 65535 bytes"
+            )));
+        }
+    }
     let (lf, rf) = (left.file(), right.file());
     // the operation is applied to the records when both sides have them
-    let rm = match (records_of(lf), records_of(rf)) {
+    let (lrec, rrec) = (records_of(lf), records_of(rf));
+    let record_merge = lrec.is_some() && rrec.is_some();
+    if lf.sections.is_empty() != rf.sections.is_empty() {
+        return Err(Error::input(
+            "cannot merge a records-only hashset with one that has hash sections",
+        ));
+    }
+    if !record_merge && lf.sections.is_empty() {
+        return Err(Error::input(
+            "the inputs have neither records nor hash sections in common",
+        ));
+    }
+    let with_records = record_merge && opts.write_records;
+    let with_hashsets = !lf.sections.is_empty() && opts.write_hashsets;
+    if !with_records && !with_hashsets {
+        return Err(Error::input(
+            "neither records nor hash sections are to be written",
+        ));
+    }
+
+    let rm = match (lrec, rrec) {
         (Some((lh, ld)), Some((rh, rd))) => Some(merge_records(op, lh, ld, rh, rd)?),
         _ => None,
     };
-    let with_records = rm.is_some() && opts.write_records;
-    let ofields = match &rm {
-        Some(m) => m.fields.clone(),
-        None => section_fields(lf, rf),
+    let ofields = match (&rm, with_hashsets) {
+        (_, false) => Vec::new(),
+        (Some(m), true) => m.fields.clone(),
+        (None, true) => section_fields(lf, rf),
     };
     let ctx = SectionMerge {
         op,
@@ -205,8 +232,8 @@ impl SectionMerge<'_, '_, '_> {
     fn section(&self, f: &FieldDescriptor) -> Result<OutSection> {
         let len = usize::try_from(f.length)
             .map_err(|_| Error::input(format!("{} hashes are too long", f.name)))?;
-        let ls = section_of(self.left, f.htype);
-        let rs = section_of(self.right, f.htype);
+        let ls = self.side(self.left, f, "left")?;
+        let rs = self.side(self.right, f, "right")?;
         let (lrows, rrows) = (
             ls.map_or(&[][..], |s| s.data),
             rs.map_or(&[][..], |s| s.data),
@@ -299,9 +326,45 @@ impl SectionMerge<'_, '_, '_> {
     }
 }
 
-/// `hs`'s section of type `t`.
-fn section_of<'s, 'a>(hs: &'s Hashset<'a>, t: HashType) -> Option<&'s Section<'a>> {
-    hs.index_for_type(t).map(|i| hs.section(i))
+impl SectionMerge<'_, '_, '_> {
+    /// `hs`'s section for the output field `f`, if it has one, checked
+    /// against the field: its hashes have the field's length and, in a
+    /// record merge, it has a record index, and a side with the field in
+    /// its records has the section (`side` names the side in errors).
+    fn side<'s, 'a>(
+        &self,
+        hs: &'s Hashset<'a>,
+        f: &FieldDescriptor,
+        side: &str,
+    ) -> Result<Option<&'s Section<'a>>> {
+        let record_merge = self.records.is_some();
+        let Some(i) = hs.index_for_type(f.htype) else {
+            let has_field = hs
+                .record_header()
+                .is_some_and(|h| h.fields.iter().any(|x| x.htype == f.htype));
+            if record_merge && has_field {
+                return Err(Error::input(format!(
+                    "{side} has a {0} field but no {0} hashset",
+                    f.name
+                )));
+            }
+            return Ok(None);
+        };
+        let s = hs.section(i);
+        if s.header.hash_length != f.length {
+            return Err(Error::input(format!(
+                "{side} {} hashset has hash length {}, expected {}",
+                f.name, s.header.hash_length, f.length
+            )));
+        }
+        if record_merge && s.ridx.is_none() {
+            return Err(Error::input(format!(
+                "{side} {} hashset has no record index",
+                f.name
+            )));
+        }
+        Ok(Some(s))
+    }
 }
 
 impl OutSection {

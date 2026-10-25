@@ -12,7 +12,10 @@
 
 use std::collections::BTreeSet;
 
-use hset::format::{FieldDescriptor, Hint, RecordHeader, chunk};
+use hset::format::{
+    Document, FORMAT_VERSION, FieldDescriptor, HashsetIn, Hint, RecordHeader, RecordsIn, chunk,
+    encode,
+};
 use hset::hashset::KnnStrategy;
 use hset::merge::{MergeOptions, TlshIndexPolicy, merge};
 use hset::tlsh::ivf::{DEFAULT_COALESCE, check_invariant};
@@ -634,4 +637,204 @@ fn a_type_on_one_side_only_is_merged_against_nothing() {
         assert_eq!(hs.count(m), want, "{}", op.name());
         check_output(&o, &a, &b, op, true);
     }
+}
+
+// ---------------------------------------------------------------------------
+// Records-only inputs and errors
+// ---------------------------------------------------------------------------
+
+/// The input error of merging `l` and `r` under `o`.
+fn merge_err(l: &[u8], r: &[u8], o: &MergeOptions) -> String {
+    match merge(SetOp::Union, &load(l), &load(r), o) {
+        Err(e @ Error::Input(_)) => e.to_string(),
+        other => panic!("expected an input error, got {:?}", other.map(|b| b.len())),
+    }
+}
+
+fn assert_contains(msg: &str, want: &str) {
+    assert!(msg.contains(want), "{msg:?} does not contain {want:?}");
+}
+
+/// `bytes` re-encoded with only the sections `keep` accepts, without
+/// their record indexes when `drop_ridx`.
+fn reencode(bytes: &[u8], keep: impl Fn(HashType) -> bool, drop_ridx: bool) -> Vec<u8> {
+    let f = hset::format::decode(bytes).unwrap();
+    let rhdr = f.rhdr.as_ref();
+    encode(&Document {
+        version: FORMAT_VERSION,
+        name: &f.fhdr.name,
+        desc: &f.fhdr.desc,
+        time: &f.fhdr.time,
+        records: rhdr.map(|h| RecordsIn {
+            fields: &h.fields,
+            record_length: h.record_length as usize,
+            data: f.rdat.unwrap(),
+        }),
+        hashsets: f
+            .sections
+            .iter()
+            .filter(|s| keep(s.header.htype))
+            .map(|s| HashsetIn {
+                htype: s.header.htype,
+                name: &s.header.name,
+                hash_length: s.hash_length(),
+                data: s.data,
+                hint: None,
+                ridx: if drop_ridx { None } else { s.ridx },
+                tivf: s.tivf,
+            })
+            .collect(),
+    })
+    .unwrap()
+}
+
+/// A file with neither records nor hash sections.
+fn empty_file() -> Vec<u8> {
+    encode(&Document {
+        version: FORMAT_VERSION,
+        name: "empty",
+        desc: "",
+        time: "",
+        records: None,
+        hashsets: vec![],
+    })
+    .unwrap()
+}
+
+const RECORDS_ONLY: In = In {
+    records: true,
+    hashsets: false,
+    index: true,
+};
+
+/// C++ hset_merge_errors: two records-only files merge to a records-only
+/// file; a records-only file cannot be merged with one that has sections.
+#[test]
+fn records_only_inputs_merge_to_records_only_and_not_with_hash_sections() {
+    let c = tlsh_corpus();
+    let ro = build_input(&c, 0..100, &MD5_TLSH, RECORDS_ONLY);
+    let ro2 = build_input(&c, 50..150, &MD5_TLSH, RECORDS_ONLY);
+    assert_eq!(load(&ro).section_count(), 0);
+    let o = merged(SetOp::Union, &ro, &ro2, &opts());
+    assert_eq!(load(&o).section_count(), 0);
+    assert_eq!(load(&o).record_count(), 150);
+    check_output(&o, &ro, &ro2, SetOp::Union, false);
+
+    let a = build_input(&c, 0..100, &MD5_TLSH, REC);
+    for (l, r) in [(&a, &ro), (&ro, &a)] {
+        assert_contains(
+            &merge_err(l, r, &opts()),
+            "cannot merge a records-only hashset with one that has hash sections",
+        );
+    }
+}
+
+#[test]
+fn inputs_without_records_or_sections_in_common_are_an_error() {
+    let c = tlsh_corpus();
+    let ro = build_input(&c, 0..100, &MD5_TLSH, RECORDS_ONLY);
+    let empty = empty_file();
+    for (l, r) in [(&ro, &empty), (&empty, &ro), (&empty, &empty)] {
+        assert_contains(
+            &merge_err(l, r, &opts()),
+            "the inputs have neither records nor hash sections in common",
+        );
+    }
+}
+
+#[test]
+fn write_flags_that_leave_nothing_to_write_are_an_error() {
+    let c = tlsh_corpus();
+    let rec = build_input(&c, 0..100, &MD5_TLSH, REC);
+    let ho = build_input(&c, 0..100, &MD5_TLSH, HO);
+    let ro = build_input(&c, 0..100, &MD5_TLSH, RECORDS_ONLY);
+    let mut neither = opts();
+    neither.write_records = false;
+    neither.write_hashsets = false;
+    let mut no_sections = opts();
+    no_sections.write_hashsets = false;
+    let mut no_records = opts();
+    no_records.write_records = false;
+    for (l, r, o) in [
+        (&rec, &rec, &neither),
+        (&ho, &ho, &no_sections),
+        (&rec, &ho, &no_sections),
+        (&ro, &ro, &no_records),
+    ] {
+        assert_contains(
+            &merge_err(l, r, o),
+            "neither records nor hash sections are to be written",
+        );
+    }
+}
+
+#[test]
+fn sections_and_fields_that_disagree_are_an_error() {
+    let c = tlsh_corpus();
+    let md5_8 = |records: bool| {
+        let mut b = Builder::with_fields(vec![FieldDescriptor {
+            htype: HashType::Md5,
+            name: "md5".into(),
+            length: 8,
+        }]);
+        b.add_record(&[Some(&[7u8; 8][..])]).unwrap();
+        b.build(&BuildOptions::new("short", "").records(records))
+            .unwrap()
+    };
+    let md5 = |records: bool| {
+        build_input(
+            &c,
+            0..10,
+            &[HashType::Md5],
+            In {
+                records,
+                hashsets: true,
+                index: true,
+            },
+        )
+    };
+    // a field of two lengths
+    assert_contains(
+        &merge_err(&md5(true), &md5_8(true), &opts()),
+        "field md5 has length 16 on the left and 8 on the right",
+    );
+    // a section of another length than the output field
+    assert_contains(
+        &merge_err(&md5(false), &md5_8(false), &opts()),
+        "right md5 hashset has hash length 8, expected 16",
+    );
+    assert_contains(
+        &merge_err(&md5_8(false), &md5(false), &opts()),
+        "right md5 hashset has hash length 16, expected 8",
+    );
+
+    // a record field without its section, a section without its RIDX
+    let rec = build_input(&c, 0..100, &MD5_TLSH, REC);
+    let no_tlsh = reencode(&rec, |t| t != HashType::Tlsh, false);
+    let no_ridx = reencode(&rec, |_| true, true);
+    assert_contains(
+        &merge_err(&no_tlsh, &rec, &opts()),
+        "left has a tlsh field but no tlsh hashset",
+    );
+    assert_contains(
+        &merge_err(&rec, &no_tlsh, &opts()),
+        "right has a tlsh field but no tlsh hashset",
+    );
+    assert_contains(
+        &merge_err(&no_ridx, &rec, &opts()),
+        "left md5 hashset has no record index",
+    );
+    assert_contains(
+        &merge_err(&rec, &no_ridx, &opts()),
+        "right md5 hashset has no record index",
+    );
+}
+
+#[test]
+fn an_overlong_name_is_an_error() {
+    let c = tlsh_corpus();
+    let ho = build_input(&c, 0..10, &[HashType::Md5], HO);
+    let mut o = opts();
+    o.name = "x".repeat(65536);
+    assert_contains(&merge_err(&ho, &ho, &o), "too long");
 }
