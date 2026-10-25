@@ -6,7 +6,7 @@
 
 use hset::lookup::{BatchMode, BitsPolicy, HintSpec, SearchConfig, SingleMode};
 use hset::synth::{SplitMix64, adversarial_hashes, sort_unique_rows};
-use hset::{HashType, SetOp};
+use hset::{HashType, SetOp, TlshIndexPolicy};
 use proptest::collection::vec;
 use proptest::prelude::*;
 use proptest::sample::select;
@@ -37,6 +37,12 @@ pub(crate) const BATCH_MODES: [BatchMode; 4] = [
 pub(crate) const TIMESTAMPS: [&str; 3] = ["2024-01-01T00:00:00Z", "1970-01-01T00:00:00Z", ""];
 /// Bits-policy budgets: none, the default, and unbounded.
 pub(crate) const BUDGETS: [f64; 3] = [0.0, 0.02, 1.0];
+/// Every merge TLSH index policy, the default first.
+pub(crate) const TLSH_MERGE_POLICIES: [TlshIndexPolicy; 3] = [
+    TlshIndexPolicy::Inherit,
+    TlshIndexPolicy::Write,
+    TlshIndexPolicy::Omit,
+];
 /// Bytes that make dense shared prefixes.
 pub(crate) const DENSE_BYTES: [u8; 3] = [0x00, 0x80, 0xFF];
 
@@ -251,7 +257,8 @@ fn bits_policies() -> BoxedStrategy<BitsPolicy> {
         .boxed()
 }
 
-/// Build options; never both records and hash sets off.
+/// Build options; never both records and hash sets off. A TLSH index
+/// three times in four; any merge index policy.
 pub fn opts() -> BoxedStrategy<Opts> {
     (
         "[ -~]{0,32}",
@@ -264,9 +271,20 @@ pub fn opts() -> BoxedStrategy<Opts> {
             Just(HintSpec::Block { bits: 0 }),
         ],
         bits_policies(),
+        prop::bool::weighted(0.75),
+        select(TLSH_MERGE_POLICIES.to_vec()),
     )
         .prop_map(
-            |(name, desc, timestamp, (with_records, with_hashsets), hint, bits_policy)| Opts {
+            |(
+                name,
+                desc,
+                timestamp,
+                (with_records, with_hashsets),
+                hint,
+                bits_policy,
+                tlsh_index,
+                tlsh_merge,
+            )| Opts {
                 name,
                 desc,
                 timestamp: timestamp.to_string(),
@@ -274,6 +292,8 @@ pub fn opts() -> BoxedStrategy<Opts> {
                 with_hashsets,
                 hint,
                 bits_policy,
+                tlsh_index,
+                tlsh_merge,
             },
         )
         .boxed()

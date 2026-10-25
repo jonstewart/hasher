@@ -9,9 +9,11 @@ use hset::builder::format_value;
 use hset::format::{FieldDescriptor, Hint, HsetFile, hint_tag_block, hint_tag_hull};
 use hset::lookup::resolve_bits;
 use hset::merge::MergeOptions;
-use hset::{BitsPolicy, BuildOptions, Builder, HashType, HintSpec, SetOp};
+use hset::tlsh::CELL_HINT_TAG;
+use hset::{BitsPolicy, BuildOptions, Builder, HashType, HintSpec, SetOp, TlshIndexPolicy};
 
 use crate::oracle::set_op_model;
+use crate::tlsh::naive_cell_index;
 
 /// Every type that can be stored in a hash set: `HashType::ALL` minus `Fuzzy`,
 /// and minus `Tlsh`, whose values must be canonical TLSH digests and whose
@@ -73,10 +75,16 @@ pub struct Opts {
     pub with_hashsets: bool,
     pub hint: HintSpec,
     pub bits_policy: BitsPolicy,
+    /// Build a `TIVF` index on a TLSH section ([`BuildOptions::tlsh_index`]).
+    pub tlsh_index: bool,
+    /// As a set operation's output options: the merge's TLSH index policy
+    /// ([`MergeOptions::tlsh_index`]).
+    pub tlsh_merge: TlshIndexPolicy,
 }
 
 impl Opts {
-    /// Records and hash sets with automatically sized hull hints.
+    /// Records and hash sets with automatically sized hull hints, a TLSH
+    /// index, and the default merge policy.
     pub fn default_for_tests() -> Opts {
         Opts {
             name: "t".to_string(),
@@ -86,6 +94,8 @@ impl Opts {
             with_hashsets: true,
             hint: HintSpec::Hull { bits: u8::MAX },
             bits_policy: BitsPolicy::default(),
+            tlsh_index: true,
+            tlsh_merge: TlshIndexPolicy::default(),
         }
     }
 
@@ -96,6 +106,7 @@ impl Opts {
             .hashsets(self.with_hashsets)
             .hint(self.hint)
             .bits_policy(self.bits_policy)
+            .tlsh_index(self.tlsh_index)
     }
 }
 
@@ -190,6 +201,7 @@ impl Doc {
                         .then(|| present.iter().map(|p| p.1).collect()),
                     hashes: present.into_iter().map(|p| p.0).collect(),
                     hint_tag,
+                    tivf: f.htype == HashType::Tlsh && opts.tlsh_index,
                 });
                 off += 1 + hlen;
             }
@@ -265,7 +277,8 @@ impl Doc {
 }
 
 /// The tag of the hint a section of `n` rows of type `htype` gets under
-/// `hint` and `policy`: none for a non-digest type.
+/// `hint` and `policy`: none for a non-digest type, the cell index for
+/// TLSH.
 fn hint_tag(
     htype: HashType,
     n: usize,
@@ -273,6 +286,9 @@ fn hint_tag(
     hint: HintSpec,
     policy: &BitsPolicy,
 ) -> Option<u16> {
+    if htype == HashType::Tlsh {
+        return Some(CELL_HINT_TAG);
+    }
     if !htype.is_digest() {
         return None;
     }
@@ -293,7 +309,7 @@ pub const REFUSE_NOTHING_TO_WRITE: &str = "neither records nor hash sections are
 impl Opts {
     /// The merge options of an output built with these options: the same
     /// metadata, hint and bits policy, `with_records` and `with_hashsets`
-    /// as the write flags, and the default TLSH index policy.
+    /// as the write flags, and `tlsh_merge` as the TLSH index policy.
     pub fn merge_options(&self) -> MergeOptions {
         let mut o = MergeOptions::new(self.name.clone(), self.desc.clone());
         o.timestamp = Some(self.timestamp.clone());
@@ -301,6 +317,7 @@ impl Opts {
         o.write_hashsets = self.with_hashsets;
         o.hint = self.hint;
         o.bits_policy = self.bits_policy;
+        o.tlsh_index = self.tlsh_merge;
         o
     }
 }
@@ -323,7 +340,9 @@ impl Opts {
 ///   either input (`a`'s first, named by the first side that has it),
 ///   holding the set operation on the two sides' distinct values (a side
 ///   without the type contributes nothing).
-/// * Digest sections get `out`'s hint as the builder sizes it.
+/// * Digest sections get `out`'s hint as the builder sizes it, a TLSH
+///   section the cell index and, per `out.tlsh_merge`, a `TIVF` index
+///   (`Inherit`: iff every input with the section has one).
 ///
 /// Inputs that have neither records nor sections in common, which C++
 /// also refuses, cannot be expressed: a [`Doc`] always has records or
@@ -344,6 +363,18 @@ pub fn set_op_expected(op: SetOp, a: &Doc, b: &Doc, out: &Opts) -> Result<Expect
             fields.push(f.clone());
         }
     }
+    // a TLSH index is merged or rebuilt per the policy; Inherit writes one
+    // iff every side that has the section has one
+    let has_index =
+        |d: &Doc| !d.fields.iter().any(|f| f.htype == HashType::Tlsh) || d.opts.tlsh_index;
+    let tivf = |t: HashType| {
+        t == HashType::Tlsh
+            && match out.tlsh_merge {
+                TlshIndexPolicy::Inherit => has_index(a) && has_index(b),
+                TlshIndexPolicy::Write => true,
+                TlshIndexPolicy::Omit => false,
+            }
+    };
     let section = |f: &Field, hashes: Vec<Vec<u8>>, ridx: Option<Vec<u64>>| ExpectedSection {
         htype: f.htype,
         name: f.name.clone(),
@@ -357,6 +388,7 @@ pub fn set_op_expected(op: SetOp, a: &Doc, b: &Doc, out: &Opts) -> Result<Expect
         ),
         hashes,
         ridx,
+        tivf: tivf(f.htype),
     };
     let mut expected = Expected {
         name: out.name.clone(),
@@ -450,6 +482,9 @@ pub struct ExpectedSection {
     pub hashes: Vec<Vec<u8>>,
     pub ridx: Option<Vec<u64>>,
     pub hint_tag: Option<u16>,
+    /// Whether the section has a `TIVF` index. Its bytes are not modelled:
+    /// [`crate::checks`] validates and searches it.
+    pub tivf: bool,
 }
 
 impl Expected {
@@ -497,6 +532,19 @@ impl Expected {
                 s.hint.map(|h| h.tag())
             );
             assert_eq!(s.hint.map(|h| h.tag()), e.hint_tag, "section {i} hint tag");
+            if let Some(Hint::TlshCells { table }) = s.hint {
+                let rows: Vec<[u8; 36]> = e
+                    .hashes
+                    .iter()
+                    .map(|h| h.as_slice().try_into().expect("a 36-byte TLSH row"))
+                    .collect();
+                let cells: Vec<u8> = naive_cell_index(&rows)
+                    .iter()
+                    .flat_map(|c| c.to_le_bytes())
+                    .collect();
+                assert!(table == cells, "section {i} cell index");
+            }
+            assert_eq!(s.tivf.is_some(), e.tivf, "section {i} TIVF presence");
         }
     }
 }
@@ -849,6 +897,142 @@ pub(crate) mod tests {
             set_op_expected(SetOp::Union, &a, &b, &out_opts(true, false)),
             Err(REFUSE_NOTHING_TO_WRITE)
         );
+    }
+
+    // TLSH sections
+
+    /// A canonical TLSH digest: header `l`, `q`, every other byte `body`
+    /// but the reserved byte (zero).
+    fn tl(l: u8, q: u8, body: u8) -> Vec<u8> {
+        let mut v = vec![body; 36];
+        v[0] = l;
+        v[1] = q;
+        v[35] = 0;
+        v
+    }
+
+    /// Fields md5 and tlsh: r0 and r2 share a digest, r1 has another in
+    /// the same cell, r3 none and r4 one in a lower cell. Sorted records:
+    /// r4, r3, r0, r1, r2.
+    fn tlsh_doc() -> Doc {
+        doc_of(
+            &[HashType::Md5, HashType::Tlsh],
+            vec![
+                vec![Some(X.to_vec()), Some(tl(1, 2, 0x11))],
+                vec![Some(Y.to_vec()), Some(tl(1, 2, 0x22))],
+                vec![Some(M.to_vec()), Some(tl(1, 2, 0x11))],
+                vec![Some(X.to_vec()), None],
+                vec![None, Some(tl(0, 5, 0x33))],
+            ],
+        )
+    }
+
+    #[test]
+    fn expected_tlsh_section_keeps_duplicates_and_has_cell_hint_and_index() {
+        let mut doc = tlsh_doc();
+        doc.opts.hint = HintSpec::None;
+        let e = doc.expected();
+        let t = &e.sections[1];
+        assert_eq!(t.htype, HashType::Tlsh);
+        assert_eq!(t.hash_length, 36);
+        assert_eq!(
+            t.hashes,
+            vec![
+                tl(0, 5, 0x33),
+                tl(1, 2, 0x11),
+                tl(1, 2, 0x11),
+                tl(1, 2, 0x22)
+            ]
+        );
+        assert_eq!(
+            t.ridx,
+            Some(vec![0, 4, 2, 3]),
+            "duplicates by descending record"
+        );
+        assert_eq!(
+            t.hint_tag,
+            Some(CELL_HINT_TAG),
+            "the cell index, whatever the hint"
+        );
+        assert!(t.tivf);
+        assert_eq!(e.sections[0].hint_tag, None);
+        assert!(!e.sections[0].tivf, "no index on an md5 section");
+
+        doc.opts.tlsh_index = false;
+        assert!(!doc.expected().sections[1].tivf);
+        doc.opts.with_records = false;
+        let ho = doc.expected();
+        assert_eq!(
+            ho.sections[1].hashes,
+            vec![tl(0, 5, 0x33), tl(1, 2, 0x11), tl(1, 2, 0x22)]
+        );
+        assert_eq!(ho.sections[1].hint_tag, Some(CELL_HINT_TAG));
+    }
+
+    #[test]
+    fn build_matches_expected_on_the_tlsh_sample() {
+        for with_records in [true, false] {
+            for tlsh_index in [true, false] {
+                for hint in [HintSpec::None, HintSpec::Hull { bits: u8::MAX }] {
+                    let mut doc = tlsh_doc();
+                    doc.opts.with_records = with_records;
+                    doc.opts.tlsh_index = tlsh_index;
+                    doc.opts.hint = hint;
+                    let bytes = doc.build().unwrap();
+                    doc.expected().assert_matches(&decode(&bytes).unwrap());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn set_op_model_tlsh_sections_get_the_cell_hint_and_the_index_policy() {
+        use TlshIndexPolicy::{Inherit, Omit, Write};
+        let tivf = |a: &Doc, b: &Doc, policy| {
+            let out = Opts {
+                tlsh_merge: policy,
+                hint: HintSpec::None,
+                ..out_opts(true, true)
+            };
+            let e = set_op_expected(SetOp::Union, a, b, &out).unwrap();
+            assert!(
+                e.sections
+                    .iter()
+                    .all(|s| s.htype == HashType::Tlsh || !s.tivf)
+            );
+            let s = e
+                .sections
+                .iter()
+                .find(|s| s.htype == HashType::Tlsh)
+                .unwrap();
+            assert_eq!(s.hint_tag, Some(CELL_HINT_TAG));
+            s.tivf
+        };
+        let a = tlsh_doc();
+        let mut b = tlsh_doc();
+        b.records.truncate(2);
+        let mut b_bare = b.clone();
+        b_bare.opts.tlsh_index = false;
+        assert!(tivf(&a, &b, Inherit));
+        assert!(!tivf(&a, &b_bare, Inherit));
+        assert!(!tivf(&b_bare, &a, Inherit));
+        assert!(tivf(&a, &b_bare, Write));
+        assert!(!tivf(&a, &b, Omit));
+
+        // a side without the TLSH section does not stop the inheritance
+        let md5_only = doc_of(&[HashType::Md5], vec![vec![Some(X.to_vec())]]);
+        assert!(tivf(&a, &md5_only, Inherit));
+        assert!(tivf(&md5_only, &a, Inherit));
+        let mut a_bare = a.clone();
+        a_bare.opts.tlsh_index = false;
+        assert!(!tivf(&a_bare, &md5_only, Inherit));
+
+        // the same without records on one side (sections merged as sets)
+        let mut a_ho = a.clone();
+        a_ho.opts.with_records = false;
+        assert!(tivf(&a_ho, &b, Inherit));
+        assert!(!tivf(&a_ho, &b_bare, Inherit));
+        assert!(tivf(&a_ho, &b_bare, Write));
     }
 
     #[test]

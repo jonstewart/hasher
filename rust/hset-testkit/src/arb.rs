@@ -11,7 +11,7 @@ use crate::corrupt::{ChunkEdit, Corruption};
 use crate::doc::{Doc, Field, Opts, STORABLE_TYPES};
 use crate::strategies::{
     BATCH_MODES, BUDGETS, DENSE_BYTES, LookupCase, SINGLE_MODES, SUPPORTED_LENGTHS, TIMESTAMPS,
-    UNSUPPORTED_LENGTH, queries, with_duplicates,
+    TLSH_MERGE_POLICIES, UNSUPPORTED_LENGTH, queries, with_duplicates,
 };
 
 /// Field-name characters of the ASCII class of `strategies::field`.
@@ -96,6 +96,8 @@ fn opts(u: &mut Unstructured<'_>) -> Result<Opts> {
     let budget = *u.choose(&BUDGETS)?;
     let min_bits = u.int_in_range(0..=4)?;
     let max_bits = u.int_in_range(min_bits..=12)?;
+    let tlsh_index = u.ratio(3u8, 4)?;
+    let tlsh_merge = *u.choose(&TLSH_MERGE_POLICIES)?;
     Ok(Opts {
         name,
         desc,
@@ -108,6 +110,8 @@ fn opts(u: &mut Unstructured<'_>) -> Result<Opts> {
             min_bits,
             max_bits,
         },
+        tlsh_index,
+        tlsh_merge,
     })
 }
 

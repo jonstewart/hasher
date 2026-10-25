@@ -111,6 +111,7 @@ fn corrupt_empty_sha1_section_does_not_over_allocate() {
                 min_bits: 0,
                 max_bits: 10,
             },
+            ..Opts::default_for_tests()
         },
     };
     let c = Corruption {
