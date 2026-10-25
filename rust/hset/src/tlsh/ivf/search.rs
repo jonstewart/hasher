@@ -1,8 +1,14 @@
 //! Exact indexed kNN search over a TIVF index (`tlsh_knn_ivf`).
 
 use super::{IvfIndex, ValidIvf};
-use crate::tlsh::digest::TlshDigest;
-use crate::tlsh::knn::{KnnStats, TlshMatch};
+use crate::tlsh::digest::{DIGEST_LENGTH, TlshDigest};
+use crate::tlsh::distance::BodyQuery;
+use crate::tlsh::knn::{KnnStats, TlshMatch, TopK};
+use crate::tlsh::order::HeaderOrder;
+
+/// Offset of the checksum byte in a canonical row (see
+/// [`crate::tlsh::digest`]).
+const CHECKSUM: usize = 34;
 
 /// Lists with fewer members than this are scanned without evaluating
 /// their bound (C++ `MIN_BOUNDED_LIST`).
@@ -32,14 +38,136 @@ pub fn list_bound(d2: u32, r2: u32) -> f32 {
     }
 }
 
-/// Exact kNN through the index (stub).
+/// Exact k nearest neighbours of `q` among the rows of a validated TIVF
+/// index (C++ `tlsh_knn_ivf`): up to `k` matches with distance at most
+/// `max_distance`, nearest first, ties by ascending row index; exactly
+/// what [`knn_brute`](crate::tlsh::knn::knn_brute) returns over
+/// `ivf.rows()`. Empty when `k == 0`, `q` is null, or the index has no
+/// rows.
+///
+/// Cells are visited in [`HeaderOrder`] with the cell search's early
+/// exits (the L loop stops at the first L cost above the current bound,
+/// the Q loop at the first header cost `ch` above it; empty cells are
+/// skipped). In a nonempty cell:
+///
+/// * a single list holds the whole cell, which by [`ValidIvf`] is a
+///   contiguous row range: it is scanned if it has fewer than
+///   [`MIN_BOUNDED_LIST`] rows or `ch + list_bound(d2, radius2) <= bound`
+///   (in `f32`), where `d2` is the query's squared body-embedding distance
+///   to the medoid;
+/// * otherwise every list's bound `b2` is evaluated, lists with
+///   `ch + b2 <= bound` are kept and sorted by `(b2, list)`, and they are
+///   scanned in that order until the first whose `ch + b2` exceeds the
+///   bound, which shrinks as matches are found.
+///
+/// A row's distance is `ch + (checksum differs) + body`. The pruning is
+/// exact because `list_bound` is a lower bound on the body distance of
+/// every member (see [`list_bound`]), whatever the medoid and however
+/// loose the radius.
+///
+/// `stats`, when given, is added to as by C++: `cells` counts the
+/// nonempty cells visited, `lists` every list of a cell with several plus
+/// each single-list cell of at least [`MIN_BOUNDED_LIST`] rows (scanned
+/// or pruned), and `rows` the rows whose distance was computed. The visit
+/// order is C++'s, so the counts equal C++'s for the same index.
 pub fn knn_ivf<I: IvfIndex>(
-    _ivf: &ValidIvf<'_, I>,
-    _q: &TlshDigest,
-    _k: usize,
-    _max_distance: u32,
-    _include_length: bool,
-    _stats: Option<&mut KnnStats>,
+    ivf: &ValidIvf<'_, I>,
+    q: &TlshDigest,
+    k: usize,
+    max_distance: u32,
+    include_length: bool,
+    mut stats: Option<&mut KnnStats>,
 ) -> Vec<TlshMatch> {
-    Vec::new()
+    let rows = ivf.rows();
+    if k == 0 || rows.is_empty() || q.is_null() {
+        return Vec::new();
+    }
+
+    let order = HeaderOrder::new(q, include_length);
+    let body = BodyQuery::new(q);
+    let checksum = q.checksum();
+    let mut top = TopK::new(k, max_distance);
+    let row_cost =
+        |ch: u32, r: &[u8; DIGEST_LENGTH]| ch + u32::from(r[CHECKSUM] != checksum) + body.body(r);
+
+    // (body bound, list) of the lists of a multi-list cell worth scanning
+    let mut lists: Vec<(f32, usize)> = Vec::new();
+
+    for (&l, &cl) in order.l().iter().zip(order.l_cost()) {
+        if cl > top.bound() {
+            break;
+        }
+        for (&qb, &cq) in order.q().iter().zip(order.q_cost()) {
+            let ch = cl + cq;
+            if ch > top.bound() {
+                break;
+            }
+            let c = usize::from(l) << 8 | usize::from(qb);
+            let cell = ivf.cell_range(c);
+            if cell.is_empty() {
+                continue;
+            }
+            if let Some(s) = stats.as_deref_mut() {
+                s.cells += 1;
+            }
+
+            if cell.len() == 1 {
+                // a single list holds the whole cell: its ids are the
+                // cell's contiguous row range in ascending order
+                let fl = cell.start;
+                let count = ivf.list_len(fl);
+                let bounded = count >= MIN_BOUNDED_LIST;
+                if let Some(s) = stats.as_deref_mut() {
+                    s.lists += u64::from(bounded);
+                }
+                if bounded
+                    && ch as f32 + list_bound(body.emb_body(&ivf.medoid(fl).0), ivf.radius2(fl))
+                        > top.bound() as f32
+                {
+                    continue;
+                }
+                if let Some(s) = stats.as_deref_mut() {
+                    s.rows += count;
+                }
+                let first = ivf.id(ivf.list_range(fl).start) as usize;
+                for (i, r) in rows[first..first + count as usize].iter().enumerate() {
+                    top.offer(TlshMatch {
+                        index: (first + i) as u64,
+                        distance: row_cost(ch, r),
+                    });
+                }
+                continue;
+            }
+
+            // body lower bound per list, through medoid and radius
+            if let Some(s) = stats.as_deref_mut() {
+                s.lists += cell.len() as u64;
+            }
+            lists.clear();
+            for fl in cell {
+                let b2 = list_bound(body.emb_body(&ivf.medoid(fl).0), ivf.radius2(fl));
+                if ch as f32 + b2 <= top.bound() as f32 {
+                    lists.push((b2, fl));
+                }
+            }
+            lists.sort_unstable_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
+            for &(b2, fl) in &lists {
+                if ch as f32 + b2 > top.bound() as f32 {
+                    break;
+                }
+                let range = ivf.list_range(fl);
+                if let Some(s) = stats.as_deref_mut() {
+                    s.rows += range.len() as u64;
+                }
+                for i in range {
+                    let id = ivf.id(i);
+                    top.offer(TlshMatch {
+                        index: id.into(),
+                        distance: row_cost(ch, &rows[id as usize]),
+                    });
+                }
+            }
+        }
+    }
+    top.into_sorted()
 }
