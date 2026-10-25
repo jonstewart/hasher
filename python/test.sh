@@ -1,4 +1,5 @@
-#!/bin/bash -e
+#!/usr/bin/env bash
+set -e
 
 # Run the Python unit tests against the freshly built libhasher, if any
 # (.so on Linux, .dylib on macOS). hasher.load_library() falls back to
