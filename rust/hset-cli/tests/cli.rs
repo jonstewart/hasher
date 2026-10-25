@@ -921,3 +921,237 @@ fn reindex_keeps_a_cpp_merged_index_verbatim() {
     }
     eprintln!("{seen} C++ fixtures checked");
 }
+
+/// What `hset knn` prints for `query` as given: one
+/// `query<TAB>distance<TAB>row<TAB>digest` line per match of
+/// `Hashset::tlsh_knn`, or `query<TAB>none`.
+fn library_knn(file: &Path, query: &str, k: usize, max_distance: u32, length: bool) -> String {
+    let bytes = std::fs::read(file).unwrap();
+    let hs = hset::Hashset::load(&bytes).unwrap();
+    let idx = hs.index_for_type(hset::HashType::Tlsh).unwrap();
+    let q = TlshDigest::from_hex(query).unwrap();
+    let rows = hs.tlsh_rows(idx).unwrap();
+    let matches = hs.tlsh_knn(idx, &q, k, max_distance, length).unwrap();
+    if matches.is_empty() {
+        return format!("{query}\tnone\n");
+    }
+    matches
+        .iter()
+        .map(|m| {
+            let d = TlshDigest(rows[m.index as usize]);
+            format!("{query}\t{}\t{}\t{}\n", m.distance, m.index, d.to_hex())
+        })
+        .collect()
+}
+
+#[test]
+fn knn_finds_a_member_at_distance_zero_as_the_library_does() {
+    let dir = tmpdir("tlsh-knn");
+    let f = dir.join("t.hset");
+    made_tlsh(&f, &[]);
+    let digests = hset_testkit::tlsh::example_digests();
+    let q = &digests[3];
+    let o = run(&["knn", p(&f), q]);
+    assert!(o.status.success(), "{}", stderr(&o));
+    let s = stdout(&o);
+    let first = s.lines().next().unwrap();
+    assert!(first.starts_with(&format!("{q}\t0\t")), "{s}");
+    assert!(first.ends_with(&format!("\t{q}")), "{s}");
+    // Defaults: k = 10, max distance 144, with the length term.
+    assert_eq!(s, library_knn(&f, q, 10, 144, true));
+    assert!(s.lines().count() <= 10);
+}
+
+#[test]
+fn knn_strategies_and_options_agree_with_the_library() {
+    let dir = tmpdir("tlsh-knn-strategies");
+    let f = dir.join("t.hset");
+    made_tlsh(&f, &[]);
+    let mut queries = hset_testkit::tlsh::example_digests();
+    queries.extend((0..10).map(absent_digest));
+    for (k, maxd, length) in [
+        (10, 144, true),
+        (3, 60, true),
+        (25, 300, false),
+        (1, 0, true),
+    ] {
+        let ks = k.to_string();
+        let ms = maxd.to_string();
+        let mut want = String::new();
+        for q in &queries {
+            want.push_str(&library_knn(&f, q, k, maxd, length));
+        }
+        for strategy in ["auto", "brute", "index"] {
+            let mut args = vec![
+                "knn",
+                p(&f),
+                "-k",
+                &ks,
+                "--max-distance",
+                &ms,
+                "--strategy",
+                strategy,
+            ];
+            if !length {
+                args.push("--no-length");
+            }
+            args.extend(queries.iter().map(String::as_str));
+            let o = run(&args);
+            assert!(o.status.code().is_some_and(|c| c <= 1), "{}", stderr(&o));
+            assert_eq!(
+                stdout(&o),
+                want,
+                "k {k} max {maxd} length {length} {strategy}"
+            );
+        }
+    }
+}
+
+#[test]
+fn knn_records_stats_stdin_and_exit_status() {
+    let dir = tmpdir("tlsh-knn-records");
+    let f = dir.join("t.hset");
+    made_tlsh(&f, &[]);
+    let digests = hset_testkit::tlsh::example_digests();
+    let fake_md5 = hset_testkit::tlsh::fake_md5;
+    let d7 = &digests[7];
+
+    // Digest 7 is in records 7 and 82: two rows at distance 0, each
+    // printed with its record in place of the digest.
+    let o = run(&["knn", p(&f), "-k", "2", "--records", d7]);
+    assert!(o.status.success(), "{}", stderr(&o));
+    let s = stdout(&o);
+    let lines: Vec<&str> = s.lines().collect();
+    assert_eq!(lines.len(), 2, "{s}");
+    let mut records: Vec<&str> = lines
+        .iter()
+        .map(|l| {
+            let cols: Vec<&str> = l.split('\t').collect();
+            assert_eq!(cols.len(), 4, "{l}");
+            assert_eq!((cols[0], cols[1]), (d7.as_str(), "0"), "{l}");
+            cols[3]
+        })
+        .collect();
+    records.sort();
+    assert_eq!(
+        records,
+        vec![
+            format!("{} {d7}", fake_md5(7)),
+            format!("{} {d7}", fake_md5(82))
+        ]
+    );
+
+    // Stats: the index's work counters, as KnnStats counts them.
+    let bytes = std::fs::read(&f).unwrap();
+    let hs = hset::Hashset::load(&bytes).unwrap();
+    let idx = hs.index_for_type(hset::HashType::Tlsh).unwrap();
+    let mut stats = hset::tlsh::KnnStats::default();
+    let q = TlshDigest::from_hex(&digests[5]).unwrap();
+    hs.tlsh_knn_with(
+        idx,
+        &q,
+        10,
+        144,
+        true,
+        hset::hashset::KnnStrategy::Index,
+        Some(&mut stats),
+    )
+    .unwrap();
+    let o = run(&["knn", p(&f), "--stats", &digests[5]]);
+    assert!(o.status.success(), "{}", stderr(&o));
+    let s = stdout(&o);
+    assert_eq!(
+        s.lines().last().unwrap(),
+        format!(
+            "# {}: strategy=index cells={} lists={} rows={}",
+            digests[5], stats.cells, stats.lists, stats.rows
+        ),
+        "{s}"
+    );
+    assert_eq!(
+        s.lines().filter(|l| !l.starts_with('#')).count(),
+        library_knn(&f, &digests[5], 10, 144, true).lines().count()
+    );
+    let o = run(&["knn", p(&f), "--stats", "--strategy", "brute", &digests[5]]);
+    assert!(o.status.success(), "{}", stderr(&o));
+    assert_eq!(
+        stdout(&o).lines().last().unwrap(),
+        format!("# {}: strategy=brute rows=81", digests[5])
+    );
+
+    // Queries from stdin, blank lines skipped; one without a match within
+    // the bound makes the exit status 1.
+    let absent = absent_digest(2);
+    let o = run_with_stdin(
+        &["knn", p(&f), "-f", "-", "--max-distance", "0"],
+        &format!("{}\n\n{absent}\n", digests[2]),
+    );
+    assert_eq!(o.status.code(), Some(1), "{}", stderr(&o));
+    assert_eq!(
+        stdout(&o),
+        format!(
+            "{}{absent}\tnone\n",
+            library_knn(&f, &digests[2], 10, 0, true)
+        )
+    );
+}
+
+#[test]
+fn knn_errors_exit_2() {
+    let dir = tmpdir("tlsh-knn-errors");
+    let f = dir.join("t.hset");
+    made_tlsh(&f, &["--no-tlsh-index"]);
+    let ho = dir.join("ho.hset");
+    made_tlsh(&ho, &["--no-records"]);
+    let md5_only = dir.join("md5.hset");
+    make_two(&md5_only, &[]);
+    let d = hset_testkit::tlsh::example_digests()[0].clone();
+    for (args, what) in [
+        (vec!["knn", p(&f), "T1XYZ"], "malformed digest"),
+        (vec!["knn", p(&f), &format!("{d}0")], "trailing junk"),
+        (vec!["knn", p(&f)], "no queries"),
+        (
+            vec!["knn", p(&f), "--strategy", "index", &d],
+            "index strategy without a TIVF",
+        ),
+        (
+            vec!["knn", p(&ho), "--records", &d],
+            "records of a hashes-only file",
+        ),
+        (vec!["knn", p(&md5_only), &d], "no TLSH section"),
+        (vec!["knn", p(&f), "-k", "-1", &d], "negative k"),
+        (
+            vec!["knn", p(&f), "--max-distance", "-1", &d],
+            "negative max distance",
+        ),
+    ] {
+        let o = run(&args);
+        assert_eq!(o.status.code(), Some(2), "{what}: {}", stdout(&o));
+        assert!(!stderr(&o).is_empty(), "{what}");
+    }
+    // Brute force still answers the file without an index.
+    let o = run(&["knn", p(&f), &d]);
+    assert!(o.status.success(), "{}", stderr(&o));
+    assert_eq!(stdout(&o), library_knn(&f, &d, 10, 144, true));
+}
+
+/// The C++ `md5_tlsh.hset` fixture (`make check`): every strategy finds a
+/// member at distance 0 and answers as the library does.
+#[test]
+fn knn_on_the_cpp_fixture() {
+    let f = fixture("md5_tlsh.hset");
+    if !f.exists() {
+        eprintln!("skipping: {} not generated", f.display());
+        return;
+    }
+    let digests = hset_testkit::tlsh::example_digests();
+    for q in [&digests[0], &digests[7], &digests[42]] {
+        let want = library_knn(&f, q, 10, 144, true);
+        assert!(want.starts_with(&format!("{q}\t0\t")), "{want}");
+        for strategy in ["auto", "brute", "index"] {
+            let o = run(&["knn", p(&f), "--strategy", strategy, q]);
+            assert!(o.status.success(), "{}", stderr(&o));
+            assert_eq!(stdout(&o), want, "{strategy}");
+        }
+    }
+}

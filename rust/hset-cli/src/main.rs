@@ -8,11 +8,12 @@ use std::time::Instant;
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use hset::format::{self, Document, HashsetIn, HsetFile};
+use hset::hashset::KnnStrategy;
 use hset::lookup::{self, BatchMode, BitsPolicy, HintSpec, SearchConfig, SingleMode};
 use hset::tlsh::cells::{cell_index, cell_table};
 use hset::tlsh::{
-    CELL_HINT_TAG, DIGEST_LENGTH as TLSH_LENGTH, IvfBuildOptions, IvfIndex, TivfView, TlshDigest,
-    build_tlsh_ivf,
+    CELL_HINT_TAG, DIGEST_LENGTH as TLSH_LENGTH, IvfBuildOptions, IvfIndex, KnnStats, TivfView,
+    TlshDigest, build_tlsh_ivf,
 };
 use hset::{BuildOptions, Builder, HashType, Hashset, SetOp, builder, hex, ops, synth};
 
@@ -33,6 +34,26 @@ enum Cmd {
     Dump(DumpArgs),
     /// Look up hashes
     Query(QueryArgs),
+    /// Find the nearest TLSH digests to each query digest
+    ///
+    /// Searches the file's TLSH section for the k rows nearest each query
+    /// by TLSH distance, within --max-distance (inclusive), nearest first
+    /// and ties by row; every strategy gives the same answer. Prints, per
+    /// query, one line per match:
+    ///
+    ///   QUERY<TAB>DISTANCE<TAB>ROW<TAB>DIGEST
+    ///
+    /// where ROW is the match's position in the section's sorted rows and
+    /// DIGEST its T1 hex (with --records, the row's record as `dump`
+    /// prints it in place of DIGEST), or `QUERY<TAB>none` when nothing is
+    /// within the bound. With --stats each query's matches are followed by
+    ///
+    ///   # QUERY: strategy=index cells=C lists=L rows=R
+    ///
+    /// (nonempty cells visited, lists bounded, rows scanned), or
+    /// `# QUERY: strategy=brute rows=R`. Exit status 0 when every query has
+    /// a match, 1 when some query has none, 2 on any error.
+    Knn(KnnArgs),
     /// Check digest, ordering, record links, hint soundness, and TLSH cell hints and indexes
     Verify(FileArg),
     /// Union of two hash sets
@@ -224,6 +245,45 @@ struct DumpArgs {
     /// Dump records (default when the file has records and no type is given)
     #[arg(long)]
     records: bool,
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum, PartialEq, Eq)]
+enum KnnKind {
+    /// The TIVF index when the file has one, else brute force
+    Auto,
+    /// The distance to every row
+    Brute,
+    /// The TIVF index (an error when the file has none)
+    Index,
+}
+
+#[derive(Args)]
+struct KnnArgs {
+    /// An .hset file with a TLSH section
+    file: PathBuf,
+    /// Read query digests, one per line, from this file (`-` is stdin)
+    #[arg(short = 'f', long)]
+    from: Option<PathBuf>,
+    /// Most matches per query
+    #[arg(short = 'k', default_value_t = 10)]
+    k: usize,
+    /// Largest TLSH distance to report (inclusive)
+    #[arg(long, default_value_t = 144)]
+    max_distance: u32,
+    /// Leave the length term out of the distance
+    #[arg(long)]
+    no_length: bool,
+    /// Search strategy
+    #[arg(long, value_enum, default_value_t = KnnKind::Auto)]
+    strategy: KnnKind,
+    /// Print each match's record in place of its digest
+    #[arg(short = 'r', long)]
+    records: bool,
+    /// Print each query's search work after its matches
+    #[arg(long)]
+    stats: bool,
+    /// Query digests: `T1` and 70 hex digits, or the digits alone
+    digests: Vec<String>,
 }
 
 #[derive(Args)]
@@ -614,14 +674,11 @@ fn query_hash_len(text: &str) -> usize {
     }
 }
 
-fn cmd_query(a: QueryArgs) -> CliResult<ExitCode> {
-    let m = map_file(&a.file)?;
-    let hs = load(&m, &a.file)?;
-    if hs.section_count() == 0 {
-        return err("file has no hash sections");
-    }
-    let mut lines: Vec<String> = a.hashes.clone();
-    if let Some(p) = &a.from {
+/// The queries of `query` and `knn`: the arguments, then the trimmed
+/// non-blank lines of `from` (`-` is stdin); none at all is an error.
+fn query_lines(args: &[String], from: Option<&Path>) -> CliResult<Vec<String>> {
+    let mut lines: Vec<String> = args.to_vec();
+    if let Some(p) = from {
         for line in open_input(p)?.lines() {
             let line = line.map_err(|e| format!("{}: {e}", p.display()))?;
             let line = line.trim();
@@ -633,6 +690,16 @@ fn cmd_query(a: QueryArgs) -> CliResult<ExitCode> {
     if lines.is_empty() {
         return err("no hashes given (pass them as arguments or with --from)");
     }
+    Ok(lines)
+}
+
+fn cmd_query(a: QueryArgs) -> CliResult<ExitCode> {
+    let m = map_file(&a.file)?;
+    let hs = load(&m, &a.file)?;
+    if hs.section_count() == 0 {
+        return err("file has no hash sections");
+    }
+    let lines = query_lines(&a.hashes, a.from.as_deref())?;
     let idx = section_for(&hs, a.r#type, Some(query_hash_len(&lines[0])))?;
     let s = hs.section(idx);
     let hl = s.hash_length();
@@ -687,6 +754,100 @@ fn cmd_query(a: QueryArgs) -> CliResult<ExitCode> {
         }
     }
     Ok(if missing == 0 {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::from(1)
+    })
+}
+
+fn cmd_knn(a: KnnArgs) -> CliResult<ExitCode> {
+    let m = map_file(&a.file)?;
+    let hs = load(&m, &a.file)?;
+    let idx = hs
+        .index_for_type(HashType::Tlsh)
+        .ok_or("file has no TLSH section")?;
+    let rows = hs.tlsh_rows(idx).map_err(|e| e.to_string())?;
+    let s = hs.section(idx);
+    if a.records && s.ridx.is_none() {
+        return err("file has no records");
+    }
+    let lines = query_lines(&a.digests, a.from.as_deref())?;
+    let queries = lines
+        .iter()
+        .map(|l| TlshDigest::from_hex(l).map_err(|e| format!("'{l}': {e}")))
+        .collect::<CliResult<Vec<_>>>()?;
+    let strategy = match a.strategy {
+        KnnKind::Brute => KnnStrategy::Brute,
+        KnnKind::Index => KnnStrategy::Index,
+        KnnKind::Auto
+            if hs
+                .tlsh_knn_strategies(idx)
+                .map_err(|e| e.to_string())?
+                .index =>
+        {
+            KnnStrategy::Index
+        }
+        KnnKind::Auto => KnnStrategy::Brute,
+    };
+
+    let out = io::stdout();
+    let mut o = BufWriter::new(out.lock());
+    let mut unmatched = 0usize;
+    for (l, q) in lines.iter().zip(&queries) {
+        let mut stats = KnnStats::default();
+        let matches = hs
+            .tlsh_knn_with(
+                idx,
+                q,
+                a.k,
+                a.max_distance,
+                !a.no_length,
+                strategy,
+                Some(&mut stats),
+            )
+            .map_err(|e| e.to_string())?;
+        if matches.is_empty() {
+            unmatched += 1;
+            let _ = writeln!(o, "{l}\tnone");
+        }
+        for mt in &matches {
+            let _ = write!(o, "{l}\t{}\t{}\t", mt.distance, mt.index);
+            let row = mt.index as usize;
+            match s.record_index(row).filter(|_| a.records) {
+                Some(r) => {
+                    let rec = hs
+                        .record(r as usize)
+                        .ok_or_else(|| format!("row {row}: record {r} out of range"))?;
+                    let _ = write_record_line(&hs, rec, &mut o);
+                }
+                None => {
+                    let _ = TlshDigest(rows[row]).write_hex(&mut o);
+                    let _ = o.write_all(b"\n");
+                }
+            }
+        }
+        if a.stats {
+            let _ = match strategy {
+                KnnStrategy::Index => writeln!(
+                    o,
+                    "# {l}: strategy=index cells={} lists={} rows={}",
+                    stats.cells, stats.lists, stats.rows
+                ),
+                // brute force computes every row's distance, unless there
+                // is nothing to search for
+                KnnStrategy::Brute => writeln!(
+                    o,
+                    "# {l}: strategy=brute rows={}",
+                    if a.k == 0 || q.is_null() {
+                        0
+                    } else {
+                        rows.len()
+                    }
+                ),
+            };
+        }
+    }
+    Ok(if unmatched == 0 {
         ExitCode::SUCCESS
     } else {
         ExitCode::from(1)
@@ -1045,6 +1206,7 @@ fn run(cli: Cli) -> CliResult<ExitCode> {
         Cmd::Info(a) => cmd_info(a).map(|()| ExitCode::SUCCESS),
         Cmd::Dump(a) => cmd_dump(a).map(|()| ExitCode::SUCCESS),
         Cmd::Query(a) => cmd_query(a),
+        Cmd::Knn(a) => cmd_knn(a),
         Cmd::Verify(a) => cmd_verify(a),
         Cmd::Union(a) => cmd_setop(SetOp::Union, a).map(|()| ExitCode::SUCCESS),
         Cmd::Intersect(a) => cmd_setop(SetOp::Intersect, a).map(|()| ExitCode::SUCCESS),
