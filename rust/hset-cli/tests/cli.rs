@@ -13,10 +13,28 @@ fn fixture(name: &str) -> PathBuf {
     hset_testkit::fixtures::fixtures_dir().join(name)
 }
 
-fn tmpdir(tag: &str) -> PathBuf {
+/// A scratch directory, removed with its contents by its `Drop` impl (also
+/// when the test fails); derefs to its path.
+struct TempDir(PathBuf);
+
+impl std::ops::Deref for TempDir {
+    type Target = Path;
+
+    fn deref(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl Drop for TempDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+fn tmpdir(tag: &str) -> TempDir {
     let d = std::env::temp_dir().join(format!("hset-cli-{tag}-{}", std::process::id()));
     std::fs::create_dir_all(&d).unwrap();
-    d
+    TempDir(d)
 }
 
 fn run(args: &[&str]) -> Output {
@@ -1501,7 +1519,6 @@ fn coalesce_4294967295_is_hsetops_default_sentinel() {
         setop_ok("union", &master, &batch, &out, extra, env);
         assert_eq!(tivf_lists(&out), Some(lists), "{extra:?} {env:?}");
     }
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// The lines `hset dump f extra..` prints, as a set.
