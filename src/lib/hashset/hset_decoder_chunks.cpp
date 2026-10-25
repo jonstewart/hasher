@@ -4,6 +4,8 @@
 #include "rwutil.h"
 #include "tlsh_embedding.h"
 
+#include <algorithm>
+
 Chunk decode_chunk(const uint8_t* beg, const uint8_t*& cur, const uint8_t* end) {
   const uint32_t type = read_be<uint32_t>(beg, cur, end);
   const uint64_t len = read_le<uint64_t>(beg, cur, end);
@@ -61,6 +63,16 @@ RecordHeader parse_rhdr(const Chunk& ch) {
         read_pstring<std::string>(ch.dbeg, cur, ch.dend),
         read_le<uint64_t>(ch.dbeg, cur, ch.dend)
       }
+    );
+    // fields are found by type, so a type listed twice is ambiguous
+    // (mkhashset refuses to write one)
+    const auto t = rhdr.fields.back().type;
+    THROW_IF(
+      std::count_if(
+        rhdr.fields.begin(), rhdr.fields.end(),
+        [t](const RecordFieldDescriptor& f) { return f.type == t; }
+      ) > 1,
+      "RHDR lists hash type " << t << " twice"
     );
   }
 
