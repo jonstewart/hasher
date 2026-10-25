@@ -6,7 +6,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use hset::format::{Document, HashsetIn, Hint, RecordsIn, decode, encode};
 use hset::tlsh::cells::{cell_index, cell_table};
-use hset::{BuildOptions, Builder, HashType, Hashset, HintSpec, SetOp, hex, ops};
+use hset::merge::{MergeOptions, merge};
+use hset::{BuildOptions, Builder, HashType, Hashset, HintSpec, SetOp, hex};
 use sha2::{Digest, Sha256};
 
 fn fixture_path(name: &str) -> PathBuf {
@@ -363,31 +364,30 @@ fn reencoding_with_the_legacy_hint_is_byte_exact() {
     );
 }
 
+/// The C++ builder-shaped set operation on md5_sha1_a and md5_sha1_b
+/// (`sfhash_hashset_builder_*_open`, test_hset_round_trip.cpp), redone by
+/// `merge::merge` with the legacy hint C++ writes: every payload but the
+/// metadata is the same.
 fn setop_fixture_matches(op: SetOp, expected: &str) {
     let a = fixture("md5_sha1_a.hset");
     let b = fixture("md5_sha1_b.hset");
-    let fa = decode(&a).unwrap();
-    let fb = decode(&b).unwrap();
-    let builder = ops::apply(op, &fa, &fb).unwrap();
-    let out = builder.build(&BuildOptions::new("c", op.name())).unwrap();
+    let (ha, hb) = (Hashset::load(&a).unwrap(), Hashset::load(&b).unwrap());
+    let mut opts = MergeOptions::new("c", op.name());
+    opts.hint = HintSpec::LEGACY;
+    let out = merge(op, &ha, &hb, &opts).unwrap();
     let ours = decode(&out).unwrap();
     let exp_bytes = fixture(expected);
     let exp = decode(&exp_bytes).unwrap();
-    assert_eq!(
-        ours.rhdr.as_ref().unwrap().fields,
-        exp.rhdr.as_ref().unwrap().fields
-    );
-    assert_eq!(ours.record_count(), exp.record_count(), "{}", op.name());
-    assert_eq!(ours.rdat, exp.rdat, "{} records differ", op.name());
+    let what = op.name();
+    assert_eq!(ours.rhdr, exp.rhdr, "{what} RHDR");
+    assert!(ours.rdat == exp.rdat, "{what} records differ");
+    assert_eq!(ours.sections.len(), exp.sections.len(), "{what} sections");
     for (x, y) in ours.sections.iter().zip(&exp.sections) {
-        assert_eq!(x.header.htype, y.header.htype);
-        assert_eq!(
-            x.data,
-            y.data,
-            "{} {} hashes differ",
-            op.name(),
-            x.header.name
-        );
+        let name = &x.header.name;
+        assert_eq!(x.header, y.header, "{what} {name} header");
+        assert!(x.data == y.data, "{what} {name} hashes differ");
+        assert!(x.ridx == y.ridx, "{what} {name} RIDX differs");
+        assert!(x.hint == y.hint, "{what} {name} hint differs");
     }
     assert!(Hashset::load(&out).unwrap().verify().is_ok());
 }
