@@ -4,6 +4,7 @@
 //! `test/test_hset_merge_incremental.cpp` (structural validity, the
 //! coalescing invariant on a hand-built cell).
 
+use hset::Error;
 use hset::tlsh::TlshDigest;
 use hset::tlsh::ivf::{IvfIndex, TivfView, TlshIvf, tivf_len};
 
@@ -252,6 +253,105 @@ fn parsing_does_not_rely_on_the_payload_alignment() {
     buf.extend(ivf.to_bytes());
     let v = TivfView::parse(&buf[1..], 6).unwrap();
     assert_eq!(TlshIvf::from_index(&v), ivf);
+}
+
+/// `parse` fails with a format error mentioning `needle`.
+#[track_caller]
+fn assert_rejected(payload: &[u8], expected_n: u64, needle: &str) {
+    match TivfView::parse(payload, expected_n) {
+        Err(Error::Format(msg)) => assert!(msg.contains(needle), "{msg:?} lacks {needle:?}"),
+        other => panic!("expected a format error mentioning {needle:?}, got {other:?}"),
+    }
+}
+
+/// The `two_lists` payload with `patch` applied.
+fn patched(patch: impl FnOnce(&mut Vec<u8>)) -> Vec<u8> {
+    let mut b = two_lists().ivf.to_bytes();
+    patch(&mut b);
+    b
+}
+
+fn put_u32(b: &mut [u8], at: usize, v: u32) {
+    b[at..at + 4].copy_from_slice(&v.to_le_bytes());
+}
+
+fn put_u64(b: &mut [u8], at: usize, v: u64) {
+    b[at..at + 8].copy_from_slice(&v.to_le_bytes());
+}
+
+/// Offset of list_start[0] in the `two_lists` payload.
+const TWO_LISTS_START: usize = MEDOIDS + 2 * 36 + 2 * 4;
+
+#[test]
+fn a_payload_shorter_than_the_header_is_rejected() {
+    let b = two_lists().ivf.to_bytes();
+    assert_rejected(&[], 0, "header");
+    assert_rejected(&b[..31], 6, "header");
+}
+
+#[test]
+fn a_payload_of_the_wrong_length_is_rejected() {
+    // tlsh_ivf_serialization_round_trip: truncated by one byte
+    let b = two_lists().ivf.to_bytes();
+    assert_rejected(&b[..b.len() - 1], 6, "expected 262308");
+    assert_rejected(&patched(|b| b.push(0)), 6, "expected 262308");
+    // the header's counts no longer describe the bytes
+    assert_rejected(&patched(|b| put_u32(b, 8, 3)), 6, "expected 262356");
+    assert_rejected(&patched(|b| put_u64(b, 16, 7)), 6, "expected 262312");
+    assert_rejected(
+        &patched(|b| put_u32(b, 8, u32::MAX)),
+        6,
+        "4294967295 lists",
+    );
+}
+
+#[test]
+fn unknown_header_values_are_rejected() {
+    // hset_tlsh_index_decode_rejects_corruption: version and dims
+    assert_rejected(&patched(|b| b[0] = 9), 6, "version 9");
+    assert_rejected(&patched(|b| b[4] = 7), 6, "dims 263");
+    // Rust only: flags and reserved fields C++ ignores must be zero
+    assert_rejected(&patched(|b| b[2] = 1), 6, "flags");
+    assert_rejected(&patched(|b| b[15] = 1), 6, "reserved");
+    assert_rejected(&patched(|b| b[24] = 1), 6, "reserved");
+}
+
+#[test]
+fn a_row_count_other_than_the_sections_is_rejected() {
+    // handle_tivf: "TIVF has n rows, expected hash_count"
+    let b = two_lists().ivf.to_bytes();
+    assert_rejected(&b, 7, "6 rows, expected 7");
+    assert_rejected(&b, 5, "6 rows, expected 5");
+}
+
+#[test]
+fn cell_lists_must_start_at_0_and_end_at_the_list_count() {
+    assert_rejected(&patched(|b| put_u32(b, 32, 1)), 6, "cell_lists");
+    assert_rejected(
+        &patched(|b| put_u32(b, 32 + 4 * CELLS, 1)),
+        6,
+        "cell_lists",
+    );
+}
+
+#[test]
+fn list_start_must_cover_the_rows_without_decreasing() {
+    assert_rejected(
+        &patched(|b| put_u64(b, TWO_LISTS_START, 1)),
+        6,
+        "do not cover the rows",
+    );
+    assert_rejected(
+        &patched(|b| put_u64(b, TWO_LISTS_START + 16, 5)),
+        6,
+        "do not cover the rows",
+    );
+    // list_start = [0, 7, 6]: in range at both ends, decreasing between
+    assert_rejected(
+        &patched(|b| put_u64(b, TWO_LISTS_START + 8, 7)),
+        6,
+        "nondecreasing",
+    );
 }
 
 #[test]

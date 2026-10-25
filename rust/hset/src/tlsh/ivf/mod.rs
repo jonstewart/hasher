@@ -195,15 +195,39 @@ pub struct TivfView<'a> {
 impl<'a> TivfView<'a> {
     /// Parse a payload.
     pub fn parse(payload: &'a [u8], expected_n: u64) -> Result<Self> {
-        let _ = expected_n;
         let Some((header, body)) = payload.split_first_chunk::<TIVF_HEADER_LENGTH>() else {
             return Err(Error::format(format!(
                 "TIVF payload is {} bytes, shorter than its {TIVF_HEADER_LENGTH}-byte header",
                 payload.len()
             )));
         };
-        let lists = u32::from_le_bytes(header[8..12].try_into().expect("4 bytes"));
-        let n = u64::from_le_bytes(header[16..24].try_into().expect("8 bytes"));
+        let (version, rest) = header.split_first_chunk::<2>().expect("32 bytes");
+        let (flags, rest) = rest.split_first_chunk::<2>().expect("30 bytes");
+        let (dims, rest) = rest.split_first_chunk::<4>().expect("28 bytes");
+        let (lists, rest) = rest.split_first_chunk::<4>().expect("24 bytes");
+        let (reserved32, rest) = rest.split_first_chunk::<4>().expect("20 bytes");
+        let (n, rest) = rest.split_first_chunk::<8>().expect("16 bytes");
+        let (reserved64, _) = rest.split_first_chunk::<8>().expect("8 bytes");
+
+        let version = u16::from_le_bytes(*version);
+        if version != TIVF_VERSION {
+            return Err(Error::format(format!("unsupported TIVF version {version}")));
+        }
+        let flags = u16::from_le_bytes(*flags);
+        if flags != 0 {
+            return Err(Error::format(format!(
+                "unsupported TIVF flags 0x{flags:04x}"
+            )));
+        }
+        let dims = u32::from_le_bytes(*dims);
+        if dims != TIVF_DIMS {
+            return Err(Error::format(format!("unsupported TIVF dims {dims}")));
+        }
+        if *reserved32 != [0; 4] || *reserved64 != [0; 8] {
+            return Err(Error::format("TIVF reserved header fields are not zero"));
+        }
+        let lists = u32::from_le_bytes(*lists);
+        let n = u64::from_le_bytes(*n);
         let want = tivf_len(lists, n);
         if payload.len() as u64 != want {
             return Err(Error::format(format!(
@@ -217,14 +241,36 @@ impl<'a> TivfView<'a> {
         let (medoids, body) = body.split_at(DIGEST_LENGTH * lists);
         let (radius2, body) = body.split_at(4 * lists);
         let (list_start, ids) = body.split_at(8 * (lists + 1));
-        Ok(Self {
+        let v = Self {
             n,
             cell_lists: cell_lists.as_chunks().0,
             medoids: medoids.as_chunks().0,
             radius2: radius2.as_chunks().0,
             list_start: list_start.as_chunks().0,
             ids: ids.as_chunks().0,
-        })
+        };
+
+        if n != expected_n {
+            return Err(Error::format(format!(
+                "TIVF has {n} rows, expected {expected_n}"
+            )));
+        }
+        if v.cell_lists(0) != 0 || v.cell_lists(CELL_COUNT) as usize != lists {
+            return Err(Error::format(format!(
+                "bad TIVF cell_lists: [0] = {}, [{CELL_COUNT}] = {}, expected 0 and {lists}",
+                v.cell_lists(0),
+                v.cell_lists(CELL_COUNT)
+            )));
+        }
+        if v.list_start(0) != 0 || v.list_start(lists) != n {
+            return Err(Error::format("TIVF list offsets do not cover the rows"));
+        }
+        if v.list_start.windows(2).any(|w| {
+            u64::from_le_bytes(w[0]) > u64::from_le_bytes(w[1])
+        }) {
+            return Err(Error::format("TIVF list offsets are not nondecreasing"));
+        }
+        Ok(v)
     }
 }
 
