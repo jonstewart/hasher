@@ -35,6 +35,187 @@ pub fn merged_record_fields(
     Ok(fields)
 }
 
+/// The result of [`merge_records`].
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct RecordMerge {
+    /// The output fields ([`merged_record_fields`]).
+    pub fields: Vec<FieldDescriptor>,
+    /// Bytes per output record.
+    pub record_length: u64,
+    /// The output records (an `RDAT` payload), sorted and unique.
+    pub rdat: Vec<u8>,
+    /// Output record of each left record, or [`RECORD_DROPPED`].
+    pub lmap: Vec<u64>,
+    /// Output record of each right record, or [`RECORD_DROPPED`].
+    pub rmap: Vec<u64>,
+}
+
+impl RecordMerge {
+    /// Number of output records.
+    pub fn record_count(&self) -> u64 {
+        (self.rdat.len() as u64)
+            .checked_div(self.record_length)
+            .unwrap_or(0)
+    }
+
+    /// The `RHDR` of the output.
+    pub fn header(&self) -> RecordHeader {
+        RecordHeader {
+            record_length: self.record_length,
+            record_count: self.record_count(),
+            fields: self.fields.clone(),
+        }
+    }
+}
+
+/// Merges two record tables (`ldat` and `rdat` hold the records their
+/// headers describe). The output fields are [`merged_record_fields`];
+/// records are widened to them (an absent field is a zero presence byte and
+/// a zero value) and merged in sorted order, identical records collapsing to
+/// the left copy. For intersection and difference only left records are
+/// emitted, so `rmap` is all [`RECORD_DROPPED`].
+pub fn merge_records(
+    op: SetOp,
+    lhdr: &RecordHeader,
+    ldat: &[u8],
+    rhdr: &RecordHeader,
+    rdat: &[u8],
+) -> Result<RecordMerge> {
+    let fields = merged_record_fields(lhdr, rhdr)?;
+    let len: usize = fields.iter().map(FieldDescriptor::stride).sum();
+    let l = Widened::new(lhdr, ldat, &fields, len, "left")?;
+    let r = Widened::new(rhdr, rdat, &fields, len, "right")?;
+
+    let rcap = if op == SetOp::Union { r.data.len() } else { 0 };
+    let mut m = RecordMerge {
+        fields,
+        record_length: len as u64,
+        rdat: Vec::with_capacity(l.data.len() + rcap),
+        lmap: vec![RECORD_DROPPED; l.n],
+        rmap: vec![RECORD_DROPPED; r.n],
+    };
+    let mut out = 0u64;
+    let mut emit = |w: &Widened, k: usize, map: &mut [u64], rdat: &mut Vec<u8>| {
+        map[k] = out;
+        out += 1;
+        rdat.extend_from_slice(w.get(k));
+    };
+    let (mut i, mut j) = (0, 0);
+    while i < l.n || j < r.n {
+        let c = if i < l.n && j < r.n {
+            l.sorted(i).cmp(r.sorted(j))
+        } else if i < l.n {
+            Ordering::Less
+        } else {
+            Ordering::Greater
+        };
+        match c {
+            Ordering::Less => {
+                if op != SetOp::Intersect {
+                    emit(&l, l.order[i], &mut m.lmap, &mut m.rdat);
+                }
+                i += 1;
+            }
+            Ordering::Greater => {
+                if op == SetOp::Union {
+                    emit(&r, r.order[j], &mut m.rmap, &mut m.rdat);
+                }
+                j += 1;
+            }
+            Ordering::Equal => {
+                // identical records: the left copy stands for both, so the
+                // right record (and its rows) is dropped whatever the operation
+                if op != SetOp::Subtract {
+                    emit(&l, l.order[i], &mut m.lmap, &mut m.rdat);
+                }
+                i += 1;
+                j += 1;
+            }
+        }
+    }
+    Ok(m)
+}
+
+/// One side's records rewritten to the output fields, with their sorted order.
+struct Widened {
+    data: Vec<u8>,
+    len: usize,
+    n: usize,
+    /// Record indices in ascending record order.
+    order: Vec<usize>,
+}
+
+impl Widened {
+    /// The records `data` of `hdr` rewritten to the output `fields` (`len`
+    /// bytes each); a field the input lacks is a zero presence byte and value.
+    fn new(
+        hdr: &RecordHeader,
+        data: &[u8],
+        fields: &[FieldDescriptor],
+        len: usize,
+        side: &str,
+    ) -> Result<Self> {
+        let ilen = hdr.computed_record_length();
+        if hdr.record_length != ilen as u64 {
+            return Err(Error::format(format!(
+                "the {side} record length {} disagrees with its fields ({ilen} bytes)",
+                hdr.record_length
+            )));
+        }
+        let n = usize::try_from(hdr.record_count)
+            .ok()
+            .filter(|n| n.checked_mul(ilen) == Some(data.len()))
+            .ok_or_else(|| {
+                Error::format(format!(
+                    "the {side} record data has {} bytes, not {} records of {ilen}",
+                    data.len(),
+                    hdr.record_count
+                ))
+            })?;
+        // (output offset, input offset, bytes) of every field the input has
+        let mut moves = Vec::new();
+        let mut ooff = 0;
+        for f in fields {
+            if let Some(ioff) = hdr.field_offset(f.htype) {
+                moves.push((ooff, ioff, f.stride()));
+            }
+            ooff += f.stride();
+        }
+        let mut out = vec![0u8; n * len];
+        if ilen > 0 && len > 0 {
+            for (src, dst) in data.chunks_exact(ilen).zip(out.chunks_exact_mut(len)) {
+                for &(o, i, b) in &moves {
+                    dst[o..o + b].copy_from_slice(&src[i..i + b]);
+                }
+            }
+        }
+        let mut w = Widened {
+            data: out,
+            len,
+            n,
+            order: (0..n).collect(),
+        };
+        // the identity when the records are already sorted, which they are
+        // unless widening reordered the fields
+        if !w.order.is_sorted_by_key(|&k| w.get(k)) {
+            let mut order = std::mem::take(&mut w.order);
+            order.sort_by(|&a, &b| w.get(a).cmp(w.get(b)));
+            w.order = order;
+        }
+        Ok(w)
+    }
+
+    /// Record `k` in input order.
+    fn get(&self, k: usize) -> &[u8] {
+        &self.data[k * self.len..(k + 1) * self.len]
+    }
+
+    /// Record `i` in sorted order.
+    fn sorted(&self, i: usize) -> &[u8] {
+        self.get(self.order[i])
+    }
+}
+
 /// A row that the merge does not emit (the same value as the TLSH index's
 /// dropped-row marker).
 pub const DROPPED: u32 = u32::MAX;
@@ -196,17 +377,18 @@ impl RowOwners<'_> {
 
     /// The output record of each of the side's `n` rows, or [`RECORD_DROPPED`].
     fn output_records(&self, n: usize, side: &str) -> Result<Vec<u64>> {
-        if self.ridx.len() / 8 != n || self.ridx.len() % 8 != 0 {
+        let (entries, tail) = self.ridx.as_chunks::<8>();
+        if entries.len() != n || !tail.is_empty() {
             return Err(Error::input(format!(
                 "the {side} record index has {} bytes for {n} rows",
                 self.ridx.len()
             )));
         }
-        self.ridx
-            .chunks_exact(8)
+        entries
+            .iter()
             .enumerate()
-            .map(|(k, b)| {
-                let rec = u64::from_le_bytes(b.try_into().expect("8-byte chunk"));
+            .map(|(k, &b)| {
+                let rec = u64::from_le_bytes(b);
                 usize::try_from(rec)
                     .ok()
                     .and_then(|rec| self.recmap.get(rec).copied())
@@ -234,7 +416,7 @@ impl<'a> Rows<'a> {
         if len == 0 {
             return Err(Error::input("zero-length rows"));
         }
-        if data.len() % len != 0 {
+        if !data.len().is_multiple_of(len) {
             return Err(Error::input(format!(
                 "the {side} rows have {} bytes, not a multiple of the row length {len}",
                 data.len()

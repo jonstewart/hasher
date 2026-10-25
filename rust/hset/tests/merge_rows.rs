@@ -3,8 +3,10 @@
 //! merges) plus proptests against `BTreeSet` / `BTreeMap` models.
 
 use hset::format::{FieldDescriptor, RecordHeader};
-use hset::merge::merged_record_fields;
-use hset::merge::{DROPPED, RECORD_DROPPED, RowMerge, RowMode, RowOwners, merge_rows};
+use hset::merge::{
+    DROPPED, RECORD_DROPPED, RowMerge, RowMode, RowOwners, merge_records, merge_rows,
+    merged_record_fields,
+};
 use hset::ops::SetOp;
 use hset::{Error, HashType};
 
@@ -275,4 +277,86 @@ fn merged_fields_reject_a_type_with_two_lengths() {
             .contains("field md5 has length 16 on the left and 15 on the right"),
         "{e}"
     );
+}
+
+// one-byte fields A (md5), B (size), C (sha1): left has A B, right C B, so
+// widening reorders the right side's fields and it must be re-sorted
+fn fa() -> FieldDescriptor {
+    field(HashType::Md5, "a", 1)
+}
+fn fb() -> FieldDescriptor {
+    field(HashType::Size, "b", 1)
+}
+fn fc() -> FieldDescriptor {
+    field(HashType::Sha1, "c", 1)
+}
+
+// left records (A B), sorted
+const LREC: [u8; 12] = [
+    0, 0, 1, 7, // A absent, B 7
+    1, 1, 1, 5, // A 1, B 5
+    1, 2, 0, 0, // A 2, B absent
+];
+// right records (C B), sorted
+const RREC: [u8; 12] = [
+    0, 0, 1, 7, // C absent, B 7: equals left record 0 once widened
+    1, 1, 0, 0, // C 1, B absent
+    1, 3, 1, 2, // C 3, B 2
+];
+
+fn rec_merge(op: SetOp) -> hset::merge::RecordMerge {
+    let l = header(vec![fa(), fb()], 3);
+    let r = header(vec![fc(), fb()], 3);
+    merge_records(op, &l, &LREC, &r, &RREC).unwrap()
+}
+
+#[test]
+fn record_union_widens_resorts_and_keeps_the_left_copy_of_identical_records() {
+    let m = rec_merge(SetOp::Union);
+    assert_eq!(m.fields, [fa(), fb(), fc()]);
+    assert_eq!(m.record_length, 6);
+    // widened to A B C and sorted
+    #[rustfmt::skip]
+    let want = [
+        0, 0, 0, 0, 1, 1, // r1
+        0, 0, 1, 2, 1, 3, // r2
+        0, 0, 1, 7, 0, 0, // l0 (= r0)
+        1, 1, 1, 5, 0, 0, // l1
+        1, 2, 0, 0, 0, 0, // l2
+    ];
+    assert_eq!(m.rdat, want);
+    assert_eq!(m.record_count(), 5);
+    assert_eq!(m.lmap, [2, 3, 4]);
+    assert_eq!(m.rmap, [RD, 0, 1]);
+    assert_eq!(m.header(), header(vec![fa(), fb(), fc()], 5));
+}
+
+#[test]
+fn record_intersect_and_difference_emit_left_records_only() {
+    let m = rec_merge(SetOp::Intersect);
+    assert_eq!(m.rdat, [0, 0, 1, 7, 0, 0]);
+    assert_eq!(m.lmap, [0, RD, RD]);
+    assert_eq!(m.rmap, [RD; 3]);
+
+    let m = rec_merge(SetOp::Subtract);
+    assert_eq!(m.rdat, [1, 1, 1, 5, 0, 0, 1, 2, 0, 0, 0, 0]);
+    assert_eq!(m.lmap, [RD, 0, 1]);
+    assert_eq!(m.rmap, [RD; 3]);
+}
+
+#[test]
+fn record_merge_rejects_headers_that_disagree_with_the_data() {
+    let good = header(vec![fa(), fb()], 3);
+    let mut bad_len = good.clone();
+    bad_len.record_length = 5;
+    let mut bad_count = good.clone();
+    bad_count.record_count = 2;
+    for bad in [bad_len, bad_count] {
+        let e = merge_records(SetOp::Union, &bad, &LREC, &good, &LREC).unwrap_err();
+        assert!(matches!(e, Error::Format(_)), "{e}");
+        let e = merge_records(SetOp::Union, &good, &LREC, &bad, &LREC).unwrap_err();
+        assert!(matches!(e, Error::Format(_)), "{e}");
+    }
+    let e = merge_records(SetOp::Union, &good, &LREC[..8], &good, &LREC).unwrap_err();
+    assert!(matches!(e, Error::Format(_)), "{e}");
 }
