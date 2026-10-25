@@ -8,9 +8,108 @@
 
 use std::cmp::Ordering;
 
+use crate::builder::{TLSH_OPTION_INDEX, TLSH_OPTION_INDEX_KMEANS, TLSH_OPTION_INHERIT};
 use crate::error::{Error, Result};
 use crate::format::{FieldDescriptor, RecordHeader};
+use crate::hashset::Hashset;
+use crate::lookup::{BitsPolicy, HintSpec};
 use crate::ops::SetOp;
+use crate::tlsh::ivf::{DEFAULT_COALESCE, IvfBuildOptions};
+
+/// Whether a merge writes the `TIVF` index of a TLSH section.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TlshIndexPolicy {
+    /// Write it iff every input that has the TLSH section has an index
+    /// (C `SFHASH_HSET_TLSH_INHERIT`).
+    #[default]
+    Inherit,
+    /// Always write it (C `SFHASH_HSET_TLSH_INDEX`).
+    Write,
+    /// Never write it (C `tlsh_options` 0).
+    Omit,
+}
+
+impl TlshIndexPolicy {
+    /// The policy of the C `tlsh_options` bits (`SFHASH_HSET_TLSH_*`, as
+    /// `sfhash_hashset_merge` and `hsetop`'s `HSET_TLSH_OPTIONS` take
+    /// them):
+    ///
+    /// * `4` (`INHERIT`): [`Inherit`](Self::Inherit), whatever else is set
+    ///   (`write_merged_hset` tests it before `INDEX`);
+    /// * else `2` (`INDEX`): [`Write`](Self::Write);
+    /// * else [`Omit`](Self::Omit). Bit `1` (once `VECTORS`, now reserved)
+    ///   is ignored.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Input`] when bit `8` (`INDEX_KMEANS`, the k-means index
+    /// build, which is not ported; controller ruling 4) or any unknown bit
+    /// is set. C++ honours `8` when it rebuilds an index (and ignores it
+    /// under `INHERIT`) and ignores unknown bits.
+    pub fn from_tlsh_options(bits: u32) -> Result<Self> {
+        if bits & TLSH_OPTION_INDEX_KMEANS != 0 {
+            return Err(Error::input(
+                "TLSH option 8 (INDEX_KMEANS, the k-means index build) is not supported",
+            ));
+        }
+        let unknown = bits & !(1 | TLSH_OPTION_INDEX | TLSH_OPTION_INHERIT);
+        if unknown != 0 {
+            return Err(Error::input(format!(
+                "unknown TLSH option bits 0x{unknown:x} in {bits}"
+            )));
+        }
+        Ok(if bits & TLSH_OPTION_INHERIT != 0 {
+            TlshIndexPolicy::Inherit
+        } else if bits & TLSH_OPTION_INDEX != 0 {
+            TlshIndexPolicy::Write
+        } else {
+            TlshIndexPolicy::Omit
+        })
+    }
+}
+
+/// Options of [`merge`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct MergeOptions {
+    pub name: String,
+    pub desc: String,
+    pub timestamp: Option<String>,
+    pub write_records: bool,
+    pub write_hashsets: bool,
+    pub hint: HintSpec,
+    pub bits_policy: BitsPolicy,
+    pub tlsh_index: TlshIndexPolicy,
+    pub coalesce_threshold: u32,
+    pub ivf_build: IvfBuildOptions,
+}
+
+impl MergeOptions {
+    pub fn new(name: impl Into<String>, desc: impl Into<String>) -> Self {
+        MergeOptions {
+            name: name.into(),
+            desc: desc.into(),
+            timestamp: None,
+            write_records: true,
+            write_hashsets: true,
+            hint: HintSpec::Hull { bits: u8::MAX },
+            bits_policy: BitsPolicy::default(),
+            tlsh_index: TlshIndexPolicy::Inherit,
+            coalesce_threshold: DEFAULT_COALESCE,
+            ivf_build: IvfBuildOptions::default(),
+        }
+    }
+}
+
+/// The merge of two loaded files.
+pub fn merge(
+    op: SetOp,
+    left: &Hashset<'_>,
+    right: &Hashset<'_>,
+    opts: &MergeOptions,
+) -> Result<Vec<u8>> {
+    let _ = (op, left, right, opts);
+    Err(Error::input("not implemented"))
+}
 
 /// The output fields of merging two record tables: the left fields followed
 /// by the right fields the left lacks (fields are matched by type). A field
