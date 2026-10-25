@@ -114,7 +114,7 @@ impl TlshDigest {
         // The hex form nibble-swaps checksum and L and emits the body bytes
         // in reverse order; raw[2] is already our Q layout.
         let mut codes = [0u8; BUCKETS];
-        for (i, quad) in codes.chunks_exact_mut(4).enumerate() {
+        for (i, quad) in codes.as_chunks_mut::<4>().0.iter_mut().enumerate() {
             let code_byte = raw[3 + 31 - i];
             for (j, c) in quad.iter_mut().enumerate() {
                 *c = (code_byte >> (2 * j)) & 3;
@@ -149,7 +149,7 @@ impl TlshDigest {
         }
         buf[0] = b'T';
         buf[1] = b'1';
-        for (b, out) in raw.iter().zip(buf[2..].chunks_exact_mut(2)) {
+        for (b, out) in raw.iter().zip(buf[2..].as_chunks_mut::<2>().0) {
             out[0] = HEX_UPPER[(b >> 4) as usize];
             out[1] = HEX_UPPER[(b & 0x0F) as usize];
         }
