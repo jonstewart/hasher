@@ -24,7 +24,11 @@ fn hex_accepted(s: &str) -> bool {
 
 fn check_from_hex(s: &str) {
     let parsed = TlshDigest::from_hex(s);
-    assert_eq!(parsed.is_ok(), hex_accepted(s), "from_hex({s:?}) = {parsed:?}");
+    assert_eq!(
+        parsed.is_ok(),
+        hex_accepted(s),
+        "from_hex({s:?}) = {parsed:?}"
+    );
     let Ok(d) = parsed else { return };
     assert_eq!(s.parse::<TlshDigest>().ok(), Some(d));
     assert_eq!(d.as_bytes()[35], 0, "from_hex sets the reserved byte");
@@ -81,7 +85,10 @@ fn check_pair(a: &TlshDigest, b: &TlshDigest) {
     assert_eq!(BodyQuery::new(a).body(b.as_bytes()), body);
     assert_eq!(BodyQuery::new(a).emb_body(b.as_bytes()), emb);
     assert_eq!(emb, emb_body_dist2(b, a));
-    assert!(emb <= body, "embedding distance {emb} > body distance {body}");
+    assert!(
+        emb <= body,
+        "embedding distance {emb} > body distance {body}"
+    );
     if !a.is_null() {
         assert_eq!(diff(a, a, true), Some(0));
     }
