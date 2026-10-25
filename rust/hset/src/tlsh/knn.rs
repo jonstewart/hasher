@@ -98,11 +98,19 @@ impl TopK {
     }
 
     /// Offer a match; true if it was kept.
-    #[inline]
+    ///
+    /// The bound test is inlined into the scan loops, so the common
+    /// rejection costs no call (nor the register spills around one).
+    #[inline(always)]
     pub fn offer(&mut self, m: TlshMatch) -> bool {
         if m.distance > self.tau || self.k == 0 {
             return false;
         }
+        self.keep(m)
+    }
+
+    /// [`offer`](Self::offer) past the bound test.
+    fn keep(&mut self, m: TlshMatch) -> bool {
         if self.heap.len() < self.k {
             self.heap.push(m);
         } else {
