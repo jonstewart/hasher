@@ -1,10 +1,17 @@
-//! Row and record merges: the building blocks of merge-based set operations.
+//! Merge-based set operations on `.hset` files (C++ `hset_merge.cpp`,
+//! HASHSET_FORMAT "Set operations").
 //!
 //! A set operation on two hash sets is a two-pointer merge of their sorted
 //! sections. Each merge reports, for every input row (or record), the row it
 //! becomes in the output, or [`DROPPED`] ([`RECORD_DROPPED`] for records).
 //! The derived structures of a section (its `RIDX` record index, a TLSH
 //! `TIVF` index) are carried through the merge by those maps.
+//!
+//! * [`merge`] writes the union, intersection or difference of two loaded
+//!   files ([`MergeOptions`], [`TlshIndexPolicy`]), without re-sorting or
+//!   re-clustering anything.
+//! * [`merge_records`], [`merge_rows`] and [`RowMerge`] are its parts:
+//!   the record merge, the row merge and the row maps' gathers.
 
 use std::cmp::Ordering;
 
@@ -24,7 +31,8 @@ use crate::tlsh::ivf::{
 };
 use crate::tlsh::{CELL_HINT_TAG, DIGEST_LENGTH as TLSH_LENGTH};
 
-/// Whether a merge writes the `TIVF` index of a TLSH section.
+/// Whether a merge writes the `TIVF` index of a TLSH section
+/// ([`MergeOptions::tlsh_index`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum TlshIndexPolicy {
     /// Write it iff every input that has the TLSH section has an index
@@ -76,22 +84,46 @@ impl TlshIndexPolicy {
     }
 }
 
-/// Options of [`merge`].
+/// Options of [`merge`] (C++ `MergeOptions` plus the name, description
+/// and hints that `write_merged_hset` takes or fixes).
 #[derive(Debug, Clone, PartialEq)]
 pub struct MergeOptions {
+    /// The output's name (FHDR).
     pub name: String,
+    /// The output's description (FHDR).
     pub desc: String,
+    /// ISO-8601 UTC timestamp of the output; `None` means "now".
     pub timestamp: Option<String>,
+    /// Write the record table (`RHDR`, `RDAT`, and an `RIDX` per section)
+    /// when both inputs have one.
     pub write_records: bool,
+    /// Write the hash sections when the inputs have them.
     pub write_hashsets: bool,
+    /// The hint of each digest section, as [`BuildOptions::hint`]: the
+    /// default sizes hull hints by `bits_policy`; [`HintSpec::LEGACY`]
+    /// writes the `0x6208` block hint C++ writes. A TLSH section always
+    /// gets its `0x7400` cell index, recomputed from the merged rows.
+    ///
+    /// [`BuildOptions::hint`]: crate::BuildOptions::hint
     pub hint: HintSpec,
+    /// Sizes automatic hints, as [`BuildOptions::bits_policy`](crate::BuildOptions::bits_policy).
     pub bits_policy: BitsPolicy,
+    /// Whether TLSH sections get a `TIVF` index (default
+    /// [`TlshIndexPolicy::Inherit`]).
     pub tlsh_index: TlshIndexPolicy,
+    /// The coalescing threshold `C` of [`merge_tlsh_ivf`] (default
+    /// [`DEFAULT_COALESCE`], 64; 0 disables coalescing). C++'s
+    /// `SFHASH_HSET_COALESCE_DEFAULT` sentinel has no counterpart: pass
+    /// the value.
     pub coalesce_threshold: u32,
+    /// The BISECT build of an index made from scratch because an input
+    /// lacks one (default [`IvfBuildOptions::default`], C++'s).
     pub ivf_build: IvfBuildOptions,
 }
 
 impl MergeOptions {
+    /// Both write flags set, hull hints sized automatically, the index
+    /// inherited, the default coalescing threshold and index build.
     pub fn new(name: impl Into<String>, desc: impl Into<String>) -> Self {
         MergeOptions {
             name: name.into(),
@@ -108,7 +140,55 @@ impl MergeOptions {
     }
 }
 
-/// The merge of two loaded files.
+/// The union, intersection or difference (`left` minus `right`) of two
+/// loaded files, as a complete file image (C++ `write_merged_hset`, C
+/// `sfhash_hashset_merge` and the builder-shaped set operations).
+///
+/// * **Records.** When both inputs have records, the operation is applied
+///   to them ([`merge_records`]: widened to left's fields then right's
+///   extras, merged, identical records once), whether or not the table is
+///   written. Rows then follow their records: a row is emitted iff its
+///   record is, equal rows of different records stay duplicates, and
+///   `RIDX` is remapped through the record map. A hashsets-only output
+///   (`write_records` false) has each such row once.
+/// * **Sections.** With records on both sides, one section per output
+///   record field, named as the field; otherwise one per type of either
+///   input, left's in left's order then right's extras, with the first
+///   side's name. A type on one side only is merged against an empty run,
+///   rows as sets: equal rows once, the left copy.
+/// * **TLSH.** The cell hint is recomputed from the merged rows. The
+///   `TIVF` is written as [`MergeOptions::tlsh_index`] says; it is carried
+///   through the merge by [`merge_tlsh_ivf`] when every input with the
+///   section has one, else built from the merged rows by
+///   [`build_tlsh_ivf`].
+/// * **Layout** as [`format::encode()`] writes it: HDAT on a 4096-byte
+///   boundary, an exact FTOC, the SHA-256 over the file from offset 40.
+///
+/// # Errors
+///
+/// [`Error::Input`], with C++'s messages, when exactly one input has hash
+/// sections ("cannot merge a records-only hashset with one that has hash
+/// sections"), neither records nor sections are on both sides, the write
+/// flags leave nothing to write, a field has two lengths, a section's
+/// hash length is not its output field's, or in a record merge a side has
+/// a field without its section or a section without `RIDX`; also for a
+/// name or description over 65535 bytes. [`Error::Format`] when an input
+/// `TIVF` that the merge carries is not valid for its rows.
+///
+/// # Differences from the C++ library
+///
+/// * Index policy: one Rust default, [`TlshIndexPolicy::Inherit`]
+///   (`sfhash_hashset_merge`'s and `hsetop`'s); the C++ builder-shaped set
+///   operations default to writing the index (controller ruling 7).
+///   `INDEX_KMEANS` is not supported ([`TlshIndexPolicy::from_tlsh_options`]).
+/// * Hints: C++ writes the `0x6208` block hint on every section but SIZE;
+///   Rust writes [`MergeOptions::hint`] on digest sections only, as the
+///   builder does (none on SIZE or ENTROPY), and the cell index only on a
+///   36-byte TLSH section (a TLSH section of another length is opaque).
+/// * An input index is validated ([`Hashset::tlsh_index`]) before it is
+///   merged; C++ trusts it.
+/// * The output is returned, not written to a file, and its timestamp is
+///   [`MergeOptions::timestamp`] when given.
 pub fn merge(
     op: SetOp,
     left: &Hashset<'_>,
