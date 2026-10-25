@@ -659,7 +659,7 @@ def build():
 
     # 5
     B(h2(5, 'The chunk grammar'))
-    B('''<p>The decoder is a small state machine driven by the FTOC. After FHDR comes an optional record table (RHDR then RDAT), then any number of hash sections, then FEND. A hash section is a run of chunks that all belong to the HH header that opens it: a HINT (every hash type except <code>sizes</code>), the HDAT rows, and then only when the file has records a RIDX, and only for TLSH an optional TIVF, always in that order. A TIVF after a non-TLSH section is a hard error, and so is a TVEC anywhere: that chunk once stored the embedding of every row and is no longer part of the format.</p>''')
+    B('''<p>The decoder is a small state machine driven by the FTOC. After FHDR comes an optional record table (RHDR then RDAT), then any number of hash sections, then FEND, the last entry: an FTOC that lists anything after FEND is rejected. A hash section is a run of chunks that all belong to the HH header that opens it: a HINT (every hash type except <code>sizes</code>), the HDAT rows, and then only when the file has records a RIDX, and only for TLSH an optional TIVF, always in that order. A TIVF after a non-TLSH section is a hard error, and so is a TVEC anywhere: that chunk once stored the embedding of every row and is no longer part of the format.</p>''')
     B(fig(fig_grammar(), 'The legal chunk sequences. Reading starts at byte 40 with FTOC; each arrow is "the next chunk may be"; the doubled circle is the end of the file.', 'wide'))
 
     # 6
