@@ -20,6 +20,7 @@
 //!   always bounded). Rust does the same and documents it so.
 
 use super::{IvfIndex, ValidIvf};
+use crate::key::prefetch;
 use crate::tlsh::digest::{DIGEST_LENGTH, TlshDigest};
 use crate::tlsh::distance::{BodyQuery, popcount};
 use crate::tlsh::knn::{KnnStats, TlshMatch, TopK};
@@ -28,6 +29,10 @@ use crate::tlsh::order::HeaderOrder;
 /// Offset of the checksum byte in a canonical row (see
 /// [`crate::tlsh::digest`]).
 const CHECKSUM: usize = 34;
+
+/// Rows of a multi-list cell's list prefetched ahead of the scan (C++
+/// `PF` in `tlsh_knn_ivf`).
+const PREFETCH_AHEAD: usize = 8;
 
 /// A cell whose only list has fewer members than this is scanned without
 /// evaluating the list's bound (C++ `MIN_BOUNDED_LIST`); such a list is
@@ -194,7 +199,12 @@ fn ivf_scan<I: IvfIndex>(
                 if let Some(s) = stats.as_deref_mut() {
                     s.rows += range.len() as u64;
                 }
+                let end = range.end;
                 for i in range {
+                    // the members are scattered over the rows: fetch ahead
+                    if i + PREFETCH_AHEAD < end {
+                        prefetch(rows[ivf.id(i + PREFETCH_AHEAD) as usize].as_ptr());
+                    }
                     let id = ivf.id(i);
                     top.offer(TlshMatch {
                         index: id.into(),
