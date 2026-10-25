@@ -1,4 +1,23 @@
-//! Exact indexed kNN search over a TIVF index (`tlsh_knn_ivf`).
+//! Exact indexed kNN search over a TIVF index (C++ `tlsh_knn_ivf`,
+//! `tlsh_ivf.cpp`): [`knn_ivf`] returns exactly what
+//! [`knn_brute`](crate::tlsh::knn::knn_brute) returns, visiting fewer rows
+//! by bounding each list's body distance with [`list_bound`].
+//!
+//! The port is faithful down to the visit order, the `f32` bound
+//! arithmetic and the `(bound, list)` sort, so the [`KnnStats`] counters
+//! equal C++'s for the same index and query.
+//!
+//! # Differences from the C++ library
+//!
+//! * [`knn_ivf`] takes a [`ValidIvf`], the index together with the rows it
+//!   was validated against, where C++ takes a view and a row pointer and
+//!   trusts both. The single-list fast path (scan the cell's rows as one
+//!   contiguous range starting at the list's first id) relies on what
+//!   validation guarantees; C++ relies on how its builders and merge
+//!   write indexes.
+//! * C++ documents `MIN_BOUNDED_LIST` as applying to all lists; it only
+//!   applies to a cell's only list (the lists of a multi-list cell are
+//!   always bounded). Rust does the same and documents it so.
 
 use super::{IvfIndex, ValidIvf};
 use crate::tlsh::digest::{DIGEST_LENGTH, TlshDigest};
@@ -10,8 +29,9 @@ use crate::tlsh::order::HeaderOrder;
 /// [`crate::tlsh::digest`]).
 const CHECKSUM: usize = 34;
 
-/// Lists with fewer members than this are scanned without evaluating
-/// their bound (C++ `MIN_BOUNDED_LIST`).
+/// A cell whose only list has fewer members than this is scanned without
+/// evaluating the list's bound (C++ `MIN_BOUNDED_LIST`); such a list is
+/// not counted in [`KnnStats::lists`].
 pub const MIN_BOUNDED_LIST: u64 = 4;
 
 /// Lower bound on the squared body-embedding distance from a query to any
