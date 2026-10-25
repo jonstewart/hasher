@@ -293,6 +293,82 @@ fn index_is_exact_beyond_144() {
     }
 }
 
+/// Each cell split into lists of up to two consecutive rows, the first
+/// the medoid, with exact radii: every cell of two or more rows has several
+/// lists (C++ BISECT with a target list size of 2).
+fn pairs_partition(rows: &[[u8; 36]]) -> TlshIvf {
+    index_of(rows, |r| {
+        let ids: Vec<u32> = r.map(|i| i as u32).collect();
+        ids.chunks(2)
+            .map(|l| exact_list(rows, l.to_vec(), TlshDigest(rows[l[0] as usize])))
+            .collect()
+    })
+}
+
+/// The rows of `ivf` in cells of more than one list.
+fn multi_list_rows(ivf: &TlshIvf, rows: &[[u8; 36]]) -> Vec<usize> {
+    (0..rows.len())
+        .filter(|&i| {
+            let c = cell_of(&rows[i]);
+            ivf.cell_lists[c + 1] - ivf.cell_lists[c] > 1
+        })
+        .collect()
+}
+
+#[test]
+fn a_list_whose_bound_equals_max_distance_is_scanned() {
+    // a stored row is inside its own list's radius, so the list's bound is
+    // 0 and, at max_distance 0, equals the search bound: the list must be
+    // scanned for the exact match (a strict comparison would skip it)
+    let rows = test_rows(41);
+    let ivf = pairs_partition(&rows);
+    let multi = multi_list_rows(&ivf, &rows);
+    let valid = ivf.validate(&rows).unwrap();
+    assert!(multi.len() > 500, "{}", multi.len());
+    for &i in &multi {
+        let q = TlshDigest(rows[i]);
+        for incl in [true, false] {
+            let r = knn_ivf(&valid, &q, 1, 0, incl, None);
+            assert_eq!(r.len(), 1, "row {i} incl {incl}");
+            assert_eq!(r[0].distance, 0);
+            assert_eq!(r, knn_brute(&rows, &q, 1, 0, incl), "row {i}");
+        }
+    }
+}
+
+#[test]
+fn index_with_two_row_lists_equals_brute_force_at_small_distances() {
+    // stored rows of multi-list cells and their near copies, at the small
+    // bounds where a list's bound often equals the search bound
+    let rows = test_rows(43);
+    let ivf = pairs_partition(&rows);
+    let multi = multi_list_rows(&ivf, &rows);
+    let valid = ivf.validate(&rows).unwrap();
+    let members: Vec<TlshDigest> = multi
+        .iter()
+        .step_by(7)
+        .map(|&i| TlshDigest(rows[i]))
+        .collect();
+    let mut queries = members.clone();
+    queries.extend(perturb_corpus(
+        44,
+        &members,
+        members.len(),
+        &Perturbation::body_only(0.02),
+    ));
+    for q in &queries {
+        for incl in [true, false] {
+            for k in [1, 2, 5] {
+                for t in [0, 1, 12] {
+                    let fast = knn_ivf(&valid, q, k, t, incl, None);
+                    let brute = knn_brute(&rows, q, k, t, incl);
+                    assert_eq!(fast, brute, "q {} k {k} T {t} incl {incl}", q.to_hex());
+                }
+            }
+        }
+    }
+}
+
 #[test]
 fn edge_cases_give_nothing_or_the_exact_member() {
     // C++ tlsh_ivf_knn_edge_cases
