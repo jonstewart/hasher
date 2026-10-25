@@ -354,6 +354,154 @@ fn list_start_must_cover_the_rows_without_decreasing() {
     );
 }
 
+//
+// validation (ruling 5; check_index_valid in test_hset_merge_incremental.cpp)
+//
+
+#[test]
+fn a_hand_built_index_validates_owned_and_borrowed() {
+    let h = two_lists();
+    let valid = (&h.ivf).validate(&h.rows).unwrap();
+    assert_same_index(&valid, &h.ivf);
+    assert_eq!(valid.rows(), &h.rows[..]);
+
+    let b = h.ivf.to_bytes();
+    let view = TivfView::parse(&b, 6).unwrap();
+    let valid = view.validate(&h.rows).unwrap();
+    assert_same_index(&valid, &h.ivf);
+    assert_eq!(TlshIvf::from_index(valid.index()), h.ivf);
+}
+
+#[test]
+fn the_empty_index_validates_over_no_rows() {
+    assert!(TlshIvf::empty().validate(&[]).is_ok());
+}
+
+#[test]
+fn a_medoid_need_not_be_a_member() {
+    // merge_tlsh_ivf keeps the medoid of a list that lost it; the format
+    // only needs every member within radius2 of the medoid. {2} is 1 from
+    // {} and 2 from {0} and {1}.
+    let h = hand_cell(&[spec(
+        digest(&[2], &[]),
+        2,
+        &[digest(&[], &[]), digest(&[0], &[]), digest(&[1], &[])],
+    )]);
+    assert!(h.ivf.validate(&h.rows).is_ok());
+}
+
+/// `validate` fails with a format error mentioning `needle`.
+#[track_caller]
+fn assert_invalid(ivf: &impl IvfIndex, rows: &[[u8; 36]], needle: &str) {
+    match ivf.validate(rows) {
+        Err(Error::Format(msg)) => assert!(msg.contains(needle), "{msg:?} lacks {needle:?}"),
+        Err(e) => panic!("expected a format error mentioning {needle:?}, got {e:?}"),
+        Ok(_) => panic!("expected a format error mentioning {needle:?}, got a valid index"),
+    }
+}
+
+/// `two_lists` with its index patched.
+fn broken(patch: impl FnOnce(&mut TlshIvf, &mut Vec<[u8; 36]>)) -> (TlshIvf, Vec<[u8; 36]>) {
+    let h = two_lists();
+    let (mut ivf, mut rows) = (h.ivf, h.rows);
+    patch(&mut ivf, &mut rows);
+    (ivf, rows)
+}
+
+#[test]
+fn the_rows_must_be_the_indexed_rows() {
+    let h = two_lists();
+    assert_invalid(&h.ivf, &h.rows[..5], "6 rows, the section has 5");
+}
+
+#[test]
+fn an_owned_index_with_arrays_of_the_wrong_length_is_invalid() {
+    let (ivf, rows) = broken(|ivf, _| {
+        ivf.medoids.pop();
+    });
+    assert_invalid(&ivf, &rows, "medoids has 1 entries, expected 2");
+    let (ivf, rows) = broken(|ivf, _| {
+        ivf.ids.pop();
+    });
+    assert_invalid(&ivf, &rows, "ids has 5 entries");
+    let (ivf, rows) = broken(|ivf, _| {
+        ivf.cell_lists.pop();
+    });
+    assert_invalid(&ivf, &rows, "cell_lists has 65536 entries");
+}
+
+#[test]
+fn an_owned_index_gets_the_checks_parse_makes() {
+    let (ivf, rows) = broken(|ivf, _| ivf.cell_lists[CELLS] = 1);
+    assert_invalid(&ivf, &rows, "cell_lists");
+    let (ivf, rows) = broken(|ivf, _| ivf.list_start[2] = 5);
+    assert_invalid(&ivf, &rows, "do not cover the rows");
+}
+
+#[test]
+fn cell_lists_must_not_decrease() {
+    // parse checks only the ends; validate checks every step
+    let b = patched(|b| put_u32(b, 32 + 4 * (CELL + 5), 1));
+    let view = TivfView::parse(&b, 6).unwrap();
+    assert_invalid(&view, &two_lists().rows, "cell_lists decreases");
+}
+
+#[test]
+fn a_list_must_not_be_empty() {
+    // lists A, an empty one, B
+    let (ivf, rows) = broken(|ivf, _| {
+        ivf.medoids.insert(1, digest(&[], &[]));
+        ivf.radius2.insert(1, 0);
+        ivf.list_start = vec![0, 3, 3, 6];
+        for c in &mut ivf.cell_lists[CELL + 1..] {
+            *c = 3;
+        }
+    });
+    assert_invalid(&ivf, &rows, "list 1 is empty");
+}
+
+#[test]
+fn ids_must_be_rows() {
+    let (ivf, rows) = broken(|ivf, _| ivf.ids[5] = 6);
+    assert_invalid(&ivf, &rows, "id 6 out of range");
+}
+
+#[test]
+fn ids_must_ascend_within_a_list() {
+    // list A [0, 4, 5] -> [4, 0, 5]
+    let (ivf, rows) = broken(|ivf, _| ivf.ids.swap(0, 1));
+    assert_invalid(&ivf, &rows, "not ascending");
+}
+
+#[test]
+fn every_row_is_in_exactly_one_list() {
+    // list B [1, 2, 3] -> [0, 2, 3]: row 0 twice, row 1 never; {} is 1
+    // from B's medoid {50}, inside its radius 2
+    let (ivf, rows) = broken(|ivf, _| ivf.ids[3] = 0);
+    assert_invalid(&ivf, &rows, "row 0 is in two lists");
+}
+
+#[test]
+fn every_id_is_in_its_lists_cell() {
+    // row 5 ({1}, the last row) moved to the next L: still sorted by cell
+    let (ivf, rows) = broken(|_, rows| rows[5][0] = CELL_L + 1);
+    assert_invalid(&ivf, &rows, "row 5 of cell 0x6557 is in a list of cell 0x6457");
+}
+
+#[test]
+fn the_rows_must_be_sorted_by_cell() {
+    // a cell's rows must be contiguous for the search's single-list path
+    let (ivf, rows) = broken(|_, rows| rows[0][0] = CELL_L + 1);
+    assert_invalid(&ivf, &rows, "not sorted");
+}
+
+#[test]
+fn every_member_lies_within_its_lists_radius() {
+    // check_index_valid: tight <= radius2. {0} and {1} are 1 from {}.
+    let (ivf, rows) = broken(|ivf, _| ivf.radius2[0] = 0);
+    assert_invalid(&ivf, &rows, "row 4 is 1 from the medoid of list 0, beyond radius2 0");
+}
+
 #[test]
 #[should_panic(expected = "medoids")]
 fn to_bytes_refuses_an_index_whose_arrays_disagree() {

@@ -9,6 +9,7 @@ use std::fmt;
 
 use super::CELL_COUNT;
 use super::digest::{DIGEST_LENGTH, TlshDigest};
+use super::distance::BodyQuery;
 use crate::error::{Error, Result};
 
 /// Length of the fixed TIVF header.
@@ -68,25 +69,35 @@ impl TlshIvf {
         self.radius2.len()
     }
 
-    /// Panic unless the arrays have the lengths the payload layout implies.
-    fn assert_shape(&self) {
+    /// What is wrong with the array lengths, if anything: they must be
+    /// those the payload layout implies for `lists()` lists over `n` rows.
+    fn layout_error(&self) -> Option<String> {
         let lists = self.lists();
-        assert!(
-            u32::try_from(lists).is_ok(),
-            "TIVF index has {lists} lists, more than a u32 counts"
-        );
-        assert_eq!(
-            self.cell_lists.len(),
-            CELL_COUNT + 1,
-            "TIVF cell_lists must have CELL_COUNT + 1 entries"
-        );
-        assert_eq!(self.medoids.len(), lists, "TIVF medoids must match radius2");
-        assert_eq!(
-            self.list_start.len(),
-            lists + 1,
-            "TIVF list_start must have lists + 1 entries"
-        );
-        assert_eq!(self.ids.len() as u64, self.n, "TIVF ids must have n entries");
+        if u32::try_from(lists).is_err() {
+            return Some(format!(
+                "TIVF index has {lists} lists, more than a u32 counts"
+            ));
+        }
+        let lens = [
+            ("cell_lists", self.cell_lists.len(), CELL_COUNT + 1),
+            ("medoids", self.medoids.len(), lists),
+            ("list_start", self.list_start.len(), lists + 1),
+        ];
+        for (name, len, want) in lens {
+            if len != want {
+                return Some(format!(
+                    "TIVF {name} has {len} entries, expected {want} for {lists} lists"
+                ));
+            }
+        }
+        if self.ids.len() as u64 != self.n {
+            return Some(format!(
+                "TIVF ids has {} entries, expected n = {}",
+                self.ids.len(),
+                self.n
+            ));
+        }
+        None
     }
 
     /// The TIVF payload (C++ `write_tivf_data`).
@@ -96,7 +107,9 @@ impl TlshIvf {
     /// If the arrays disagree in length with each other or with `n` (see
     /// the field docs).
     pub fn to_bytes(&self) -> Vec<u8> {
-        self.assert_shape();
+        if let Some(e) = self.layout_error() {
+            panic!("{e}");
+        }
         let lists = self.lists() as u32;
         let mut out = Vec::with_capacity(tivf_len(lists, self.n) as usize);
         out.extend_from_slice(&TIVF_VERSION.to_le_bytes());
@@ -155,9 +168,192 @@ pub trait IvfIndex {
     fn list_start(&self, l: usize) -> u64;
     /// Entry `i` of `ids`.
     fn id(&self, i: usize) -> u32;
+    /// The arrays have the lengths the layout implies.
+    fn check_layout(&self) -> Result<()>;
+
+    /// Validate against the rows.
+    fn validate(self, rows: &[[u8; DIGEST_LENGTH]]) -> Result<ValidIvf<'_, Self>>
+    where
+        Self: Sized,
+    {
+        check_valid(&self, rows)?;
+        Ok(ValidIvf { index: self, rows })
+    }
+}
+
+/// The checks of [`IvfIndex::validate`].
+fn check_valid<I: IvfIndex + ?Sized>(ivf: &I, rows: &[[u8; DIGEST_LENGTH]]) -> Result<()> {
+    ivf.check_layout()?;
+    let n = ivf.n();
+    let lists = ivf.lists();
+    if rows.len() as u64 != n {
+        return Err(Error::format(format!(
+            "TIVF indexes {n} rows, the section has {}",
+            rows.len()
+        )));
+    }
+    if let Some(i) = rows.windows(2).position(|w| cell_of(&w[0]) > cell_of(&w[1])) {
+        return Err(Error::format(format!(
+            "TIVF rows are not sorted by cell: row {} of cell 0x{:04x} follows cell 0x{:04x}",
+            i + 1,
+            cell_of(&rows[i + 1]),
+            cell_of(&rows[i])
+        )));
+    }
+    if ivf.cell_lists(0) != 0 || ivf.cell_lists(CELL_COUNT) as usize != lists {
+        return Err(Error::format(format!(
+            "bad TIVF cell_lists: [0] = {}, [{CELL_COUNT}] = {}, expected 0 and {lists}",
+            ivf.cell_lists(0),
+            ivf.cell_lists(CELL_COUNT)
+        )));
+    }
+    if ivf.list_start(0) != 0 || ivf.list_start(lists) != n {
+        return Err(Error::format("TIVF list offsets do not cover the rows"));
+    }
+
+    // n distinct ids below n: every row exactly once
+    let mut seen = vec![0u64; rows.len().div_ceil(64)];
+    for c in 0..CELL_COUNT {
+        let (first, end) = (ivf.cell_lists(c), ivf.cell_lists(c + 1));
+        if first > end {
+            return Err(Error::format(format!(
+                "TIVF cell_lists decreases from {first} to {end} after cell 0x{c:04x}"
+            )));
+        }
+        for l in first as usize..end as usize {
+            let (lb, le) = (ivf.list_start(l), ivf.list_start(l + 1));
+            if lb >= le {
+                return Err(Error::format(format!("TIVF list {l} is empty")));
+            }
+            let medoid = BodyQuery::new(&ivf.medoid(l));
+            let radius2 = ivf.radius2(l);
+            let mut prev = None;
+            for i in lb as usize..le as usize {
+                let id = ivf.id(i);
+                let Some(row) = rows.get(id as usize) else {
+                    return Err(Error::format(format!(
+                        "TIVF list {l} has id {id} out of range for {n} rows"
+                    )));
+                };
+                if prev.is_some_and(|p| p >= id) {
+                    return Err(Error::format(format!(
+                        "TIVF list {l} ids are not ascending at id {id}"
+                    )));
+                }
+                prev = Some(id);
+                let row_cell = cell_of(row);
+                if usize::from(row_cell) != c {
+                    return Err(Error::format(format!(
+                        "TIVF row {id} of cell 0x{row_cell:04x} is in a list of cell 0x{c:04x}"
+                    )));
+                }
+                let (word, bit) = (id as usize / 64, 1u64 << (id % 64));
+                if seen[word] & bit != 0 {
+                    return Err(Error::format(format!("TIVF row {id} is in two lists")));
+                }
+                seen[word] |= bit;
+                let d2 = medoid.emb_body(row);
+                if d2 > radius2 {
+                    return Err(Error::format(format!(
+                        "TIVF row {id} is {d2} from the medoid of list {l}, beyond radius2 {radius2}"
+                    )));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The cell of a raw row.
+fn cell_of(row: &[u8; DIGEST_LENGTH]) -> u16 {
+    TlshDigest(*row).cell()
+}
+
+/// A validated index.
+#[derive(Clone, Copy, Debug)]
+pub struct ValidIvf<'r, I> {
+    index: I,
+    rows: &'r [[u8; DIGEST_LENGTH]],
+}
+
+impl<'r, I: IvfIndex> ValidIvf<'r, I> {
+    /// The index.
+    pub fn index(&self) -> &I {
+        &self.index
+    }
+
+    /// The rows it was validated against.
+    pub fn rows(&self) -> &'r [[u8; DIGEST_LENGTH]] {
+        self.rows
+    }
+
+    /// The index, giving up the guarantee.
+    pub fn into_inner(self) -> I {
+        self.index
+    }
+}
+
+impl<I: IvfIndex + ?Sized> IvfIndex for &I {
+    fn n(&self) -> u64 {
+        (**self).n()
+    }
+    fn lists(&self) -> usize {
+        (**self).lists()
+    }
+    fn cell_lists(&self, c: usize) -> u32 {
+        (**self).cell_lists(c)
+    }
+    fn medoid(&self, l: usize) -> TlshDigest {
+        (**self).medoid(l)
+    }
+    fn radius2(&self, l: usize) -> u32 {
+        (**self).radius2(l)
+    }
+    fn list_start(&self, l: usize) -> u64 {
+        (**self).list_start(l)
+    }
+    fn id(&self, i: usize) -> u32 {
+        (**self).id(i)
+    }
+    fn check_layout(&self) -> Result<()> {
+        (**self).check_layout()
+    }
+}
+
+impl<I: IvfIndex> IvfIndex for ValidIvf<'_, I> {
+    fn n(&self) -> u64 {
+        self.index.n()
+    }
+    fn lists(&self) -> usize {
+        self.index.lists()
+    }
+    fn cell_lists(&self, c: usize) -> u32 {
+        self.index.cell_lists(c)
+    }
+    fn medoid(&self, l: usize) -> TlshDigest {
+        self.index.medoid(l)
+    }
+    fn radius2(&self, l: usize) -> u32 {
+        self.index.radius2(l)
+    }
+    fn list_start(&self, l: usize) -> u64 {
+        self.index.list_start(l)
+    }
+    fn id(&self, i: usize) -> u32 {
+        self.index.id(i)
+    }
+    fn check_layout(&self) -> Result<()> {
+        self.index.check_layout()
+    }
 }
 
 impl IvfIndex for TlshIvf {
+    fn check_layout(&self) -> Result<()> {
+        match self.layout_error() {
+            Some(e) => Err(Error::format(e)),
+            None => Ok(()),
+        }
+    }
     fn n(&self) -> u64 {
         self.n
     }
@@ -284,6 +480,10 @@ impl fmt::Debug for TivfView<'_> {
 }
 
 impl IvfIndex for TivfView<'_> {
+    fn check_layout(&self) -> Result<()> {
+        // parse split the payload into arrays of these lengths
+        Ok(())
+    }
     fn n(&self) -> u64 {
         self.n
     }
