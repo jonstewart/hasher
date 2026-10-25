@@ -24,7 +24,6 @@ fn run(args: &[&str]) -> Output {
 }
 
 fn run_with_stdin(args: &[&str], stdin: &str) -> Output {
-    use std::io::Write;
     use std::process::Stdio;
     let mut child = bin()
         .args(args)
@@ -33,13 +32,20 @@ fn run_with_stdin(args: &[&str], stdin: &str) -> Output {
         .stderr(Stdio::piped())
         .spawn()
         .unwrap();
-    child
-        .stdin
-        .take()
-        .unwrap()
-        .write_all(stdin.as_bytes())
-        .unwrap();
+    feed(&mut child, stdin.as_bytes());
     child.wait_with_output().unwrap()
+}
+
+/// Write `input` to the child's stdin and close it. A child that exits
+/// before reading all of it (an argument or environment error) closes the
+/// pipe, and that broken pipe is not a test failure: the exit status and
+/// stderr say what happened.
+fn feed(child: &mut std::process::Child, input: &[u8]) {
+    use std::io::Write;
+    match child.stdin.take().unwrap().write_all(input) {
+        Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => {}
+        r => r.unwrap(),
+    }
 }
 
 fn stdout(o: &Output) -> String {
@@ -523,7 +529,6 @@ fn bench_single_only_times_single_lookups() {
 /// 80 distinct digests), with `extra` arguments and `env` variables; any
 /// inherited `HSET_TLSH_OPTIONS` is removed first.
 fn make_tlsh(out: &Path, extra: &[&str], env: &[(&str, &str)]) -> Output {
-    use std::io::Write;
     use std::process::Stdio;
     let mut args = vec!["make", "-t", "md5,tlsh", "-o", p(out)];
     args.extend_from_slice(extra);
@@ -537,12 +542,10 @@ fn make_tlsh(out: &Path, extra: &[&str], env: &[(&str, &str)]) -> Output {
         cmd.env(k, v);
     }
     let mut child = cmd.spawn().unwrap();
-    child
-        .stdin
-        .take()
-        .unwrap()
-        .write_all(hset_testkit::tlsh::example_text(false).as_bytes())
-        .unwrap();
+    feed(
+        &mut child,
+        hset_testkit::tlsh::example_text(false).as_bytes(),
+    );
     child.wait_with_output().unwrap()
 }
 
