@@ -505,20 +505,22 @@ fn run_matrix(input: In) {
         (true, true, 0, false),   // index dropped
         (true, true, 1, false),   // ... bit 1 alone writes nothing
     ];
+    // [without, with] the index
+    let a = [false, true].map(|i| build_input(&c, 0..600, &MD5_TLSH, input.index(i)));
+    let b = [false, true].map(|i| build_input(&c, 300..900, &MD5_TLSH, input.index(i)));
+    let tlsh = rows_of(&load(&a[0]), HashType::Tlsh);
+    assert_eq!(
+        tlsh.len() - unique(&tlsh).len(),
+        if input.records { 11 } else { 0 },
+        "duplicate TLSH rows of the left input"
+    );
     for (aidx, bidx, bits, want_idx) in cases {
-        let a = build_input(&c, 0..800, &MD5_TLSH, input.index(aidx));
-        let b = build_input(&c, 400..1200, &MD5_TLSH, input.index(bidx));
-        let tlsh = rows_of(&load(&a), HashType::Tlsh);
-        assert_eq!(
-            tlsh.len() - unique(&tlsh).len(),
-            if input.records { 15 } else { 0 },
-            "duplicate TLSH rows of the left input"
-        );
+        let (a, b) = (&a[usize::from(aidx)], &b[usize::from(bidx)]);
         let mut o = opts();
         o.tlsh_index = TlshIndexPolicy::from_tlsh_options(bits).unwrap();
         for op in OPS {
-            let out = merged(op, &a, &b, &o);
-            check_output(&out, &a, &b, op, want_idx);
+            let out = merged(op, a, b, &o);
+            check_output(&out, a, b, op, want_idx);
         }
     }
 }
@@ -1050,4 +1052,234 @@ fn incremental_unions_keep_the_index_within_its_bounds() {
         final_lists[0] <= final_lists[1] && final_lists[1] < final_lists[2],
         "lists at C = 64, 32, 0: {final_lists:?}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// The C++ merges on disk
+// ---------------------------------------------------------------------------
+
+/// A merge the C++ suites run whose inputs and output they leave in
+/// `test/` (the last one written to each output file).
+struct CppMerge {
+    out: &'static str,
+    left: &'static str,
+    right: &'static str,
+    op: SetOp,
+    /// C `tlsh_options`.
+    tlsh_options: u32,
+    /// C `coalesce_threshold` (`SFHASH_HSET_COALESCE_DEFAULT` is 64).
+    coalesce: u32,
+    write_records: bool,
+    write_hashsets: bool,
+}
+
+const fn cpp(out: &'static str, left: &'static str, right: &'static str, op: SetOp) -> CppMerge {
+    CppMerge {
+        out,
+        left,
+        right,
+        op,
+        tlsh_options: 4, // INHERIT
+        coalesce: DEFAULT_COALESCE,
+        write_records: true,
+        write_hashsets: true,
+    }
+}
+
+impl CppMerge {
+    const fn tlsh_options(self, tlsh_options: u32) -> Self {
+        CppMerge {
+            tlsh_options,
+            ..self
+        }
+    }
+
+    const fn flags(self, write_records: bool, write_hashsets: bool) -> Self {
+        CppMerge {
+            write_records,
+            write_hashsets,
+            ..self
+        }
+    }
+}
+
+use SetOp::{Intersect as I, Subtract as D, Union as U};
+
+/// The merges of test_hset_merge.cpp and test_hset_merge_incremental.cpp
+/// whose files are on disk after `make check`: each output file holds the
+/// last merge the suite wrote to it (run_matrix ends with its last case,
+/// INDEX/INDEX inputs merged with options 1 by DIFFERENCE; the set-op
+/// loops end with the difference).
+const CPP_MERGES: &[CppMerge] = &[
+    cpp(
+        "merge_out_rec.hset",
+        "merge_a_rec.hset",
+        "merge_b_rec.hset",
+        D,
+    )
+    .tlsh_options(1),
+    cpp("merge_out_ho.hset", "merge_a_ho.hset", "merge_b_ho.hset", D).tlsh_options(1),
+    cpp(
+        "merge_alg_ab.hset",
+        "merge_alg_a_rec.hset",
+        "merge_alg_b_rec.hset",
+        U,
+    ),
+    cpp(
+        "merge_alg_ba.hset",
+        "merge_alg_b_rec.hset",
+        "merge_alg_a_rec.hset",
+        U,
+    ),
+    cpp(
+        "merge_alg_a-a.hset",
+        "merge_alg_a_rec.hset",
+        "merge_alg_a_rec.hset",
+        D,
+    ),
+    cpp(
+        "merge_alg_a&a.hset",
+        "merge_alg_a_rec.hset",
+        "merge_alg_a_rec.hset",
+        I,
+    ),
+    cpp(
+        "merge_alg_ab-b.hset",
+        "merge_alg_ab.hset",
+        "merge_alg_b_rec.hset",
+        D,
+    ),
+    cpp(
+        "merge_alg_a-b.hset",
+        "merge_alg_a_rec.hset",
+        "merge_alg_b_rec.hset",
+        D,
+    ),
+    cpp("merge_df_out.hset", "merge_df_a.hset", "merge_df_b.hset", D),
+    cpp(
+        "merge_df_out2.hset",
+        "merge_df_b.hset",
+        "merge_df_a.hset",
+        U,
+    ),
+    cpp("merge_mx_out.hset", "merge_mx_a.hset", "merge_mx_b.hset", D),
+    cpp(
+        "merge_mx_out2.hset",
+        "merge_mx_b.hset",
+        "merge_mx_a.hset",
+        D,
+    ),
+    cpp("merge_t1_out.hset", "merge_t1_a.hset", "merge_t1_b.hset", D),
+    cpp(
+        "merge_err_out.hset",
+        "merge_err_ro.hset",
+        "merge_err_ro2.hset",
+        U,
+    ),
+    cpp(
+        "setop_out_rec.hset",
+        "setop_a_rec.hset",
+        "setop_b_rec.hset",
+        D,
+    ),
+    cpp(
+        "setop_merge_rec.hset",
+        "setop_a_rec.hset",
+        "setop_b_rec.hset",
+        D,
+    ),
+    cpp("setop_out_ho.hset", "setop_a_ho.hset", "setop_b_ho.hset", D),
+    cpp(
+        "setop_merge_ho.hset",
+        "setop_a_ho.hset",
+        "setop_b_ho.hset",
+        D,
+    ),
+    cpp(
+        "setop_fl_full.hset",
+        "setop_fl_a.hset",
+        "setop_fl_b.hset",
+        D,
+    ),
+    cpp("setop_fl_ho.hset", "setop_fl_a.hset", "setop_fl_b.hset", D).flags(false, true),
+    cpp("setop_fl_ro.hset", "setop_fl_a.hset", "setop_fl_b.hset", D).flags(true, false),
+    // inputs without an index: INDEX builds one from scratch (BISECT)
+    cpp(
+        "setop_fl_both.hset",
+        "setop_fl_na.hset",
+        "setop_fl_nb.hset",
+        U,
+    )
+    .tlsh_options(2),
+    cpp(
+        "setop_fl_none.hset",
+        "setop_fl_na.hset",
+        "setop_fl_nb.hset",
+        U,
+    ),
+    // the last step of the C = 0 simulation (step 23 writes inc_out_a
+    // from step 22's inc_out_b)
+    CppMerge {
+        coalesce: 0,
+        ..cpp("inc_out_a.hset", "inc_out_b.hset", "inc_batch.hset", U).tlsh_options(2)
+    },
+];
+
+/// The payloads of `ours` equal those of the C++ output `theirs` chunk
+/// by chunk: RHDR and RDAT, and per section its header, HINT (legacy
+/// block hints and TLSH cell indexes), HDAT, RIDX and TIVF.
+fn assert_same_payloads(name: &str, ours: &[u8], theirs: &[u8]) {
+    let (a, b) = (
+        hset::format::decode(ours).unwrap(),
+        hset::format::decode(theirs).unwrap(),
+    );
+    assert_eq!(a.rhdr, b.rhdr, "{name}: RHDR");
+    assert!(a.rdat == b.rdat, "{name}: RDAT");
+    assert_eq!(a.sections.len(), b.sections.len(), "{name}: sections");
+    for (s, t) in a.sections.iter().zip(&b.sections) {
+        let what = format!("{name}: {} section", s.header.htype);
+        assert_eq!(s.header, t.header, "{what} header");
+        assert!(s.data == t.data, "{what} HDAT");
+        assert!(s.ridx == t.ridx, "{what} RIDX");
+        assert!(
+            s.hint.map(|h| (h.tag(), h.byte_len())) == t.hint.map(|h| (h.tag(), h.byte_len()))
+                && s.hint == t.hint,
+            "{what} HINT {:?} vs {:?}",
+            s.hint.map(|h| h.tag()),
+            t.hint.map(|h| h.tag())
+        );
+        assert!(s.tivf == t.tivf, "{what} TIVF");
+    }
+}
+
+/// Re-runs the C++ merges whose inputs and outputs are on disk
+/// (`HSET_FIXTURES_DIR`) and compares the payloads; absent files are
+/// skipped. Rust writes the legacy block hint here, as C++ does.
+#[test]
+fn rust_merges_reproduce_the_cpp_merge_payloads() {
+    let dir = hset_testkit::fixtures::fixtures_dir();
+    let read = |name: &str| std::fs::read(dir.join(name)).ok();
+    let mut compared = 0;
+    for m in CPP_MERGES {
+        let (Some(theirs), Some(l), Some(r)) = (read(m.out), read(m.left), read(m.right)) else {
+            eprintln!(
+                "SKIP: {} or its inputs are absent (run the C++ make check)",
+                m.out
+            );
+            continue;
+        };
+        let mut o = MergeOptions::new("merged", "merge test output");
+        o.hint = HintSpec::LEGACY;
+        o.tlsh_index = TlshIndexPolicy::from_tlsh_options(m.tlsh_options).unwrap();
+        o.coalesce_threshold = m.coalesce;
+        o.write_records = m.write_records;
+        o.write_hashsets = m.write_hashsets;
+        let ours =
+            merge(m.op, &load(&l), &load(&r), &o).unwrap_or_else(|e| panic!("{}: {e}", m.out));
+        let hs = load(&ours);
+        assert!(hs.verify().is_ok(), "{}: {:?}", m.out, hs.verify().problems);
+        assert_same_payloads(m.out, &ours, &theirs);
+        compared += 1;
+    }
+    eprintln!("compared {compared} of {} C++ merges", CPP_MERGES.len());
 }
