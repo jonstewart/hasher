@@ -1,6 +1,6 @@
 //! The BISECT builder of TIVF indexes (`build_tlsh_ivf`).
 
-use super::{DEFAULT_SEED, TARGET_LIST_SIZE, TlshIvf};
+use super::{DEFAULT_SEED, FLAT_MAX, TARGET_LIST_SIZE, TlshIvf};
 use crate::error::{Error, Result};
 use crate::tlsh::CELL_COUNT;
 use crate::tlsh::digest::{DIGEST_LENGTH, TlshDigest};
@@ -132,6 +132,12 @@ fn cell_bounds(rows: &[Row]) -> Result<Vec<usize>> {
     Ok(cells)
 }
 
+/// A pivot split leaving fewer than `1 / MIN_SIDE_DIVISOR` of a node's
+/// rows on one side is replaced by a median split; this bounds the depth
+/// by `log_{8/7} m` and guarantees termination (C++
+/// `BISECT_MIN_SIDE_DIVISOR`). A quality knob only.
+const MIN_SIDE_DIVISOR: usize = 8;
+
 /// The flat k-means of a node stops after this many update and
 /// reassignment rounds if assignments still change (C++
 /// `BISECT_KMEANS_MAX_ITERATIONS`). A quality and build-cost knob only.
@@ -197,8 +203,84 @@ impl<'a> CellBisector<'a> {
         out
     }
 
+    /// Node `lo..hi`: clustered flat if it has at most [`FLAT_MAX`] rows,
+    /// else split in two and each half recursed into, the lower first
+    /// (depth-first, which fixes the order of the RNG draws).
     fn split(&mut self, lo: usize, hi: usize, out: &mut Vec<(usize, usize)>) {
-        self.cluster(lo, hi, out);
+        if hi - lo <= FLAT_MAX {
+            self.cluster(lo, hi, out);
+            return;
+        }
+        let mid = self.partition(lo, hi);
+        self.split(lo, mid, out);
+        self.split(mid, hi, out);
+    }
+
+    /// Split node `lo..hi` in two in place and return the boundary: pivots
+    /// `a`, the member farthest from a random member, and `b`, the member
+    /// farthest from `a`; the members nearer `a` (ties to `a`) go first,
+    /// stably. A split leaving fewer than `1 / MIN_SIDE_DIVISOR` of the
+    /// node on one side is replaced by [`median_split`](Self::median_split).
+    fn partition(&mut self, lo: usize, hi: usize) -> usize {
+        let at = lo + self.draw(hi - lo);
+        let p0 = self.perm[at];
+        let a = self.farthest(lo, hi, p0);
+        let b = self.farthest(lo, hi, a);
+        let mid = self.assign(lo, hi, a, b);
+        if (mid - lo).min(hi - mid) * MIN_SIDE_DIVISOR < hi - lo {
+            return self.median_split(lo, hi, a);
+        }
+        mid
+    }
+
+    /// The member of `lo..hi` farthest from row `p`, ties by the smaller
+    /// local index; `p` itself (at distance 0) when every member is at
+    /// distance 0 and none has a smaller index.
+    fn farthest(&self, lo: usize, hi: usize, p: u32) -> u32 {
+        let q = BodyQuery::new(&TlshDigest(self.rows[p as usize]));
+        let (mut best, mut best_d) = (p, 0);
+        for &id in &self.perm[lo..hi] {
+            let d = q.emb_body(&self.rows[id as usize]);
+            if d > best_d || (d == best_d && id < best) {
+                best = id;
+                best_d = d;
+            }
+        }
+        best
+    }
+
+    /// Move the members of `lo..hi` nearer `a` than `b` (ties to `a`) to
+    /// the front, stably (`std::stable_partition`); returns the end of
+    /// `a`'s side.
+    fn assign(&mut self, lo: usize, hi: usize, a: u32, b: u32) -> usize {
+        let qa = BodyQuery::new(&TlshDigest(self.rows[a as usize]));
+        let qb = BodyQuery::new(&TlshDigest(self.rows[b as usize]));
+        let rows = self.rows;
+        let (near_a, near_b): (Vec<u32>, Vec<u32>) =
+            self.perm[lo..hi].iter().partition(|&&id| {
+                let r = &rows[id as usize];
+                qa.emb_body(r) <= qb.emb_body(r)
+            });
+        let mid = lo + near_a.len();
+        self.perm[lo..mid].copy_from_slice(&near_a);
+        self.perm[mid..hi].copy_from_slice(&near_b);
+        mid
+    }
+
+    /// Sort `lo..hi` by (distance to `a`, local index) and cut it in half:
+    /// the fallback when the pivots split off too few rows (or none, when
+    /// every body in the node is the same), so every split makes progress.
+    fn median_split(&mut self, lo: usize, hi: usize, a: u32) -> usize {
+        let q = BodyQuery::new(&TlshDigest(self.rows[a as usize]));
+        let mut keyed: Vec<(u32, u32)> = self.perm[lo..hi]
+            .iter()
+            .map(|&id| (q.emb_body(&self.rows[id as usize]), id))
+            .collect();
+        keyed.sort_unstable();
+        for (p, (_, id)) in self.perm[lo..hi].iter_mut().zip(keyed) {
+            *p = id;
+        }
+        lo + (hi - lo) / 2
     }
 
     /// A draw in `0..n` straight from the engine (`rng() % n`): the C++
@@ -360,7 +442,7 @@ impl<'a> CellBisector<'a> {
             let x = &self.emb[i];
             let (mut best, mut best_big, mut best_n) = (0u32, 0u64, 0u64);
             for (c, (sc, &nc)) in self.sum.iter().zip(&self.cnt).enumerate() {
-                let dot: i32 = x.iter().zip(sc).map(|(&xj, &sj)| i32::from(xj) * sj).sum();
+                let dot = dot(x, sc);
                 let n = i64::from(nc);
                 let big = (n * n * i64::from(self.norm2[i]) - 2 * n * i64::from(dot)
                     + self.sum2[c]) as u64;
@@ -375,6 +457,29 @@ impl<'a> CellBisector<'a> {
         }
         changed
     }
+}
+
+/// `x . s` in `i32` (no overflow: `|s_j| <= FLAT_MAX`).
+///
+/// The hot loop of the build. A plain indexed loop over fixed-size arrays
+/// keeps unoptimized (test) builds several times faster than an iterator
+/// chain, and optimizes to the same vector code.
+#[inline]
+fn dot(x: &[i8; EMBED_BODY_DIMS], s: &[i32; EMBED_BODY_DIMS]) -> i32 {
+    let (xs, sx) = (x.as_chunks::<8>().0, s.as_chunks::<8>().0);
+    let mut d = 0;
+    for j in 0..EMBED_BODY_DIMS / 8 {
+        let (x, s) = (&xs[j], &sx[j]);
+        d += i32::from(x[0]) * s[0]
+            + i32::from(x[1]) * s[1]
+            + i32::from(x[2]) * s[2]
+            + i32::from(x[3]) * s[3]
+            + i32::from(x[4]) * s[4]
+            + i32::from(x[5]) * s[5]
+            + i32::from(x[6]) * s[6]
+            + i32::from(x[7]) * s[7];
+    }
+    d
 }
 
 /// The lists of one cell's rows by coarse bisection and flat integer

@@ -145,3 +145,19 @@ fn golden_bisect_small() {
     );
     ivf.validate(&rows).expect("valid");
 }
+
+#[test]
+fn golden_bisect_large() {
+    let rows = golden_corpus(0x5eed02, &large_cells(), 20);
+    let ivf = build_tlsh_ivf(&rows, &IvfBuildOptions::default()).expect("build");
+    // the coarse split is exercised
+    assert!(max_cell_rows(&ivf) > FLAT_MAX as u64);
+    check_golden(
+        &rows,
+        &ivf,
+        10400,
+        343,
+        "b1bb7a6d494bef04007ac04832f89aa00552c11f2d1eb01d6c085d5f0bfe55bb",
+    );
+    ivf.validate(&rows).expect("valid");
+}
