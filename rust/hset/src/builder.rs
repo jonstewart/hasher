@@ -10,7 +10,8 @@ use crate::hash_type::HashType;
 use crate::hex;
 use crate::key::key64_dyn;
 use crate::lookup::{self, BitsPolicy, HintSpec};
-use crate::tlsh::{DIGEST_LENGTH as TLSH_LENGTH, TlshDigest};
+use crate::tlsh::cells::{cell_index, cell_table};
+use crate::tlsh::{CELL_HINT_TAG, DIGEST_LENGTH as TLSH_LENGTH, TlshDigest};
 
 /// Options controlling how a file is written.
 #[derive(Debug, Clone, PartialEq)]
@@ -24,7 +25,9 @@ pub struct BuildOptions {
     /// Write one sorted hash section per field.
     pub with_hashsets: bool,
     /// Hint to build for each digest section. Use `bits: u8::MAX` (hull) or
-    /// `bits: 0` (block) to let `bits_policy` pick the block count.
+    /// `bits: 0` (block) to let `bits_policy` pick the block count. A TLSH
+    /// section always gets the `0x7400` cell index instead, as in C++,
+    /// even with [`HintSpec::None`].
     pub hint: HintSpec,
     pub bits_policy: BitsPolicy,
 }
@@ -304,7 +307,14 @@ impl Builder {
                         ri.extend_from_slice(&u64::from(r).to_le_bytes());
                     }
                 }
-                let hint = if f.htype.is_digest() {
+                let hint = if is_tlsh(f) {
+                    // C++ writes the cell index on every TLSH section,
+                    // whatever hint the other sections get. `data` holds
+                    // the sorted rows (duplicates included in a records
+                    // file) that the TIVF index will also be built from.
+                    let (rows, _) = data.as_chunks::<TLSH_LENGTH>();
+                    Some((CELL_HINT_TAG, cell_table(&cell_index(rows)?)))
+                } else if f.htype.is_digest() {
                     let spec = lookup::resolve_bits(opts.hint, idx.len(), hlen, &opts.bits_policy);
                     lookup::build_hint(hlen, &data, spec)?
                 } else {

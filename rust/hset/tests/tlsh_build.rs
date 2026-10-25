@@ -7,10 +7,10 @@
 //! hashsets-only files, and the `0x7400` cell hint on every TLSH section.
 
 use hset::builder::{format_value, parse_value, write_value};
-use hset::format::{FieldDescriptor, decode};
+use hset::format::{FieldDescriptor, Hint, decode};
 use hset::tlsh::TlshDigest;
-use hset::{BuildOptions, Builder, Error, HashType};
-use hset_testkit::tlsh::{VEC_HEX, fake_md5};
+use hset::{BuildOptions, Builder, Error, HashType, HintSpec};
+use hset_testkit::tlsh::{VEC_HEX, example_digests, fake_md5, naive_cell_index};
 
 fn tlsh_field() -> FieldDescriptor {
     FieldDescriptor::for_type(HashType::Tlsh).unwrap()
@@ -142,4 +142,44 @@ fn a_present_null_digest_in_a_raw_record_is_stored_absent() {
     let (recs, rows) = presence(&b);
     assert_eq!(recs, vec![(1, 0), (1, 1)]);
     assert_eq!(rows, 1);
+}
+
+/// The 0x7400 table a section of `rows` must carry: the naive oracle's
+/// offsets, each a little-endian u64.
+fn expected_cell_table(rows: &[u8]) -> Vec<u8> {
+    let rows: Vec<[u8; 36]> = rows.as_chunks::<36>().0.to_vec();
+    naive_cell_index(&rows)
+        .iter()
+        .flat_map(|c| c.to_le_bytes())
+        .collect()
+}
+
+#[test]
+fn the_tlsh_section_gets_the_cell_hint_whatever_hint_the_options_ask_for() {
+    let mut b = Builder::new(&[HashType::Md5, HashType::Tlsh]).unwrap();
+    for (i, d) in example_digests().iter().take(10).enumerate() {
+        b.add_text_line(&format!("{} {d}", fake_md5(i as u64)))
+            .unwrap();
+    }
+    for spec in [
+        HintSpec::Hull { bits: u8::MAX },
+        HintSpec::LEGACY,
+        HintSpec::Block { bits: 0 },
+        HintSpec::Hull { bits: 3 },
+        HintSpec::None,
+    ] {
+        for records in [true, false] {
+            let bytes = b.build(&opts().hint(spec).records(records)).unwrap();
+            let f = decode(&bytes).unwrap();
+            let s = &f.sections[f.section_for(HashType::Tlsh).unwrap()];
+            assert_eq!(s.len(), 10);
+            let Some(Hint::TlshCells { table }) = s.hint else {
+                panic!("{spec:?}: TLSH hint is {:?}", s.hint.map(|h| h.tag()));
+            };
+            assert_eq!(table, expected_cell_table(s.data), "{spec:?}");
+            // The md5 section still gets the hint asked for.
+            let m = &f.sections[f.section_for(HashType::Md5).unwrap()];
+            assert_eq!(m.hint.is_none(), spec == HintSpec::None, "{spec:?}");
+        }
+    }
 }
