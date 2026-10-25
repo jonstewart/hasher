@@ -551,3 +551,52 @@ fn dump_prints_tlsh_rows_as_t1_hex() {
         .collect();
     assert_eq!(stdout(&o), want);
 }
+
+/// Example digest `i` with hex digit 40 changed: not in the set.
+fn absent_digest(i: usize) -> String {
+    let mut h = hset_testkit::tlsh::example_digests()[i]
+        .clone()
+        .into_bytes();
+    h[40] = if h[40] == b'0' { b'1' } else { b'0' };
+    String::from_utf8(h).unwrap()
+}
+
+#[test]
+fn query_takes_t1_hex_for_a_tlsh_section() {
+    let dir = tmpdir("tlsh-query");
+    let f = dir.join("t.hset");
+    made_tlsh(&f, &[]);
+    let digests = hset_testkit::tlsh::example_digests();
+    let present = &digests[3];
+    let absent = absent_digest(3);
+    // The section is inferred from a T1 digest's length.
+    let o = run(&["query", p(&f), present, &absent]);
+    assert_eq!(o.status.code(), Some(1), "{}", stderr(&o));
+    assert_eq!(stdout(&o), format!("{present}\tfound\n{absent}\tmissing\n"));
+    // 70 hex digits without the prefix, lowercase, with the type given.
+    let bare = present[2..].to_ascii_lowercase();
+    let o = run(&["query", p(&f), "-t", "tlsh", &bare]);
+    assert!(o.status.success(), "{}", stderr(&o));
+    assert_eq!(stdout(&o), format!("{bare}\tfound\n"));
+    // The same, inferring the section from the 70-digit length.
+    let o = run(&["query", p(&f), &bare]);
+    assert!(o.status.success(), "{}", stderr(&o));
+
+    // Records print as dump prints them; digest 7 is in two records.
+    let o = run(&["query", p(&f), "-r", &digests[7]]);
+    assert!(o.status.success(), "{}", stderr(&o));
+    let mut got: Vec<String> = stdout(&o).lines().map(str::to_string).collect();
+    got.sort();
+    let fake_md5 = hset_testkit::tlsh::fake_md5;
+    assert_eq!(
+        got,
+        vec![
+            format!("{} {}", fake_md5(7), digests[7]),
+            format!("{} {}", fake_md5(82), digests[7]),
+        ]
+    );
+
+    // A malformed digest is an error.
+    let o = run(&["query", p(&f), "-t", "tlsh", &format!("{present}0")]);
+    assert_eq!(o.status.code(), Some(2), "{}", stdout(&o));
+}

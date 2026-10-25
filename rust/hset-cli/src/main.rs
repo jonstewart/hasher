@@ -9,6 +9,7 @@ use std::time::Instant;
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use hset::format::{self, Document, HashsetIn, HsetFile};
 use hset::lookup::{self, BatchMode, BitsPolicy, HintSpec, SearchConfig, SingleMode};
+use hset::tlsh::{DIGEST_LENGTH as TLSH_LENGTH, TlshDigest};
 use hset::{BuildOptions, Builder, HashType, Hashset, SetOp, builder, hex, ops, synth};
 
 #[derive(Parser)]
@@ -184,7 +185,7 @@ struct QueryArgs {
     /// Hash type to query (default: inferred from the hash length)
     #[arg(short = 't', long)]
     r#type: Option<HashType>,
-    /// Read hex hashes, one per line, from this file (`-` is stdin)
+    /// Read hashes, one per line, from this file (`-` is stdin)
     #[arg(short = 'f', long)]
     from: Option<PathBuf>,
     /// Print the matching records instead of found/missing
@@ -196,7 +197,7 @@ struct QueryArgs {
     /// Print nothing; the exit status says whether every hash was found
     #[arg(short = 'q', long)]
     quiet: bool,
-    /// Hex hashes to look up
+    /// Hashes to look up: hex digests, decimal sizes, TLSH as `T1` hex
     #[arg(allow_negative_numbers = true)]
     hashes: Vec<String>,
 }
@@ -524,6 +525,17 @@ fn section_for(hs: &Hashset<'_>, t: Option<HashType>, hash_len: Option<usize>) -
     err("several sections match; choose one with --type")
 }
 
+/// The hash length a query's text implies: 36 for a TLSH digest in its
+/// text form (`T1` and 70 hex digits, the digits alone, or `TNULL`), half
+/// the hex digits otherwise.
+fn query_hash_len(text: &str) -> usize {
+    if TlshDigest::from_hex(text).is_ok() {
+        TLSH_LENGTH
+    } else {
+        text.len() / 2
+    }
+}
+
 fn cmd_query(a: QueryArgs) -> CliResult<ExitCode> {
     let m = map_file(&a.file)?;
     let hs = load(&m, &a.file)?;
@@ -543,8 +555,7 @@ fn cmd_query(a: QueryArgs) -> CliResult<ExitCode> {
     if lines.is_empty() {
         return err("no hashes given (pass them as arguments or with --from)");
     }
-    let first_len = lines[0].len() / 2;
-    let idx = section_for(&hs, a.r#type, Some(first_len))?;
+    let idx = section_for(&hs, a.r#type, Some(query_hash_len(&lines[0])))?;
     let s = hs.section(idx);
     let hl = s.hash_length();
     let fd = format::FieldDescriptor {
@@ -554,9 +565,12 @@ fn cmd_query(a: QueryArgs) -> CliResult<ExitCode> {
     };
 
     let mut queries = Vec::with_capacity(lines.len() * hl);
-    if matches!(fd.htype, HashType::Size | HashType::Entropy) {
+    if matches!(
+        fd.htype,
+        HashType::Size | HashType::Entropy | HashType::Tlsh
+    ) {
         for l in &lines {
-            let v = builder::parse_value(&fd, l).map_err(|e| e.to_string())?;
+            let v = builder::parse_value(&fd, l).map_err(|e| format!("'{l}': {e}"))?;
             queries.extend_from_slice(&v);
         }
     } else {
