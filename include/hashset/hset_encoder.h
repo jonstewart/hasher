@@ -77,7 +77,8 @@ struct SFHASH_HashsetBuildCtx {
 
   size_t field_pos;
 
-  // which optional TLSH sections to write, SFHASH_HSET_TLSH_* bits
+  // whether to write the TIVF index of each TLSH field and how to build
+  // it, SFHASH_HSET_TLSH_* bits
   uint32_t tlsh_options = SFHASH_HSET_TLSH_INDEX;
 
   // one per field: the TIVF index of a TLSH field that gets one, built from

@@ -235,8 +235,9 @@ enum {
 };
 
 /*
- * Select the optional TLSH sections to write; options is a bitwise OR of
- * SFHASH_HSET_TLSH_* values (0 for none). Only TLSH hashsets are affected,
+ * Select whether to write the optional TIVF index of each TLSH hashset,
+ * and how to build it; options is a bitwise OR of SFHASH_HSET_TLSH_*
+ * values (0 for no index). Only TLSH hashsets are affected,
  * and only when hashsets are written. Call after *_open and before
  * *_write.
  */

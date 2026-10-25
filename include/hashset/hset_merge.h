@@ -98,8 +98,8 @@ RecordMerge merge_records(
  * Options of write_merged_hset.
  *
  * tlsh_options is a bitwise OR of SFHASH_HSET_TLSH_* values; with
- * SFHASH_HSET_TLSH_INHERIT each optional TLSH section is written iff every
- * input side that has a TLSH section has it. An index is carried through
+ * SFHASH_HSET_TLSH_INHERIT the TIVF index is written iff every input side
+ * that has a TLSH section has one. An index is carried through
  * the merge when every side has one and otherwise built from scratch with
  * the method SFHASH_HSET_TLSH_INDEX_KMEANS selects (tlsh_ivf_build_of).
  *
