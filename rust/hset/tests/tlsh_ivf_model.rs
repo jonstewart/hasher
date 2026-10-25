@@ -8,6 +8,7 @@ use hset::Error;
 use hset::tlsh::TlshDigest;
 use hset::tlsh::ivf;
 use hset::tlsh::ivf::{IvfIndex, TivfView, TlshIvf, check_invariant, tivf_len};
+use proptest::prelude::*;
 
 // Layout (HASHSET_FORMAT, tlsh_ivf.cpp length_tivf_data): 32-byte header,
 // u32 cell_lists[65537], 36-byte medoids[C], u32 radius2[C],
@@ -583,4 +584,175 @@ fn to_bytes_refuses_an_index_whose_arrays_disagree() {
     let mut ivf = two_lists().ivf;
     ivf.medoids.pop();
     ivf.to_bytes();
+}
+
+//
+// properties
+//
+
+/// Any index `parse` accepts: `lists` lists in sorted (not necessarily
+/// distinct) cells, nondecreasing offsets from 0 to n, and arbitrary
+/// medoids, radii and ids; validity against rows is not implied.
+fn arb_parseable() -> impl Strategy<Value = TlshIvf> {
+    (0usize..6, 0u64..24)
+        .prop_map(|(lists, n)| if lists == 0 { (0, 0) } else { (lists, n) })
+        .prop_flat_map(|(lists, n)| {
+            (
+                Just(n),
+                prop::collection::vec(any::<u16>(), lists),
+                prop::collection::vec(0..=n, lists.saturating_sub(1)),
+                prop::collection::vec(any::<[u8; 36]>(), lists),
+                prop::collection::vec(any::<u32>(), lists),
+                prop::collection::vec(any::<u32>(), n as usize),
+            )
+        })
+        .prop_map(|(n, mut cells, mut cuts, medoids, radius2, ids)| {
+            cells.sort();
+            cuts.sort();
+            let mut list_start = vec![0];
+            if !medoids.is_empty() {
+                list_start.extend(cuts);
+                list_start.push(n);
+            }
+            TlshIvf {
+                n,
+                cell_lists: (0..=CELLS)
+                    .map(|c| cells.partition_point(|&x| usize::from(x) < c) as u32)
+                    .collect(),
+                medoids: medoids.into_iter().map(TlshDigest).collect(),
+                radius2,
+                list_start,
+                ids,
+            }
+        })
+}
+
+/// Squared body-embedding distance bucket by bucket: 0, 1, 2, 5 for code
+/// differences 0..=3.
+fn ref_emb2(a: &TlshDigest, b: &[u8; 36]) -> u32 {
+    let b = TlshDigest(*b);
+    (0..128)
+        .map(|i| [0, 1, 2, 5][usize::from(a.bucket(i).abs_diff(b.bucket(i)))])
+        .sum()
+}
+
+/// Sorted rows over a few cells, possibly repeated, as a records file has.
+fn arb_rows() -> impl Strategy<Value = Vec<[u8; 36]>> {
+    prop::collection::vec((0u8..3, 0u8..3, any::<[u8; 32]>()), 0..40).prop_map(|v| {
+        let mut rows: Vec<[u8; 36]> = v
+            .into_iter()
+            .map(|(l, q, planes)| {
+                let mut d = [0u8; 36];
+                d[0] = l;
+                d[1] = q;
+                d[2..34].copy_from_slice(&planes);
+                d
+            })
+            .collect();
+        rows.sort();
+        rows
+    })
+}
+
+/// A valid index over sorted `rows`: each cell's rows go to the lists
+/// `labels` name (up to 4 per cell, empty ones dropped), the medoid is a
+/// list's `pick`-th member and radius2 the exact maximum distance to it.
+fn reference_index(rows: &[[u8; 36]], labels: &[u8], pick: usize) -> TlshIvf {
+    let mut ivf = TlshIvf::empty();
+    ivf.n = rows.len() as u64;
+    let mut at = 0;
+    for c in 0..CELLS {
+        ivf.cell_lists[c] = ivf.radius2.len() as u32;
+        let end = at + rows[at..]
+            .iter()
+            .take_while(|r| usize::from(u16::from_be_bytes([r[0], r[1]])) == c)
+            .count();
+        for label in 0..4 {
+            let members: Vec<u32> = (at..end)
+                .filter(|&i| labels[i] % 4 == label)
+                .map(|i| i as u32)
+                .collect();
+            if members.is_empty() {
+                continue;
+            }
+            let medoid = TlshDigest(rows[members[pick % members.len()] as usize]);
+            let radius2 = members
+                .iter()
+                .map(|&i| ref_emb2(&medoid, &rows[i as usize]))
+                .max()
+                .unwrap();
+            ivf.medoids.push(medoid);
+            ivf.radius2.push(radius2);
+            ivf.ids.extend(members);
+            ivf.list_start.push(ivf.ids.len() as u64);
+        }
+        at = end;
+    }
+    ivf.cell_lists[CELLS] = ivf.radius2.len() as u32;
+    ivf
+}
+
+proptest! {
+    // Every case walks all 65,536 cells several times; 64 cases keep the
+    // debug build's run to seconds.
+    #![proptest_config(ProptestConfig::with_cases(64))]
+
+    #[test]
+    fn to_bytes_of_a_parsed_payload_is_the_payload(ivf in arb_parseable()) {
+        let b = ivf.to_bytes();
+        prop_assert_eq!(b.len() as u64, tivf_len(ivf.lists() as u32, ivf.n));
+        let v = TivfView::parse(&b, ivf.n).unwrap();
+        let back = TlshIvf::from_index(&v);
+        prop_assert_eq!(back.to_bytes(), b);
+        prop_assert_eq!(back, ivf);
+    }
+
+    #[test]
+    fn every_truncation_is_rejected(ivf in arb_parseable(), cut in any::<prop::sample::Index>()) {
+        let b = ivf.to_bytes();
+        let short = &b[..cut.index(b.len())];
+        prop_assert!(matches!(TivfView::parse(short, ivf.n), Err(Error::Format(_))));
+    }
+
+    #[test]
+    fn a_reference_index_validates(
+        rows in arb_rows(),
+        labels in prop::collection::vec(any::<u8>(), 40),
+        pick in any::<usize>(),
+        coalesce in 0u32..12,
+    ) {
+        let ivf = reference_index(&rows, &labels, pick);
+        prop_assert!((&ivf).validate(&rows).is_ok());
+        let b = ivf.to_bytes();
+        let v = TivfView::parse(&b, rows.len() as u64).unwrap();
+        prop_assert!(v.validate(&rows).is_ok());
+
+        // tlsh_ivf_check_invariant, counted list by list
+        let half = u64::from(coalesce / 2);
+        let want = half == 0 || (0..CELLS).all(|c| {
+            (ivf.cell_lists[c]..ivf.cell_lists[c + 1])
+                .filter(|&l| {
+                    let l = l as usize;
+                    ivf.list_start[l + 1] - ivf.list_start[l] < half
+                })
+                .count()
+                <= 1
+        });
+        prop_assert_eq!(check_invariant(&ivf, coalesce), want);
+        prop_assert_eq!(check_invariant(&v, coalesce), want);
+    }
+
+    #[test]
+    fn a_tightened_radius_is_invalid(
+        rows in arb_rows(),
+        labels in prop::collection::vec(any::<u8>(), 40),
+        pick in any::<usize>(),
+        which in any::<prop::sample::Index>(),
+    ) {
+        let mut ivf = reference_index(&rows, &labels, pick);
+        let wide: Vec<usize> = (0..ivf.lists()).filter(|&l| ivf.radius2[l] > 0).collect();
+        prop_assume!(!wide.is_empty());
+        ivf.radius2[wide[which.index(wide.len())]] -= 1;
+        prop_assert!(matches!(ivf.validate(&rows), Err(Error::Format(_))));
+    }
 }
