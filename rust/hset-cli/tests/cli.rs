@@ -576,6 +576,31 @@ fn dump_prints_tlsh_rows_as_t1_hex() {
     assert_eq!(stdout(&o), want);
 }
 
+#[test]
+fn dumped_tlsh_records_make_the_same_file_again() {
+    let dir = tmpdir("tlsh-dump-records");
+    let f = dir.join("t.hset");
+    made_tlsh(&f, &[]);
+    let o = run(&["dump", p(&f)]);
+    assert!(o.status.success(), "{}", stderr(&o));
+    let dumped = stdout(&o);
+    // The input lines, TNULL printed as an absent (empty) value, sorted.
+    let mut want: Vec<String> = hset_testkit::tlsh::example_text(false)
+        .lines()
+        .map(|l| l.replace("TNULL", ""))
+        .collect();
+    want.sort();
+    let mut got: Vec<String> = dumped.lines().map(str::to_string).collect();
+    got.sort();
+    assert_eq!(got, want);
+
+    let again = dir.join("again.hset");
+    let o = run_with_stdin(&["make", "-t", "md5,tlsh", "-o", p(&again)], &dumped);
+    assert!(o.status.success(), "{}", stderr(&o));
+    assert_eq!(stdout(&run(&["dump", p(&again)])), dumped);
+    assert_eq!(tlsh_parts(&again), tlsh_parts(&f));
+}
+
 /// Example digest `i` with hex digit 40 changed: not in the set.
 fn absent_digest(i: usize) -> String {
     let mut h = hset_testkit::tlsh::example_digests()[i]
