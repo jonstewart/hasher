@@ -5,7 +5,9 @@ use std::cmp::Ordering;
 use std::collections::BinaryHeap;
 
 use super::digest::{DIGEST_LENGTH, TlshDigest};
+use super::CELL_COUNT;
 use super::distance::{BodyQuery, l_cost, mod_diff, q_cost};
+use super::order::HeaderOrder;
 
 /// Offset of the checksum byte in a canonical row (see [`super::digest`]).
 const CHECKSUM: usize = 34;
@@ -34,6 +36,17 @@ impl PartialOrd for TlshMatch {
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
         Some(self.cmp(other))
     }
+}
+
+/// Work counters an indexed search adds to (C++ `TlshKnnStats`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct KnnStats {
+    /// Nonempty header cells visited.
+    pub cells: u64,
+    /// IVF lists whose bound was evaluated (0 for the cell search).
+    pub lists: u64,
+    /// Rows whose distance was computed.
+    pub rows: u64,
 }
 
 /// The k nearest matches offered so far and the distance bound they imply:
@@ -146,6 +159,70 @@ pub fn knn_brute(
             index: i as u64,
             distance: header + body.body(r),
         });
+    }
+    top.into_sorted()
+}
+
+/// Exact k nearest neighbours using the cell index (C++ `tlsh_knn_cells`,
+/// `tlsh_cell_search.cpp`): cells are visited in [`HeaderOrder`], the L
+/// loop stops at the first L cost above the current bound and the Q loop
+/// at the first header cost above it, and within a cell only the checksum
+/// and body kernel run. Returns exactly what [`knn_brute`] returns.
+///
+/// `cells` is the 65,537-entry prefix-sum cell index of the sorted `rows`
+/// (the `0x7400` HINT payload): rows of cell `c` are
+/// `rows[cells[c]..cells[c + 1]]`. `stats`, when given, is added to:
+/// `cells` counts nonempty cells visited and `rows` their rows.
+///
+/// # Panics
+///
+/// If `cells` does not have [`CELL_COUNT`] + 1 entries, or an entry the
+/// search reaches is decreasing or beyond `rows`. A cell index parsed by
+/// [`super::cells`] has been checked against its rows.
+pub fn knn_cells(
+    rows: &[[u8; DIGEST_LENGTH]],
+    cells: &[u64],
+    q: &TlshDigest,
+    k: usize,
+    max_distance: u32,
+    include_length: bool,
+    mut stats: Option<&mut KnnStats>,
+) -> Vec<TlshMatch> {
+    assert_eq!(cells.len(), CELL_COUNT + 1, "cell index length");
+    if k == 0 || q.is_null() {
+        return Vec::new();
+    }
+
+    let order = HeaderOrder::new(q, include_length);
+    let body = BodyQuery::new(q);
+    let checksum = q.checksum();
+    let mut top = TopK::new(k, max_distance);
+
+    for (&l, &cl) in order.l().iter().zip(order.l_cost()) {
+        if cl > top.bound() {
+            break;
+        }
+        for (&qb, &cq) in order.q().iter().zip(order.q_cost()) {
+            let ch = cl + cq;
+            if ch > top.bound() {
+                break;
+            }
+            let c = usize::from(l) << 8 | usize::from(qb);
+            let (lb, le) = (cells[c] as usize, cells[c + 1] as usize);
+            if lb == le {
+                continue;
+            }
+            if let Some(s) = stats.as_deref_mut() {
+                s.cells += 1;
+                s.rows += (le - lb) as u64;
+            }
+            for (i, r) in rows[lb..le].iter().enumerate() {
+                top.offer(TlshMatch {
+                    index: (lb + i) as u64,
+                    distance: ch + u32::from(r[CHECKSUM] != checksum) + body.body(r),
+                });
+            }
+        }
     }
     top.into_sorted()
 }

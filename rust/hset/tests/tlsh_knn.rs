@@ -5,9 +5,12 @@
 //! (`test_tlsh_cell_search.cpp`).
 
 use hset::tlsh::TlshDigest;
-use hset::tlsh::knn::{TlshMatch, TopK, knn_brute};
+use hset::tlsh::knn::{KnnStats, TlshMatch, TopK, knn_brute, knn_cells};
 use hset::tlsh::order::HeaderOrder;
-use hset_testkit::tlsh::{corpus, example_digests, naive_knn, ref_diff, sorted_rows};
+use hset_testkit::tlsh::{
+    Perturbation, corpus, example_digests, naive_cell_index, naive_knn, perturb_corpus, ref_diff,
+    sorted_rows,
+};
 use proptest::prelude::*;
 
 fn m(distance: u32, index: u64) -> TlshMatch {
@@ -295,5 +298,107 @@ proptest! {
             knn_brute(&rows, &q, k, maxd, include_length),
             naive_knn(&rows, &q, k, maxd, include_length)
         );
+    }
+
+    #[test]
+    fn cells_equal_the_naive_oracle(
+        seed in any::<u64>(),
+        n in 0usize..400,
+        near in any::<bool>(),
+        pick in any::<usize>(),
+        k in 0usize..40,
+        maxd in prop_oneof![0u32..400, Just(u32::MAX)],
+        include_length in any::<bool>(),
+    ) {
+        let (rows, q) = corpus_and_query(seed, n, near, pick);
+        let cells = naive_cell_index(&rows);
+        prop_assert_eq!(
+            knn_cells(&rows, &cells, &q, k, maxd, include_length, None),
+            naive_knn(&rows, &q, k, maxd, include_length)
+        );
+    }
+}
+
+#[test]
+fn cells_are_empty_for_k_zero_or_a_null_query() {
+    let (digests, rows) = example_rows();
+    let cells = naive_cell_index(&rows);
+    let q = digests[0];
+    assert_eq!(knn_cells(&rows, &cells, &q, 0, 100, true, None), vec![]);
+    assert_eq!(
+        knn_cells(&rows, &cells, &TlshDigest::NULL, 5, 100, true, None),
+        vec![]
+    );
+    assert_eq!(
+        knn_cells(&[], &naive_cell_index(&[]), &q, 5, 100, true, None),
+        vec![]
+    );
+}
+
+#[test]
+fn cells_at_distance_zero_visit_only_the_query_cell() {
+    let (digests, rows) = example_rows();
+    let cells = naive_cell_index(&rows);
+    // digest 7 is in the rows twice
+    let q = digests[7];
+    let in_cell = rows.iter().filter(|r| r[..2] == q.0[..2]).count() as u64;
+    assert!(in_cell >= 2);
+    let mut stats = KnnStats::default();
+    let got = knn_cells(&rows, &cells, &q, 1, 0, true, Some(&mut stats));
+    assert_eq!(got.len(), 1);
+    assert_eq!(got[0].distance, 0);
+    assert_eq!(rows[got[0].index as usize], q.0);
+    assert_eq!(
+        stats,
+        KnnStats {
+            cells: 1,
+            lists: 0,
+            rows: in_cell
+        }
+    );
+    // the counters accumulate across searches
+    knn_cells(&rows, &cells, &q, 1, 0, true, Some(&mut stats));
+    assert_eq!(stats.cells, 2);
+    assert_eq!(stats.rows, 2 * in_cell);
+}
+
+#[test]
+fn cells_within_a_huge_radius_return_every_row_in_order() {
+    let rows = sorted_rows(&corpus(23, 500));
+    let cells = naive_cell_index(&rows);
+    let q = TlshDigest(rows[5]);
+    let mut stats = KnnStats::default();
+    let all = knn_cells(&rows, &cells, &q, rows.len(), 1 << 30, true, Some(&mut stats));
+    assert_eq!(all.len(), rows.len());
+    assert_eq!(all, knn_brute(&rows, &q, rows.len(), 1 << 30, true));
+    // every nonempty cell is visited and every row scanned
+    let mut distinct: Vec<[u8; 2]> = rows.iter().map(|r| [r[0], r[1]]).collect();
+    distinct.dedup();
+    assert_eq!(stats.cells, distinct.len() as u64);
+    assert_eq!(stats.rows, rows.len() as u64);
+}
+
+#[test]
+fn cells_match_brute_force_on_a_generated_corpus() {
+    // test_tlsh_cell_search.cpp's grid, on 3000 rows and 40 queries
+    let rows = sorted_rows(&corpus(21, 3000));
+    let cells = naive_cell_index(&rows);
+    let seeds: Vec<TlshDigest> = rows.iter().map(|r| TlshDigest(*r)).collect();
+    let p = Perturbation {
+        bucket_flip_prob: 0.03,
+        ..Perturbation::default()
+    };
+    for q in perturb_corpus(22, &seeds, 40, &p) {
+        for k in [1, 5, 20] {
+            for t in [10, 30, 100, 144, 400, 100_000] {
+                for incl in [true, false] {
+                    assert_eq!(
+                        knn_cells(&rows, &cells, &q, k, t, incl, None),
+                        knn_brute(&rows, &q, k, t, incl),
+                        "q {q} k {k} t {t} incl {incl}"
+                    );
+                }
+            }
+        }
     }
 }
