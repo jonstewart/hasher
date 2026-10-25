@@ -305,3 +305,28 @@ mod proptests {
         }
     }
 }
+
+#[cfg(kani)]
+mod proofs {
+    use super::*;
+    use crate::tlsh::TlshDigest;
+
+    /// A row's cell is `(L << 8) | Q`, the same through the index builder's
+    /// `cell_of` and [`TlshDigest::cell`], and it never decreases in the
+    /// rows' bytewise order, so each cell's rows are one contiguous run.
+    /// Rules out a byte-swapped (little-endian) cell, which scatters a
+    /// cell's rows and makes the prefix-sum ranges wrong.
+    #[kani::proof]
+    #[kani::unwind(37)]
+    fn cell_is_l_then_q_and_monotone_in_row_order() {
+        let a: [u8; DIGEST_LENGTH] = kani::any();
+        let b: [u8; DIGEST_LENGTH] = kani::any();
+        let d = TlshDigest(a);
+        let want = (usize::from(d.l()) << 8) | usize::from(d.q());
+        assert!(cell_of(&a) == want);
+        assert!(usize::from(d.cell()) == want);
+        if a <= b {
+            assert!(cell_of(&a) <= cell_of(&b));
+        }
+    }
+}

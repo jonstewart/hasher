@@ -670,3 +670,51 @@ fn one_center(rows: &[Row], ids: &[u32]) -> (u32, u32) {
     }
     (best, best_r)
 }
+
+#[cfg(kani)]
+mod proofs {
+    use super::*;
+    use crate::tlsh::ivf::FLAT_MAX;
+
+    /// A value below `2^bits`, masked so that its high bits are zero in the
+    /// formula and not only by assumption: the solver then sees the high
+    /// partial products of each multiply vanish. (With `assume` bounds
+    /// alone and a `u128` reference product the harness did not finish in
+    /// 9 minutes.)
+    fn any_below_pow2(bits: u32) -> u64 {
+        kani::any::<u64>() & ((1u64 << bits) - 1)
+    }
+
+    /// Within the flat k-means' bounds `nearer` is the exact comparison of
+    /// `big_a / n_a^2` and `big_b / n_b^2`. A flat node has
+    /// `1 <= n <= FLAT_MAX` rows, and `big = ||n x - S||^2 <= 2^10 n^2`
+    /// (each of the 256 coordinates of `n x - S` is at most `2n` in
+    /// magnitude, see [`nearer`]). With `n < 2^b`, `b` the bit length of
+    /// `FLAT_MAX` (13 for 4096), `big < 2^(10 + 2b)` and each product is
+    /// below `2^(10 + 4b) = 2^62`: the products never overflow, so the
+    /// wrapping products are the exact ones and `nearer` is the exact
+    /// cross-multiplication. Rules out a wrapped product picking the
+    /// farther centroid, e.g. if `FLAT_MAX` and the static bound below
+    /// `nearer` were raised to `2^14` (`10 + 4 * 15 > 64`), and a
+    /// comparison taken in narrower integers (`u32` products fail here).
+    ///
+    /// Over one minute: 270 to 350 s of verification under Kani 0.68.
+    #[kani::proof]
+    #[kani::unwind(1)]
+    fn nearer_is_exact_within_flat_bounds() {
+        let b = usize::BITS - FLAT_MAX.leading_zeros();
+        let flat_max = FLAT_MAX as u64;
+        let n_a = any_below_pow2(b);
+        let n_b = any_below_pow2(b);
+        let big_a = any_below_pow2(10 + 2 * b);
+        let big_b = any_below_pow2(10 + 2 * b);
+        kani::assume(n_a >= 1 && n_a <= flat_max && n_b >= 1 && n_b <= flat_max);
+        kani::assume(big_a <= (n_a * n_a) << 10 && big_b <= (n_b * n_b) << 10);
+        let pa = big_a.checked_mul(n_b).and_then(|p| p.checked_mul(n_b));
+        let pb = big_b.checked_mul(n_a).and_then(|p| p.checked_mul(n_a));
+        let (Some(pa), Some(pb)) = (pa, pb) else {
+            panic!("a product overflows u64");
+        };
+        assert!(nearer(big_a, n_a, big_b, n_b) == (pa < pb));
+    }
+}

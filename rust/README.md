@@ -63,8 +63,10 @@ recipes the same way.
 `hset-testkit` holds Rust-internal oracles (reference hex codec, brute-force
 lookup, etc.) used from each crate's `tests/` directory and from the fuzz
 crate. The fuzz crate's targets, corpora and invocation are documented in
-`fuzz/README.md`. `just verify` runs 29 Kani harnesses over the pure integer
-functions of `hset`, in the same capped `systemd-run` scope `mutants` uses
+`fuzz/README.md`. `just verify` runs 37 Kani harnesses over the pure integer
+functions of `hset` (8 of them over TLSH: the header costs, the popcount body
+kernel, the cell of a row, `tivf_len`, the BISECT `nearer` comparison, and the
+`f32` `list_bound`), in the same capped `systemd-run` scope `mutants` uses
 (`MemoryMax=$KANI_MEMORY`) when `systemd-run` is available. Mutation testing
 (`cargo-mutants`, configured in `.cargo/mutants.toml`) is triaged on a
 strict policy: every surviving mutant gets a new test that kills it, an

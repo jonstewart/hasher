@@ -251,3 +251,120 @@ impl BodyQuery {
         self.weighted::<4>(row)
     }
 }
+
+#[cfg(kani)]
+mod proofs {
+    use super::*;
+
+    /// `mod_diff` on a circle of `r <= 256` values (the L circle is 256,
+    /// Q1 and Q2 are 16) is symmetric, at most `r / 2`, zero only for equal
+    /// arguments, and the shorter of the two arcs. Rules out a one-sided
+    /// difference (`x - y` wrapping, or `|x - y|` without the wrap-around
+    /// arc), which makes `header_diff` asymmetric or over-charges L.
+    #[kani::proof]
+    #[kani::unwind(1)]
+    fn mod_diff_is_the_shorter_arc() {
+        let r: u32 = kani::any();
+        let x: u32 = kani::any();
+        let y: u32 = kani::any();
+        kani::assume(r >= 1 && r <= 256 && x < r && y < r);
+        let d = mod_diff(x, y, r);
+        assert!(d == mod_diff(y, x, r));
+        assert!(d <= r / 2);
+        assert!((d == 0) == (x == y));
+        // d is one of the two arcs from x to y.
+        assert!((x + d) % r == y || (y + d) % r == x);
+    }
+
+    /// `l_cost` and `q_cost` are non-decreasing over their whole domain
+    /// (`k <= 128` for L, `k <= 8` for Q, the largest `mod_diff` values),
+    /// start 0, 1, and never overflow there. Rules out an off-by-one in the
+    /// `12 k` / `12 (k - 1)` branches, which would let a farther header
+    /// cost less and break the header order's early exits.
+    #[kani::proof]
+    #[kani::unwind(1)]
+    fn l_and_q_costs_are_monotone() {
+        assert!(l_cost(0) == 0 && l_cost(1) == 1 && l_cost(2) == 24);
+        assert!(q_cost(0) == 0 && q_cost(1) == 1 && q_cost(2) == 12);
+        let a: u32 = kani::any();
+        let b: u32 = kani::any();
+        kani::assume(a <= b && b <= 128);
+        assert!(l_cost(a) <= l_cost(b));
+        assert!(l_cost(b) <= 12 * 128);
+        if b <= 8 {
+            assert!(q_cost(a) <= q_cost(b));
+            assert!(q_cost(b) <= 12 * 7);
+        }
+    }
+
+    fn any_digest() -> TlshDigest {
+        TlshDigest(kani::any())
+    }
+
+    /// `header_diff` is symmetric, zero for equal headers, and at most
+    /// `1 + 12 * 128 + 2 * 12 * 7 = 1705`. Rules out an asymmetric
+    /// distance (k-NN of `a` from `b` differing from `b` from `a`) and a
+    /// header cost large enough to overflow `diff`'s sum.
+    #[kani::proof]
+    #[kani::unwind(1)]
+    fn header_diff_is_symmetric_and_bounded() {
+        let a = any_digest();
+        let b = any_digest();
+        let include_length: bool = kani::any();
+        let d = header_diff(&a, &b, include_length);
+        assert!(d == header_diff(&b, &a, include_length));
+        assert!(d <= 1705);
+        assert!(header_diff(&a, &a, include_length) == 0);
+    }
+
+    /// Per-bucket costs of a code difference of 0, 1, 2, 3: the TLSH body
+    /// distance (6 for 3, as in `totalDiff`) and the squared embedding
+    /// distance (5 for 3).
+    const BODY_COST: [u32; 4] = [0, 1, 2, 6];
+    const EMB_COST: [u32; 4] = [0, 1, 2, 5];
+
+    /// A digest that is zero except for its header and trailer bytes (L,
+    /// Q, checksum, reserved) and the body byte `j` of each plane, all
+    /// arbitrary.
+    fn one_body_byte(j: usize) -> TlshDigest {
+        let mut d = [0u8; DIGEST_LENGTH];
+        for at in [0, 1, 34, 35, HI + j, LO + j] {
+            d[at] = kani::any();
+        }
+        TlshDigest(d)
+    }
+
+    /// The popcount kernel equals the per-bucket sum over the 128 two-bit
+    /// codes read with `bucket`, for pairs of digests whose bodies differ
+    /// from zero in one byte position `j` of each plane (any `j`, any
+    /// values, any header and trailer bytes). Every term of the kernel is a
+    /// popcount of bitwise operations on the planes, so it is a sum of
+    /// independent per-byte terms, and per-byte correctness at every
+    /// position is correctness for all digests. Rules out a wrong plane
+    /// offset (one that reads L, Q or the checksum), a swapped hi/lo plane,
+    /// a dropped word, and a wrong weight for the `|0 - 3|` case, all of
+    /// which the bit-parallel form would hide from a spot check. (Fully
+    /// symbolic 36-byte pairs did not finish in 11 minutes: the solver has
+    /// to prove two popcount formulations equal, which SAT handles badly.)
+    ///
+    /// Over one minute: about 125 s of verification under Kani 0.68.
+    #[kani::proof]
+    #[kani::unwind(9)]
+    fn body_kernel_matches_per_bucket_costs() {
+        let j: usize = kani::any();
+        kani::assume(j < 16);
+        let a = one_body_byte(j);
+        let b = one_body_byte(j);
+        let mut body = 0;
+        let mut emb = 0;
+        // Buckets outside 8j..8j + 8 are code 0 in both: cost 0.
+        for i in 8 * j..8 * j + 8 {
+            let k = a.bucket(i).abs_diff(b.bucket(i)) as usize;
+            body += BODY_COST[k];
+            emb += EMB_COST[k];
+        }
+        let q = BodyQuery::new(&a);
+        assert!(q.body(&b.0) == body);
+        assert!(q.emb_body(&b.0) == emb);
+    }
+}

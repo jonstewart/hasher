@@ -740,3 +740,31 @@ impl IvfIndex for TivfView<'_> {
         u32::from_le_bytes(self.ids[i])
     }
 }
+
+#[cfg(kani)]
+mod proofs {
+    use super::*;
+
+    /// `tivf_len` is the exact `32 + 4 * 65537 + 48 * lists + 8 + 4 * n`
+    /// whenever that fits in a `u64`, and `u64::MAX` otherwise; in
+    /// particular it is never below the 262,188 bytes of the fixed part.
+    /// So no header passes [`TivfView::parse`]'s length check on a payload
+    /// shorter than that, and a payload that passes holds every array its
+    /// header names. Rules out a wrapping length: with one,
+    /// `lists = 0, n = 2^62 - 65537` gives `262188 + 4 n = 2^64 + 40`, a
+    /// 40-byte payload passes, and the split into arrays indexes out of
+    /// bounds. (A harness over `parse` itself on short payloads ran out of
+    /// its 4 GB in the error messages' formatting of symbolic values; the
+    /// `tivf` fuzz target covers `parse`.)
+    #[kani::proof]
+    #[kani::unwind(1)]
+    fn tivf_len_is_exact_or_saturated() {
+        let lists: u32 = kani::any();
+        let n: u64 = kani::any();
+        let exact = (32 + 4 * 65537 + 8) + 48 * u128::from(lists) + 4 * u128::from(n);
+        let want = u64::try_from(exact).unwrap_or(u64::MAX);
+        let len = tivf_len(lists, n);
+        assert!(len == want);
+        assert!(len >= 262_188);
+    }
+}

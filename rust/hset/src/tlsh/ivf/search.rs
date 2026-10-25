@@ -216,3 +216,33 @@ fn ivf_scan<I: IvfIndex>(
     }
     top.into_sorted()
 }
+
+#[cfg(kani)]
+mod proofs {
+    use super::*;
+
+    /// `list_bound` is never negative or NaN, and is 0 when the query is no
+    /// farther from the medoid than the radius (`d2 <= r2`: the query may
+    /// lie inside the list). Rules out dropping the `max(0.0)` (a gap
+    /// below 0.1 would give a negative bound that lowers the header cost
+    /// it is added to) and a sign slip that prunes a list containing the
+    /// query's neighbours.
+    ///
+    /// Inputs are below `2^10`: a squared body-embedding distance is at
+    /// most `5 * 128 = 640`, so `d2` always is, and so is the exact
+    /// `radius2` the build and the merge write. A loaded file's `radius2`
+    /// is only checked to be an upper bound and may be larger; that range
+    /// is not covered. (Over all `u32` pairs the `f32` square roots did not
+    /// finish in 20 minutes.)
+    #[kani::proof]
+    #[kani::unwind(1)]
+    fn list_bound_is_nonnegative_and_zero_inside() {
+        let d2 = kani::any::<u32>() & 0x3ff;
+        let r2 = kani::any::<u32>() & 0x3ff;
+        let b = list_bound(d2, r2);
+        assert!(b >= 0.0);
+        if d2 <= r2 {
+            assert!(b == 0.0);
+        }
+    }
+}
