@@ -1,6 +1,6 @@
 //! Thin wrappers over libhasher's TLSH C API (`include/hasher/tlsh.h`,
 //! `include/hasher/hasher.h`) and the hash set API (`include/hasher/hashset.h`:
-//! loading, the TLSH kNN strategies, the embedding vectors and the builder),
+//! loading, the TLSH kNN strategies and the builder),
 //! plus deterministic synthetic corpora and a brute-force kNN used by the
 //! Criterion benchmarks.
 
@@ -28,12 +28,11 @@ pub const TLSH_KNN_BRUTE: u32 = 1;
 /// `SFHASH_TLSH_KNN_INDEX`: prune with the TIVF index stored in the file.
 pub const TLSH_KNN_INDEX: u32 = 2;
 
-/// `SFHASH_HSET_TLSH_VECTORS`: write the TVEC embedding matrix.
-pub const HSET_TLSH_VECTORS: u32 = 1;
-/// `SFHASH_HSET_TLSH_INDEX`: write the TIVF kNN index.
+/// `SFHASH_HSET_TLSH_INDEX`: write the TIVF kNN index. (Bit 1, once the
+/// stored embedding vectors, is reserved and ignored.)
 pub const HSET_TLSH_INDEX: u32 = 2;
-/// `SFHASH_HSET_TLSH_INHERIT` (`sfhash_hashset_merge` only): write each
-/// optional TLSH section iff every input that has a TLSH hash set has it.
+/// `SFHASH_HSET_TLSH_INHERIT` (`sfhash_hashset_merge` only): write the
+/// TIVF index iff every input that has a TLSH hash set has one.
 pub const HSET_TLSH_INHERIT: u32 = 4;
 
 /// `SFHASH_HSET_OP_UNION`
@@ -151,7 +150,6 @@ pub mod ffi {
             out: *mut TlshMatch,
         ) -> usize;
         pub fn sfhash_hashset_tlsh_knn_strategies(hset: *const RawHashset, tidx: usize) -> u32;
-        pub fn sfhash_hashset_tlsh_vectors(hset: *const RawHashset, tidx: usize, dims: *mut usize) -> *const f32;
 
         pub fn sfhash_hashset_builder_open(
             hashset_name: *const c_char,
@@ -551,8 +549,9 @@ fn path_c_string(p: &Path, what: &str) -> Result<CString, HashsetError> {
 /// reads in place, for as long as the handle lives.
 pub struct Hashset {
     raw: *mut RawHashset,
-    // 8-byte aligned so that the float32 TVEC matrix (page aligned in the
-    // file) stays at least 8-byte aligned in memory; `len` is the byte count.
+    // 8-byte aligned so that the chunks libhasher reads in place (HDAT on a
+    // 4096-byte boundary of the file) keep their alignment up to 8 bytes in
+    // memory; `len` is the byte count.
     _bytes: Vec<u64>,
     len: usize,
 }
@@ -686,19 +685,6 @@ impl Hashset {
         let mut out = Vec::with_capacity(k);
         self.tlsh_knn_into(tidx, digest, k, max_distance, include_length, strategy, &mut out);
         out.iter().map(|m| (m.index, m.distance)).collect()
-    }
-
-    /// `sfhash_hashset_tlsh_vectors`: the n x 264 row-major float32
-    /// embedding matrix, or `None` when the file has no TVEC section.
-    pub fn tlsh_vectors(&self, tidx: usize) -> Option<&[f32]> {
-        let mut dims = 0usize;
-        let p = unsafe { ffi::sfhash_hashset_tlsh_vectors(self.raw, tidx, &mut dims) };
-        if p.is_null() {
-            return None;
-        }
-        assert_eq!(dims, TLSH_EMBEDDING_DIMS);
-        let n = self.count(tidx) as usize;
-        Some(unsafe { slice::from_raw_parts(p, n * dims) })
     }
 }
 
@@ -1199,13 +1185,13 @@ mod tests {
     }
 
     #[test]
-    fn hset_build_load_knn_vectors() {
+    fn hset_build_load_knn() {
         let corpus = make_corpus(21, 2000);
         let expected = unique_sorted(&corpus);
 
         let dir = TempDir::new("test");
         let path = dir.0.join("corpus.hset");
-        let written = build_tlsh_hset(&path, &corpus, HSET_TLSH_VECTORS | HSET_TLSH_INDEX).unwrap();
+        let written = build_tlsh_hset(&path, &corpus, HSET_TLSH_INDEX).unwrap();
         assert_eq!(written, fs::metadata(&path).unwrap().len());
 
         let hset = Hashset::open(&path).unwrap();
@@ -1248,12 +1234,15 @@ mod tests {
         assert!(hset.tlsh_knn(tidx, &TlshDigest::NULL, 10, 1000, true, None).is_empty());
         assert!(hset.tlsh_knn(tidx, &rows[0], 10, 1000, true, Some(TLSH_KNN_BRUTE | TLSH_KNN_INDEX)).is_empty());
 
-        // vectors: n x 264, row r is the embedding of row r
-        let vec = hset.tlsh_vectors(tidx).expect("TVEC section");
-        assert_eq!(vec.len(), rows.len() * TLSH_EMBEDDING_DIMS);
-        assert_eq!(&vec[..TLSH_EMBEDDING_DIMS], &rows[0].embed()[..]);
-        let last = rows.len() - 1;
-        assert_eq!(&vec[last * TLSH_EMBEDDING_DIMS..], &rows[last].embed()[..]);
+        // bit 1 of the options (once the stored vectors) is ignored: the
+        // file is the same size, with the same index
+        let path3 = dir.0.join("corpus3.hset");
+        let written3 = build_tlsh_hset(&path3, &corpus, 1 | HSET_TLSH_INDEX).unwrap();
+        assert_eq!(written3, written);
+        let hset3 = Hashset::open(&path3).unwrap();
+        let tidx3 = hset3.tlsh_index().unwrap();
+        assert_eq!(hset3.tlsh_rows(tidx3), rows);
+        assert_eq!(hset3.tlsh_knn_strategies(tidx3), TLSH_KNN_BRUTE | TLSH_KNN_INDEX);
     }
 
     #[test]
@@ -1279,7 +1268,6 @@ mod tests {
             let rows = u.tlsh_rows(tidx);
             assert_eq!(rows, unique_sorted(&all));
             assert_eq!(u.tlsh_knn_strategies(tidx), TLSH_KNN_BRUTE | TLSH_KNN_INDEX);
-            assert!(u.tlsh_vectors(tidx).is_none());
 
             let mut rng = SplitMix64::new(53);
             for _ in 0..20 {
@@ -1319,7 +1307,6 @@ mod tests {
         let tidx = hset.tlsh_index().unwrap();
         assert_eq!(hset.count(tidx), unique_sorted(&corpus).len() as u64);
         assert_eq!(hset.tlsh_knn_strategies(tidx), TLSH_KNN_BRUTE);
-        assert!(hset.tlsh_vectors(tidx).is_none());
 
         let rows = hset.tlsh_rows(tidx);
         let q = perturb(&mut SplitMix64::new(1), &corpus[3], 0.05);

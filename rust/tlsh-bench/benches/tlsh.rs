@@ -151,7 +151,7 @@ fn prepare_case(dir: &ScratchDir, n: usize) -> HsetCase {
 
     let path = dir.0.join(format!("tlsh-{n}.hset"));
     let t1 = Instant::now();
-    // the index only; the TVEC matrix (n x 264 x f32) is not needed for kNN
+    // with the TIVF index
     let bytes = build_tlsh_hset(&path, &corpus, HSET_TLSH_INDEX).expect("build hset");
     let t_build = t1.elapsed();
 
@@ -274,8 +274,7 @@ fn hset_incremental_merge(c: &mut Criterion) {
     let coalesce = coalesce_from_env();
 
     // the master and a batch of half new families, half near-duplicates of
-    // master rows; TIVF index only, no TVEC (kNN does not read it and its
-    // 1 KiB per row would dominate both the merge and the build)
+    // master rows; with the TIVF index
     let t0 = Instant::now();
     let master = make_hashed_corpus(CORPUS_SEED, MERGE_MASTER);
     let mut batch = make_hashed_corpus(CORPUS_SEED + 1, MERGE_BATCH / 2);

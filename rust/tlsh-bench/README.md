@@ -68,8 +68,8 @@ its place; `otool -L` / `ldd` on the bench binary should not list libhasher.
 | `hset_incremental_merge` | `knn_merged`, `knn_rebuilt` | `sfhash_hashset_tlsh_knn_with(..., INDEX)` over the merged and over the rebuilt file, 20 queries as in `hset_knn` |
 
 `hset_knn` runs for N in {10 000, 100 000, 1 000 000} rows by default. Each
-N builds a TLSH-only hset once (through the builder API, with the TIVF index
-and without the TVEC vectors, which kNN does not need) in a fresh directory
+N builds a TLSH-only hset once (through the builder API, with the TIVF index)
+in a fresh directory
 under the system temp dir, loads it, and answers 20 fixed queries per
 iteration with k = 10, max_distance = 144 and the length included. Before
 timing, the harness asserts that the four strategies return identical
@@ -87,9 +87,7 @@ perturbations of master rows) once, then times one incremental union
 against one from-scratch build of the union's rows, and finally the kNN
 query time over each result (the harness first asserts that the two files
 have the same row count and answer the 20 queries identically). The files
-carry the TIVF index and no TVEC vectors: kNN never reads the vectors and
-their 1 KiB per row would dominate both the merge (a copy) and the build (an
-embedding pass). `TLSH_BENCH_COALESCE` overrides the coalescing threshold
+carry the TIVF index. `TLSH_BENCH_COALESCE` overrides the coalescing threshold
 (`SFHASH_HSET_COALESCE_DEFAULT` otherwise; 0 disables coalescing).
 
 All kNN groups return matches nearest first, ties by ascending row index,
@@ -208,9 +206,9 @@ temporary directory and check the row count (rows are deduplicated), the
 sorted row order, that `tlsh_knn` with `INDEX`, `BRUTE` and the default give
 the same answer as a pure-Rust brute force over `sfhash_tlsh_diff` for 20
 queries x k in {1, 10} x max_distance in {30, 144, 1000} x both
-`include_length` settings, and that the TVEC matrix has `n x 264` floats
-whose rows equal `sfhash_tlsh_embed` of the corresponding hash. A second
-hset is built with neither optional section to check the fallbacks. A merge
+`include_length` settings, and that options with the reserved bit 1 set
+build the same file. A second hset is built without the index to check the
+fallbacks. A merge
 test unions two built hsets through `sfhash_hashset_merge` with the default,
 a disabled and an explicit coalescing threshold and checks the rows against
 the deduplicated union and the carried index against a Rust brute force,
