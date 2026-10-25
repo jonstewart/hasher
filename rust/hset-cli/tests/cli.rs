@@ -710,3 +710,102 @@ fn make_rejects_bad_hset_tlsh_options() {
     assert_eq!(o.status.code(), Some(2), "{}", stderr(&o));
     assert!(stderr(&o).contains("HSET_TLSH_OPTIONS"), "{}", stderr(&o));
 }
+
+/// The byte ranges in `bytes` of the TLSH section's cell table (the
+/// `HINT` payload after its tag) and its `TIVF` payload.
+fn tlsh_chunk_ranges(bytes: &[u8]) -> (std::ops::Range<usize>, Option<std::ops::Range<usize>>) {
+    let f = hset::format::decode(bytes).unwrap();
+    let s = f
+        .sections
+        .iter()
+        .find(|s| s.header.htype == hset::HashType::Tlsh)
+        .unwrap();
+    let range = |part: &[u8]| {
+        let start = part.as_ptr() as usize - bytes.as_ptr() as usize;
+        start..start + part.len()
+    };
+    let Some(hset::format::Hint::TlshCells { table }) = s.hint else {
+        panic!("no cell hint");
+    };
+    (range(table), s.tivf.map(range))
+}
+
+/// Write `bytes` to `path` with the file digest recomputed, so that only
+/// the deliberate damage is a problem.
+fn write_redigested(path: &Path, mut bytes: Vec<u8>) {
+    let d = hset::format::encode::file_digest(&bytes).unwrap();
+    bytes[8..40].copy_from_slice(&d);
+    std::fs::write(path, bytes).unwrap();
+}
+
+#[test]
+fn verify_prints_the_tlsh_checks() {
+    let dir = tmpdir("tlsh-verify");
+    let f = dir.join("t.hset");
+    made_tlsh(&f, &[]);
+    let o = run(&["verify", p(&f)]);
+    assert!(o.status.success(), "{}", stdout(&o));
+    let s = stdout(&o);
+    assert!(
+        s.contains("\ntlsh: tlsh cells_exact=true, index lists=76 valid=true\n"),
+        "{s}"
+    );
+    assert!(s.ends_with("OK\n"), "{s}");
+
+    let none = dir.join("none.hset");
+    made_tlsh(&none, &["--no-tlsh-index"]);
+    let s = stdout(&run(&["verify", p(&none)]));
+    assert!(
+        s.contains("\ntlsh: tlsh cells_exact=true, index none\n"),
+        "{s}"
+    );
+}
+
+#[test]
+fn verify_fails_on_a_wrong_cell_hint_or_an_invalid_index() {
+    let dir = tmpdir("tlsh-verify-bad");
+    let f = dir.join("t.hset");
+    made_tlsh(&f, &[]);
+    let good = std::fs::read(&f).unwrap();
+    let (cells, tivf) = tlsh_chunk_ranges(&good);
+
+    // Move the end of the first nonempty cell down by one row: still a
+    // valid (non-decreasing) table, so the file loads, but not the cell
+    // index of the rows.
+    let mut bad = good.clone();
+    let at = |b: &[u8], c: usize| {
+        let o = cells.start + 8 * c;
+        u64::from_le_bytes(b[o..o + 8].try_into().unwrap())
+    };
+    let c = (0..65535).find(|&c| at(&bad, c) < at(&bad, c + 1)).unwrap();
+    let o = cells.start + 8 * (c + 1);
+    let v = at(&bad, c + 1) - 1;
+    bad[o..o + 8].copy_from_slice(&v.to_le_bytes());
+    let damaged = dir.join("cells.hset");
+    write_redigested(&damaged, bad);
+    let o = run(&["verify", p(&damaged)]);
+    assert_eq!(o.status.code(), Some(1), "{}", stdout(&o));
+    let s = stdout(&o);
+    assert!(s.contains("tlsh: tlsh cells_exact=false"), "{s}");
+    assert!(
+        s.contains("PROBLEM: tlsh: TLSH cell hint is not the cell index of the rows"),
+        "{s}"
+    );
+
+    // Repeat the first row id over the second in the TIVF ids (the last
+    // 4n bytes): the header still parses, the full validation fails.
+    let tivf = tivf.unwrap();
+    let mut bad = good.clone();
+    let ids = tivf.end - 4 * 81;
+    bad.copy_within(ids..ids + 4, ids + 4);
+    let damaged = dir.join("tivf.hset");
+    write_redigested(&damaged, bad);
+    let o = run(&["verify", p(&damaged)]);
+    assert_eq!(o.status.code(), Some(1), "{}", stdout(&o));
+    let s = stdout(&o);
+    assert!(
+        s.contains("tlsh: tlsh cells_exact=true, index lists=76 valid=false"),
+        "{s}"
+    );
+    assert!(s.contains("PROBLEM: tlsh: invalid TIVF index"), "{s}");
+}

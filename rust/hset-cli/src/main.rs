@@ -29,7 +29,7 @@ enum Cmd {
     Dump(DumpArgs),
     /// Look up hashes
     Query(QueryArgs),
-    /// Check digest, ordering, record links, and hint soundness
+    /// Check digest, ordering, record links, hint soundness, and TLSH cell hints and indexes
     Verify(FileArg),
     /// Union of two hash sets
     Union(SetOpArgs),
@@ -707,6 +707,15 @@ fn cmd_verify(a: FileArg) -> CliResult<ExitCode> {
             s.max_window,
             human(s.table_bytes)
         );
+        if let Some(t) = &s.tlsh {
+            let cells = t
+                .cells_exact
+                .map_or("none".to_string(), |exact| exact.to_string());
+            let index = t.index.map_or("none".to_string(), |ix| {
+                format!("lists={} valid={}", ix.lists, ix.valid)
+            });
+            out!("{}: tlsh cells_exact={cells}, index {index}", s.name);
+        }
     }
     if r.is_ok() {
         out!("OK");
