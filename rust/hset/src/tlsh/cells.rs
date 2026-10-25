@@ -50,8 +50,7 @@ pub fn cell_index(rows: &[[u8; DIGEST_LENGTH]]) -> Result<Vec<u64>> {
 /// The `0x7400` HINT table for `cells`: each offset as a little-endian `u64`
 /// (`write_tlsh_hint_data`, without the tag).
 pub fn cell_table(cells: &[u64]) -> Vec<u8> {
-    let _ = cells;
-    Vec::new()
+    cells.iter().flat_map(|c| c.to_le_bytes()).collect()
 }
 
 /// A validated cell index borrowed from a HINT table. The table need not be
@@ -143,5 +142,20 @@ mod tests {
         rows = five_rows();
         rows.swap(2, 3);
         assert!(cell_index(&rows).is_err());
+    }
+
+    /// test_hset_tlsh.cpp `write_tlsh_hint_data`: offsets `3i`, each a
+    /// little-endian u64.
+    #[test]
+    fn cell_table_writes_each_offset_little_endian() {
+        let cells: Vec<u64> = (0..65537u64).map(|i| i * 3).collect();
+        let t = cell_table(&cells);
+        assert_eq!(t.len(), 524296);
+        assert_eq!(&t[..16], &[0, 0, 0, 0, 0, 0, 0, 0, 3, 0, 0, 0, 0, 0, 0, 0]);
+        // 65536 * 3 = 0x3_0000
+        assert_eq!(&t[524288..], &[0, 0, 3, 0, 0, 0, 0, 0]);
+        for (i, e) in t.chunks_exact(8).enumerate() {
+            assert_eq!(u64::from_le_bytes(e.try_into().unwrap()), i as u64 * 3);
+        }
     }
 }
