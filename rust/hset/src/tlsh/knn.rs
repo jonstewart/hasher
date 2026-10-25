@@ -4,6 +4,12 @@
 use std::cmp::Ordering;
 use std::collections::BinaryHeap;
 
+use super::digest::{DIGEST_LENGTH, TlshDigest};
+use super::distance::{BodyQuery, l_cost, mod_diff, q_cost};
+
+/// Offset of the checksum byte in a canonical row (see [`super::digest`]).
+const CHECKSUM: usize = 34;
+
 /// One kNN hit: a row of the searched section and its TLSH distance from
 /// the query (C `SFHASH_TlshMatch`).
 ///
@@ -95,4 +101,51 @@ impl TopK {
     pub fn into_sorted(self) -> Vec<TlshMatch> {
         self.heap.into_sorted_vec()
     }
+}
+
+/// Brute-force k nearest neighbours of `q` among `rows` by TLSH distance
+/// (C++ `tlsh_knn_brute`): up to `k` matches with distance at most
+/// `max_distance`, nearest first, ties by ascending row index.
+///
+/// Empty when `k == 0`, `q` is null, or there are no rows. Rows are not
+/// checked: a null row gets its header-plus-body distance like any other,
+/// as in C++ (a loaded TLSH section never holds one).
+pub fn knn_brute(
+    rows: &[[u8; DIGEST_LENGTH]],
+    q: &TlshDigest,
+    k: usize,
+    max_distance: u32,
+    include_length: bool,
+) -> Vec<TlshMatch> {
+    if k == 0 || rows.is_empty() || q.is_null() {
+        return Vec::new();
+    }
+
+    // per-query header cost tables indexed by a row's L and Q bytes
+    let mut l_costs = [0u32; 256];
+    let mut q_costs = [0u32; 256];
+    for v in 0..256u32 {
+        if include_length {
+            l_costs[v as usize] = l_cost(mod_diff(v, q.l().into(), 256));
+        }
+        q_costs[v as usize] = q_cost(mod_diff(v >> 4, q.q1().into(), 16))
+            + q_cost(mod_diff(v & 0x0F, q.q2().into(), 16));
+    }
+    let body = BodyQuery::new(q);
+    let checksum = q.checksum();
+
+    let mut top = TopK::new(k, max_distance);
+    for (i, r) in rows.iter().enumerate() {
+        let header = l_costs[usize::from(r[0])]
+            + q_costs[usize::from(r[1])]
+            + u32::from(r[CHECKSUM] != checksum);
+        if header > top.bound() {
+            continue;
+        }
+        top.offer(TlshMatch {
+            index: i as u64,
+            distance: header + body.body(r),
+        });
+    }
+    top.into_sorted()
 }

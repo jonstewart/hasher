@@ -4,10 +4,45 @@
 //! (`test_hset_tlsh.cpp`), and the cell-index search against brute force
 //! (`test_tlsh_cell_search.cpp`).
 
-use hset::tlsh::knn::{TlshMatch, TopK};
+use hset::tlsh::TlshDigest;
+use hset::tlsh::knn::{TlshMatch, TopK, knn_brute};
+use hset_testkit::tlsh::{corpus, example_digests, naive_knn, ref_diff, sorted_rows};
+use proptest::prelude::*;
 
 fn m(distance: u32, index: u64) -> TlshMatch {
     TlshMatch { index, distance }
+}
+
+fn digest(hex: &str) -> TlshDigest {
+    TlshDigest::from_hex(hex).unwrap()
+}
+
+/// The TLSH rows of `test_hset_tlsh.cpp`'s fixture: the 80 example digests
+/// and digest 7 again, sorted (TNULL and the empty column are absent).
+fn example_rows() -> (Vec<TlshDigest>, Vec<[u8; 36]>) {
+    let digests: Vec<TlshDigest> = example_digests().iter().map(|h| digest(h)).collect();
+    let mut all = digests.clone();
+    all.push(digests[7]);
+    let rows = sorted_rows(&all);
+    (digests, rows)
+}
+
+/// The queries of `tlsh_knn_brute_matches_naive_and_reference`: five
+/// members, a member with flipped body bits, and a member moved far away
+/// in L and Q.
+fn example_queries(digests: &[TlshDigest]) -> Vec<TlshDigest> {
+    let mut qs: Vec<TlshDigest> = [0, 7, 13, 42, 79].iter().map(|&i| digests[i]).collect();
+    // C++ q.lo[2] ^= 0x33; q.hi[9] ^= 0x81 (lo plane at 18, hi at 2)
+    let mut b = digests[20].0;
+    b[18 + 2] ^= 0x33;
+    b[2 + 9] ^= 0x81;
+    qs.push(TlshDigest(b));
+    // C++ q.L += 100; q.Q ^= 0x77
+    let mut b = digests[50].0;
+    b[0] = b[0].wrapping_add(100);
+    b[1] ^= 0x77;
+    qs.push(TlshDigest(b));
+    qs
 }
 
 #[test]
@@ -72,4 +107,87 @@ fn top_k_below_k_keeps_everything_within_the_bound_sorted() {
         top.into_sorted(),
         vec![m(0, 8), m(7, 9), m(30, 2), m(30, 4)]
     );
+}
+
+#[test]
+fn brute_is_empty_for_k_zero_a_null_query_or_no_rows() {
+    let (digests, rows) = example_rows();
+    let q = digests[0];
+    assert_eq!(knn_brute(&rows, &q, 0, 1000, true), vec![]);
+    assert_eq!(knn_brute(&rows, &TlshDigest::NULL, 8, 1000, true), vec![]);
+    assert_eq!(knn_brute(&[], &q, 5, 1000, true), vec![]);
+}
+
+#[test]
+fn brute_matches_the_naive_oracle_on_the_reference_digests() {
+    let (digests, rows) = example_rows();
+    let n = rows.len();
+    assert_eq!(n, 81);
+    for q in example_queries(&digests) {
+        for include_length in [true, false] {
+            for k in [0, 1, 2, 5, 10, n, n + 50] {
+                for maxd in [0, 1, 30, 100, 200, u32::MAX] {
+                    let got = knn_brute(&rows, &q, k, maxd, include_length);
+                    let want = naive_knn(&rows, &q, k, maxd, include_length);
+                    assert_eq!(got, want, "q {q} k {k} maxd {maxd} incl {include_length}");
+                    for w in got.windows(2) {
+                        assert!(w[0] < w[1]);
+                    }
+                    for hit in &got {
+                        let row = TlshDigest(rows[hit.index as usize]);
+                        assert_eq!(ref_diff(&q, &row, include_length), Some(hit.distance));
+                        assert!(hit.distance <= maxd);
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn brute_finds_a_duplicated_member_twice_at_distance_zero() {
+    let (digests, rows) = example_rows();
+    let q = digests[7];
+    let got = knn_brute(&rows, &q, 3, 0, true);
+    assert_eq!(got.len(), 2);
+    assert_eq!(got[0].distance, 0);
+    assert_eq!(got[1].distance, 0);
+    assert_eq!(got[0].index + 1, got[1].index);
+    assert_eq!(rows[got[0].index as usize], q.0);
+    assert_eq!(rows[got[1].index as usize], q.0);
+}
+
+/// A seeded corpus of `n` rows and a query near (or equal to) one of them,
+/// or a fresh random digest when `n` is 0 or `near` is false.
+fn corpus_and_query(seed: u64, n: usize, near: bool, pick: usize) -> (Vec<[u8; 36]>, TlshDigest) {
+    let mut c = corpus(seed, n + 1);
+    let fresh = c.pop().expect("n + 1 digests");
+    let rows = sorted_rows(&c);
+    let q = if near && !rows.is_empty() {
+        let mut b = rows[pick % rows.len()];
+        b[2 + pick % 16] ^= 1 << (pick % 8);
+        TlshDigest(b)
+    } else {
+        fresh
+    };
+    (rows, q)
+}
+
+proptest! {
+    #[test]
+    fn brute_equals_the_naive_oracle(
+        seed in any::<u64>(),
+        n in 0usize..400,
+        near in any::<bool>(),
+        pick in any::<usize>(),
+        k in 0usize..40,
+        maxd in prop_oneof![0u32..400, Just(u32::MAX)],
+        include_length in any::<bool>(),
+    ) {
+        let (rows, q) = corpus_and_query(seed, n, near, pick);
+        prop_assert_eq!(
+            knn_brute(&rows, &q, k, maxd, include_length),
+            naive_knn(&rows, &q, k, maxd, include_length)
+        );
+    }
 }
