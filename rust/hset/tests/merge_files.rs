@@ -18,7 +18,9 @@ use hset::format::{
 };
 use hset::hashset::KnnStrategy;
 use hset::merge::{MergeOptions, TlshIndexPolicy, merge};
-use hset::tlsh::ivf::{DEFAULT_COALESCE, check_invariant};
+use hset::tlsh::ivf::{
+    DEFAULT_COALESCE, IvfBuildOptions, build_tlsh_ivf, check_invariant, tivf_len,
+};
 use hset::tlsh::{IvfIndex, TlshDigest, emb_body_dist2};
 use hset::{BuildOptions, Builder, Error, HashType, Hashset, HintSpec, SetOp};
 use hset_testkit::tlsh::{Perturbation, corpus, naive_cell_index, perturb_corpus};
@@ -953,4 +955,99 @@ fn an_invalid_input_index_fails_only_the_merges_that_carry_it() {
             }
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Incremental unions
+// ---------------------------------------------------------------------------
+
+/// A TLSH-only, hashsets-only file of `digests` with the index (C++
+/// `build_file` of test_hset_merge_incremental.cpp).
+fn tlsh_file(digests: &[TlshDigest]) -> Vec<u8> {
+    let mut b = Builder::new(&[HashType::Tlsh]).unwrap();
+    for d in digests {
+        b.add_record(&[Some(&d.0[..])]).unwrap();
+    }
+    b.build(&BuildOptions::new("inc", "incremental merge test").records(false))
+        .unwrap()
+}
+
+/// C++ hset_merge_incremental_unions, scaled down: a master absorbs
+/// batches, half new families and half near-duplicates of master rows,
+/// by unions with the index written and coalescing threshold C. After
+/// every step the rows are the union so far, the index is valid and
+/// coalesced (at most one list per cell below C / 2), each cell of m rows
+/// has at most m / (C / 2) + 1 lists, with the default C at most one list
+/// (48 TIVF bytes) more per nonempty cell than a fresh build, and the
+/// index search is exact.
+#[test]
+fn incremental_unions_keep_the_index_within_its_bounds() {
+    const MASTER: usize = 3000;
+    const STEPS: u64 = 5;
+    const HALF_BATCH: usize = 150;
+    let master_corpus = corpus(101, MASTER);
+    let near = Perturbation {
+        bucket_flip_prob: 0.03,
+        ..Perturbation::default()
+    };
+    let batches: Vec<Vec<TlshDigest>> = (0..STEPS)
+        .map(|i| {
+            let mut b = corpus(1000 + i, HALF_BATCH);
+            b.extend(perturb_corpus(2000 + i, &master_corpus, HALF_BATCH, &near));
+            b
+        })
+        .collect();
+    let sorted_unique =
+        |d: &[TlshDigest]| -> BTreeSet<[u8; 36]> { d.iter().map(|d| d.0).collect() };
+
+    let mut final_lists = Vec::new();
+    for c in [64, 32, 0] {
+        let mut o = MergeOptions::new("inc", "incremental merge test");
+        o.tlsh_index = TlshIndexPolicy::Write;
+        o.coalesce_threshold = c;
+        let mut expected = sorted_unique(&master_corpus);
+        let mut master = tlsh_file(&master_corpus);
+        for (step, batch) in batches.iter().enumerate() {
+            let out = merge(SetOp::Union, &load(&master), &load(&tlsh_file(batch)), &o).unwrap();
+            let hs = load(&out);
+            assert!(
+                hs.verify().is_ok(),
+                "C {c} step {step}: {:?}",
+                hs.verify().problems
+            );
+
+            expected.extend(sorted_unique(batch));
+            let rows = hs.tlsh_rows(0).unwrap();
+            assert!(rows.iter().eq(expected.iter()), "C {c} step {step}: rows");
+
+            let ivf = hs.tlsh_index(0).unwrap().unwrap();
+            assert!(check_invariant(&ivf, c), "C {c} step {step}");
+            let cells = naive_cell_index(rows);
+            let sizes = cells.windows(2).map(|w| w[1] - w[0]).filter(|&m| m > 0);
+            let nonempty = sizes.clone().count();
+            if c > 0 {
+                let bound: u64 = sizes.map(|m| m / u64::from(c / 2) + 1).sum();
+                assert!(ivf.lists() as u64 <= bound, "C {c} step {step}");
+            }
+            if c == DEFAULT_COALESCE {
+                let fresh = build_tlsh_ivf(rows, &IvfBuildOptions::default()).unwrap();
+                assert!(ivf.lists() <= fresh.lists() + nonempty, "step {step}");
+                let n = rows.len() as u64;
+                assert!(
+                    tivf_len(ivf.lists() as u32, n)
+                        <= tivf_len(fresh.lists() as u32, n) + 48 * nonempty as u64
+                );
+            }
+            check_knn_exact(&hs, 0, 77 + step as u64);
+            drop(hs);
+            master = out;
+        }
+        let hs = load(&master);
+        final_lists.push(hs.tlsh_index(0).unwrap().unwrap().lists());
+    }
+    // coalescing keeps the lists down; without it they accumulate
+    assert!(
+        final_lists[0] <= final_lists[1] && final_lists[1] < final_lists[2],
+        "lists at C = 64, 32, 0: {final_lists:?}"
+    );
 }
