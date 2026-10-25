@@ -2,6 +2,8 @@
 //! (merge_rows_sets, merge_rows_records, the differing-fields record
 //! merges) plus proptests against `BTreeSet` / `BTreeMap` models.
 
+use std::collections::{BTreeMap, BTreeSet};
+
 use hset::format::{FieldDescriptor, RecordHeader};
 use hset::merge::{
     DROPPED, RECORD_DROPPED, RowMerge, RowMode, RowOwners, merge_records, merge_rows,
@@ -9,6 +11,9 @@ use hset::merge::{
 };
 use hset::ops::SetOp;
 use hset::{Error, HashType};
+use hset_testkit::oracle::set_op_model;
+use hset_testkit::strategies::set_op;
+use proptest::prelude::*;
 
 const D: u32 = DROPPED;
 
@@ -359,4 +364,219 @@ fn record_merge_rejects_headers_that_disagree_with_the_data() {
     }
     let e = merge_records(SetOp::Union, &good, &LREC[..8], &good, &LREC).unwrap_err();
     assert!(matches!(e, Error::Format(_)), "{e}");
+}
+
+// ---------------------------------------------------------------------------
+// proptests against BTreeSet / BTreeMap models
+
+/// Sorted 2-byte rows over a small alphabet, so runs and cross-side equal
+/// rows are common.
+fn sorted_rows2() -> impl Strategy<Value = Vec<[u8; 2]>> {
+    prop::collection::vec(prop::array::uniform2(0u8..3), 0..14).prop_map(|mut v| {
+        v.sort();
+        v
+    })
+}
+
+fn flat(rows: &[[u8; 2]]) -> Vec<u8> {
+    rows.concat()
+}
+
+/// Rows with owning records: each row names a record, each record is kept
+/// (`Some(output record)`) or dropped.
+fn owned_rows() -> impl Strategy<Value = (Vec<[u8; 2]>, Vec<u64>, Vec<Option<u64>>)> {
+    (
+        sorted_rows2(),
+        prop::collection::vec(prop::option::of(0u64..100), 1..6),
+    )
+        .prop_flat_map(|(rows, fates)| {
+            let n = rows.len();
+            let nrec = fates.len() as u64;
+            (
+                Just(rows),
+                prop::collection::vec(0..nrec, n..=n),
+                Just(fates),
+            )
+        })
+}
+
+fn recmap(fates: &[Option<u64>]) -> Vec<u64> {
+    fates.iter().map(|f| f.unwrap_or(RD)).collect()
+}
+
+proptest! {
+    #[test]
+    fn set_merge_matches_the_btreeset_model(
+        l in sorted_rows2(), r in sorted_rows2(), op in set_op()
+    ) {
+        let m = merge_rows(&flat(&l), &flat(&r), 2, RowMode::Set(op)).unwrap();
+        let ls: BTreeSet<Vec<u8>> = l.iter().map(|x| x.to_vec()).collect();
+        let rs: BTreeSet<Vec<u8>> = r.iter().map(|x| x.to_vec()).collect();
+        let want: Vec<Vec<u8>> = set_op_model(op, &ls, &rs).into_iter().collect();
+
+        prop_assert_eq!(m.n, want.len() as u64);
+        prop_assert_eq!(m.gather_rows(&flat(&l), &flat(&r), 2).unwrap(), want.concat());
+        // the first row of a left run stands for it when its value is output;
+        // a right run is emitted only for a value the left lacks
+        for (i, row) in l.iter().enumerate() {
+            let first = i == 0 || l[i - 1] != *row;
+            let at = want.iter().position(|w| w == row);
+            let expect = if first { at.map_or(D, |k| k as u32) } else { D };
+            prop_assert_eq!(m.lmap[i], expect, "left row {}", i);
+        }
+        for (j, row) in r.iter().enumerate() {
+            let first = j == 0 || r[j - 1] != *row;
+            let at = want.iter().position(|w| w == row);
+            let expect = match at {
+                Some(k) if first && !ls.contains(&row.to_vec()) => k as u32,
+                _ => D,
+            };
+            prop_assert_eq!(m.rmap[j], expect, "right row {}", j);
+        }
+    }
+
+    #[test]
+    fn record_mode_merge_matches_a_stable_sort_of_the_kept_rows(
+        (l, lridx, lfates) in owned_rows(),
+        (r, rridx, rfates) in owned_rows(),
+        collapse in any::<bool>(),
+    ) {
+        let (lrm, rrm) = (recmap(&lfates), recmap(&rfates));
+        let (lrb, rrb) = (ridx(&lridx), ridx(&rridx));
+        let lo = RowOwners { ridx: &lrb, recmap: &lrm };
+        let ro = RowOwners { ridx: &rrb, recmap: &rrm };
+        let mode = RowMode::Records { left: lo, right: ro, collapse_equal: collapse };
+        let m = merge_rows(&flat(&l), &flat(&r), 2, mode).unwrap();
+
+        // model: kept rows as (row, side, index), sorted so ties put left
+        // (side 0) first and keep input order; collapsing keeps the first of
+        // each value
+        let mut kept: Vec<([u8; 2], u8, usize)> = Vec::new();
+        for (i, row) in l.iter().enumerate() {
+            if lfates[lridx[i] as usize].is_some() {
+                kept.push((*row, 0, i));
+            }
+        }
+        for (j, row) in r.iter().enumerate() {
+            if rfates[rridx[j] as usize].is_some() {
+                kept.push((*row, 1, j));
+            }
+        }
+        kept.sort();
+        if collapse {
+            kept.dedup_by_key(|k| k.0);
+        }
+        let (mut lmap, mut rmap) = (vec![D; l.len()], vec![D; r.len()]);
+        let mut want_ridx = Vec::new();
+        for (k, &(_, side, i)) in kept.iter().enumerate() {
+            if side == 0 {
+                lmap[i] = k as u32;
+                want_ridx.push(lfates[lridx[i] as usize].unwrap());
+            } else {
+                rmap[i] = k as u32;
+                want_ridx.push(rfates[rridx[i] as usize].unwrap());
+            }
+        }
+        prop_assert_eq!(m.n, kept.len() as u64);
+        prop_assert_eq!(&m.lmap, &lmap);
+        prop_assert_eq!(&m.rmap, &rmap);
+        let rows: Vec<[u8; 2]> = kept.iter().map(|k| k.0).collect();
+        prop_assert_eq!(m.gather_rows(&flat(&l), &flat(&r), 2).unwrap(), rows.concat());
+        prop_assert_eq!(m.gather_ridx(lo, ro).unwrap(), ridx(&want_ridx));
+    }
+}
+
+/// The three one-byte field types the record proptests draw from.
+const TYPES: [HashType; 3] = [HashType::Md5, HashType::Size, HashType::Sha1];
+
+/// A record as the model sees it: each field type's value, `None` = absent.
+type ModelRecord = BTreeMap<HashType, Option<u8>>;
+
+/// A record table with a shuffled nonempty subset of `TYPES` as its fields.
+fn record_table() -> impl Strategy<Value = (Vec<HashType>, Vec<ModelRecord>)> {
+    Just(TYPES.to_vec())
+        .prop_shuffle()
+        .prop_flat_map(|types| (Just(types), 1usize..=3))
+        .prop_flat_map(|(types, k)| {
+            let types: Vec<HashType> = types[..k].to_vec();
+            let rec = prop::collection::vec(prop::option::of(0u8..3), k..=k);
+            (Just(types), prop::collection::vec(rec, 0..12))
+        })
+        .prop_map(|(types, recs)| {
+            let recs = recs
+                .into_iter()
+                .map(|vals| types.iter().copied().zip(vals).collect())
+                .collect();
+            (types, recs)
+        })
+}
+
+/// A record in the layout `types`: presence byte and value per field, an
+/// absent field (or one the record lacks) all zero.
+fn layout(types: &[HashType], rec: &ModelRecord) -> Vec<u8> {
+    types
+        .iter()
+        .flat_map(|t| match rec.get(t).copied().flatten() {
+            Some(v) => [1, v],
+            None => [0, 0],
+        })
+        .collect()
+}
+
+/// The sorted, unique records of a table, as the builder writes them.
+fn table_bytes(types: &[HashType], recs: &[ModelRecord]) -> (RecordHeader, Vec<Vec<u8>>) {
+    let rows: BTreeSet<Vec<u8>> = recs.iter().map(|r| layout(types, r)).collect();
+    let fields = types.iter().map(|&t| field(t, t.field_name(), 1)).collect();
+    (
+        header(fields, rows.len() as u64),
+        rows.into_iter().collect(),
+    )
+}
+
+/// Reads a record in the layout `types` back into the model.
+fn unlayout(types: &[HashType], bytes: &[u8]) -> ModelRecord {
+    types
+        .iter()
+        .zip(bytes.chunks_exact(2))
+        .map(|(&t, pv)| (t, (pv[0] == 1).then_some(pv[1])))
+        .collect()
+}
+
+proptest! {
+    #[test]
+    fn record_merge_matches_the_btreemap_model(
+        (ltypes, lrecs) in record_table(),
+        (rtypes, rrecs) in record_table(),
+        op in set_op(),
+    ) {
+        let (lh, lrows) = table_bytes(&ltypes, &lrecs);
+        let (rh, rrows) = table_bytes(&rtypes, &rrecs);
+        let m = merge_records(op, &lh, &lrows.concat(), &rh, &rrows.concat()).unwrap();
+
+        // the output layout: left types, then the right types the left lacks
+        let mut otypes = ltypes.clone();
+        otypes.extend(rtypes.iter().filter(|t| !ltypes.contains(t)));
+        let ofields: Vec<HashType> = m.fields.iter().map(|f| f.htype).collect();
+        prop_assert_eq!(&ofields, &otypes);
+        prop_assert_eq!(m.record_length, 2 * otypes.len() as u64);
+
+        // every record widened through the model
+        let widen = |types: &[HashType], row: &Vec<u8>| layout(&otypes, &unlayout(types, row));
+        let lw: Vec<Vec<u8>> = lrows.iter().map(|x| widen(&ltypes, x)).collect();
+        let rw: Vec<Vec<u8>> = rrows.iter().map(|x| widen(&rtypes, x)).collect();
+        let ls: BTreeSet<Vec<u8>> = lw.iter().cloned().collect();
+        let rs: BTreeSet<Vec<u8>> = rw.iter().cloned().collect();
+        let want: Vec<Vec<u8>> = set_op_model(op, &ls, &rs).into_iter().collect();
+        prop_assert_eq!(&m.rdat, &want.concat());
+        prop_assert_eq!(m.record_count(), want.len() as u64);
+
+        let pos = |w: &Vec<u8>| want.iter().position(|x| x == w).map_or(RD, |k| k as u64);
+        let lmap: Vec<u64> = lw.iter().map(pos).collect();
+        let rmap: Vec<u64> = rw
+            .iter()
+            .map(|w| if op == SetOp::Union && !ls.contains(w) { pos(w) } else { RD })
+            .collect();
+        prop_assert_eq!(&m.lmap, &lmap);
+        prop_assert_eq!(&m.rmap, &rmap);
+    }
 }
