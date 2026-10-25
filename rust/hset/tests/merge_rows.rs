@@ -2,7 +2,7 @@
 //! (merge_rows_sets, merge_rows_records, the differing-fields record
 //! merges) plus proptests against `BTreeSet` / `BTreeMap` models.
 
-use hset::merge::{DROPPED, RowMerge, RowMode, merge_rows};
+use hset::merge::{DROPPED, RECORD_DROPPED, RowMerge, RowMode, RowOwners, merge_rows};
 use hset::ops::SetOp;
 
 const D: u32 = DROPPED;
@@ -48,4 +48,43 @@ fn set_merges_with_an_empty_side() {
     assert_eq!(m.n, 4);
     assert_eq!(m.rmap, [0, 1, 2, D, 3]);
     assert!(m.lmap.is_empty());
+}
+
+/// An `RIDX` payload: one little-endian u64 per row.
+fn ridx(recs: &[u64]) -> Vec<u8> {
+    recs.iter().flat_map(|r| r.to_le_bytes()).collect()
+}
+
+fn records(l: &[u8], lo: RowOwners<'_>, r: &[u8], ro: RowOwners<'_>, collapse: bool) -> RowMerge {
+    let mode = RowMode::Records {
+        left: lo,
+        right: ro,
+        collapse_equal: collapse,
+    };
+    merge_rows(l, r, 2, mode).unwrap()
+}
+
+// rows owned by records, test_hset_merge.cpp merge_rows_records
+const L4: [u8; 8] = [0, 1, 0, 3, 0, 3, 0, 5];
+const L4_RECMAP: [u64; 4] = [0, RD, 2, 3];
+const R2: [u8; 4] = [0, 3, 0, 4];
+const R2_RECMAP: [u64; 2] = [1, RD];
+const RD: u64 = RECORD_DROPPED;
+
+#[test]
+fn record_rows_follow_their_records_and_left_precedes_right_on_ties() {
+    let (lr, rr) = (ridx(&[0, 1, 2, 3]), ridx(&[0, 1]));
+    let lo = RowOwners {
+        ridx: &lr,
+        recmap: &L4_RECMAP,
+    };
+    let ro = RowOwners {
+        ridx: &rr,
+        recmap: &R2_RECMAP,
+    };
+    let m = records(&L4, lo, &R2, ro, false);
+    // 0,1 (l0) 0,3 (l2) 0,3 (r0) 0,5 (l3)
+    assert_eq!(m.n, 4);
+    assert_eq!(m.lmap, [0, D, 1, 3]);
+    assert_eq!(m.rmap, [2, D]);
 }

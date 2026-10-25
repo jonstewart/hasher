@@ -61,18 +61,54 @@ pub struct RowMerge {
 /// Merges two sorted runs of `len`-byte rows (`left` and `right` hold the
 /// rows back to back). Output row `k` is the input row mapped to `k`.
 pub fn merge_rows(left: &[u8], right: &[u8], len: usize, mode: RowMode<'_>) -> Result<RowMerge> {
-    let op = match mode {
-        RowMode::Set(op) => op,
-        RowMode::Records { .. } => SetOp::Union,
-    };
     let (l, r) = (Rows::new(left, len), Rows::new(right, len));
     let mut m = RowMerge {
         n: 0,
         lmap: vec![DROPPED; l.n],
         rmap: vec![DROPPED; r.n],
     };
-    merge_sets(op, l, r, &mut m)?;
+    match mode {
+        RowMode::Set(op) => merge_sets(op, l, r, &mut m)?,
+        RowMode::Records {
+            left,
+            right,
+            collapse_equal,
+        } => {
+            let lkept = left.kept(l.n, "left")?;
+            let rkept = right.kept(r.n, "right")?;
+            merge_owned(l, &lkept, r, &rkept, collapse_equal, &mut m)?;
+        }
+    }
     Ok(m)
+}
+
+impl RowOwners<'_> {
+    /// Whether each of the side's `n` rows belongs to an emitted record.
+    fn kept(&self, n: usize, side: &str) -> Result<Vec<bool>> {
+        if self.ridx.len() / 8 != n || self.ridx.len() % 8 != 0 {
+            return Err(Error::input(format!(
+                "the {side} record index has {} bytes for {n} rows",
+                self.ridx.len()
+            )));
+        }
+        self.ridx
+            .chunks_exact(8)
+            .enumerate()
+            .map(|(k, b)| {
+                let rec = u64::from_le_bytes(b.try_into().expect("8-byte chunk"));
+                usize::try_from(rec)
+                    .ok()
+                    .and_then(|rec| self.recmap.get(rec))
+                    .map(|&to| to != RECORD_DROPPED)
+                    .ok_or_else(|| {
+                        Error::format(format!(
+                            "{side} row {k} names record {rec}, but there are {} records",
+                            self.recmap.len()
+                        ))
+                    })
+            })
+            .collect()
+    }
 }
 
 /// Fixed-length rows stored back to back.
@@ -140,6 +176,42 @@ fn emit(m: &mut RowMerge, row: Side) -> Result<()> {
     }
     m.n += 1;
     Ok(())
+}
+
+fn merge_owned(
+    l: Rows<'_>,
+    lkept: &[bool],
+    r: Rows<'_>,
+    rkept: &[bool],
+    collapse_equal: bool,
+    m: &mut RowMerge,
+) -> Result<()> {
+    let (mut i, mut j) = (0, 0);
+    let mut last: Option<&[u8]> = None; // the previous emitted row
+    loop {
+        while i < l.n && !lkept[i] {
+            i += 1;
+        }
+        while j < r.n && !rkept[j] {
+            j += 1;
+        }
+        if i == l.n && j == r.n {
+            return Ok(());
+        }
+        // ties go left
+        let (row, next) = if next_order(&l, i, &r, j) != Ordering::Greater {
+            i += 1;
+            (l.get(i - 1), Side::Left(i - 1))
+        } else {
+            j += 1;
+            (r.get(j - 1), Side::Right(j - 1))
+        };
+        if collapse_equal && last == Some(row) {
+            continue;
+        }
+        last = Some(row);
+        emit(m, next)?;
+    }
 }
 
 fn merge_sets(op: SetOp, l: Rows<'_>, r: Rows<'_>, m: &mut RowMerge) -> Result<()> {
