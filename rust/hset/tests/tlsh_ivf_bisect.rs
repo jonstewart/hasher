@@ -5,12 +5,15 @@
 
 use hset::Error;
 use hset::synth::SplitMix64;
-use hset::tlsh::{TlshDigest, emb_body_dist2};
-use hset::tlsh::ivf::bisect::{IvfBuildOptions, build_tlsh_ivf, nearer};
 use hset::tlsh::CELL_COUNT;
+use hset::tlsh::ivf::bisect::{IvfBuildOptions, build_tlsh_ivf, nearer};
 use hset::tlsh::ivf::{FLAT_MAX, IvfIndex, TlshIvf};
+use hset::tlsh::knn::{TlshMatch, knn_brute};
+use hset::tlsh::{TlshDigest, body_diff, emb_body_dist2, header_diff};
 use hset::tlsh::mt64::Mt19937_64;
-use hset_testkit::tlsh::{corpus, random_digest_with_header, sorted_rows};
+use hset_testkit::tlsh::{
+    Perturbation, cell_corpus, corpus, perturb_corpus, random_digest_with_header, sorted_rows,
+};
 
 /// `n` random rows of the one cell (L 0x40, Q 0x21), sorted and
 /// deduplicated (C++ `one_cell_corpus`).
@@ -48,7 +51,7 @@ fn one_row_is_one_list_of_radius_zero() {
     let cell = 0x4021;
     assert!(ivf.cell_lists[..=cell].iter().all(|&c| c == 0));
     assert!(ivf.cell_lists[cell + 1..].iter().all(|&c| c == 1));
-    ivf.validate(&rows).expect("valid");
+    (&ivf).validate(&rows).expect("valid");
 }
 
 #[test]
@@ -131,7 +134,7 @@ fn exactly_t_rows_are_one_list_about_their_one_center() {
     let ivf = build(rows, 32, 7);
     assert_eq!(ivf.lists(), 1);
     check_one_centers(&ivf, rows);
-    ivf.validate(rows).expect("valid");
+    (&ivf).validate(rows).expect("valid");
 }
 
 #[test]
@@ -253,7 +256,7 @@ fn fewer_bodies_than_lists_give_one_list_per_body() {
     assert_eq!(ivf.ids.len(), rows.len());
     assert_eq!(sizes(&ivf), vec![70, 70, 70]);
     assert_eq!(ivf.radius2, vec![0, 0, 0]);
-    ivf.validate(&rows).expect("valid");
+    (&ivf).validate(&rows).expect("valid");
 }
 
 #[test]
@@ -404,5 +407,165 @@ fn the_build_does_not_depend_on_the_thread_count() {
     assert_eq!(build_with(&few, 32, 1, 16), build_with(&few, 32, 1, 1));
     // the same build again
     assert_eq!(build_with(&rows, 32, 1, 1), a);
+}
+
+/// Every list's medoid is one of its members (true of a fresh build; the
+/// format does not require it).
+fn check_medoids_are_members(ivf: &TlshIvf, rows: &[[u8; 36]]) {
+    for l in 0..ivf.lists() {
+        assert!(
+            ivf.list_ids(l).any(|i| TlshDigest(rows[i as usize]) == ivf.medoids[l]),
+            "list {l}: medoid is not a member"
+        );
+    }
+}
+
+#[test]
+fn a_build_over_many_cells_is_a_valid_index() {
+    // C++ tlsh_ivf_build_invariants (BISECT), T = 64
+    let rows = sorted_rows(&corpus(1, 5000));
+    let ivf = build_with(&rows, 64, 0x71_7565_7279, 0);
+    assert_eq!(ivf.n, rows.len() as u64);
+    assert!(ivf.lists() > 1);
+    // lengths, offsets, each row once, ascending ids, cells, radii
+    (&ivf).validate(&rows).expect("valid");
+    check_medoids_are_members(&ivf, &rows);
+    check_bisect_shape(&ivf, 64);
+}
+
+#[test]
+fn lists_are_one_centers() {
+    let rows = one_cell_corpus(21, 2000);
+    let ivf = build(&rows, 32, 7);
+    assert_eq!(ivf.ids.len(), rows.len());
+    check_bisect_shape(&ivf, 32);
+    check_one_centers(&ivf, &rows);
+}
+
+#[test]
+fn list_sizes_and_counts_are_bounded() {
+    let rows = sorted_rows(&corpus(51, 20000));
+    for t in [8, 32, 64] {
+        let ivf = build(&rows, t, 7);
+        check_bisect_shape(&ivf, t as u64);
+        check_one_centers(&ivf, &rows);
+        (&ivf).validate(&rows).expect("valid");
+    }
+}
+
+#[test]
+fn one_body_above_flat_max_ends_in_median_splits() {
+    // the pivot split puts every row on one side, so only the median
+    // fallback makes the coarse split terminate; every list has radius 0
+    let rows = same_body_corpus(FLAT_MAX + 1000);
+    let ivf = build(&rows, 32, 7);
+    assert_eq!(ivf.ids.len(), rows.len());
+    // split once at the median: two flat nodes of one body, one list each
+    assert_eq!(sizes(&ivf), vec![2548, 2548]);
+    check_bisect_shape(&ivf, 32);
+    assert!(ivf.radius2.iter().all(|&r| r == 0));
+    (&ivf).validate(&rows).expect("valid");
+}
+
+/// Exact kNN over a valid index, written from the model alone (not
+/// `ivf::search`): a list is skipped when the cell's header cost plus a
+/// lower bound on the body cost of every member exceeds `max_distance`,
+/// otherwise every member is scored. The body cost is at least the squared
+/// body-embedding distance (per bucket 0, 1, 2, 6 against 0, 1, 2, 5),
+/// and by the triangle inequality that is at least
+/// `(sqrt(d2(q, medoid)) - sqrt(radius2))^2` when positive. Returns the
+/// matches and the rows scored.
+fn ivf_knn(
+    ivf: &TlshIvf,
+    rows: &[[u8; 36]],
+    q: &TlshDigest,
+    k: usize,
+    max_distance: u32,
+    include_length: bool,
+) -> (Vec<TlshMatch>, usize) {
+    let mut found = Vec::new();
+    let mut scanned = 0;
+    for c in 0..CELL_COUNT {
+        let lists = ivf.cell_range(c);
+        if lists.is_empty() {
+            continue;
+        }
+        // the header cost without the checksum term is the cell's
+        let first = TlshDigest(rows[ivf.ids[ivf.list_start[lists.start] as usize] as usize]);
+        let mut cell = first.0;
+        cell[34] = q.checksum();
+        let header = header_diff(q, &TlshDigest(cell), include_length);
+        for l in lists {
+            let d = f64::from(emb_body_dist2(q, &ivf.medoids[l])).sqrt()
+                - f64::from(ivf.radius2[l]).sqrt();
+            let bound = if d > 0.0 { d * d - 1e-6 } else { 0.0 };
+            if f64::from(header) + bound > f64::from(max_distance) {
+                continue;
+            }
+            for i in ivf.list_ids(l) {
+                scanned += 1;
+                let r = TlshDigest(rows[i as usize]);
+                let distance = header_diff(q, &r, include_length) + body_diff(q, &r);
+                if distance <= max_distance {
+                    found.push(TlshMatch {
+                        index: u64::from(i),
+                        distance,
+                    });
+                }
+            }
+        }
+    }
+    found.sort_by_key(|m| (m.distance, m.index));
+    found.truncate(k);
+    (found, scanned)
+}
+
+/// The index gives the brute-force answers for perturbations of its rows,
+/// at several k, bounds and with and without the length; returns the
+/// rows scored over all queries.
+fn check_search_is_exact(ivf: &TlshIvf, rows: &[[u8; 36]], seed: u64, queries: usize) -> usize {
+    let digests: Vec<TlshDigest> = rows.iter().map(|r| TlshDigest(*r)).collect();
+    let mut scanned = 0;
+    for p in [Perturbation::default(), Perturbation::body_only(0.05)] {
+        for q in perturb_corpus(seed, &digests, queries, &p) {
+            for (k, max_distance) in [(1, 300), (10, 100), (10, 300)] {
+                for include_length in [true, false] {
+                    let (got, s) = ivf_knn(ivf, rows, &q, k, max_distance, include_length);
+                    scanned += s;
+                    assert_eq!(
+                        got,
+                        knn_brute(rows, &q, k, max_distance, include_length),
+                        "query {}, k {k}, max {max_distance}, length {include_length}",
+                        q.to_hex()
+                    );
+                }
+            }
+        }
+    }
+    scanned
+}
+
+#[test]
+fn searching_a_built_index_equals_brute_force() {
+    let rows = sorted_rows(&corpus(81, 6000));
+    let ivf = build(&rows, 32, 7);
+    (&ivf).validate(&rows).expect("valid");
+    check_search_is_exact(&ivf, &rows, 82, 20);
+}
+
+#[test]
+fn one_cell_of_twenty_thousand_rows_is_split_and_searchable() {
+    // several times FLAT_MAX in one cell: coarse splits, then a flat
+    // clustering of each node
+    let mut rows = sorted_rows(&cell_corpus(71, 20000, (0x40, 2, 1), 400, 0.05));
+    rows.dedup();
+    assert!(rows.len() > 3 * FLAT_MAX);
+    let ivf = build(&rows, 32, 7);
+    assert_eq!(ivf.ids.len(), rows.len());
+    check_bisect_shape(&ivf, 32);
+    (&ivf).validate(&rows).expect("every member within radius2");
+    let scanned = check_search_is_exact(&ivf, &rows, 72, 5);
+    // the radii prune: fewer rows scored than a scan of every query
+    assert!(scanned < 2 * 5 * 6 * rows.len(), "scanned {scanned}");
 }
 
