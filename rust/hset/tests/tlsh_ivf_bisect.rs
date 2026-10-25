@@ -6,7 +6,7 @@
 use hset::Error;
 use hset::synth::SplitMix64;
 use hset::tlsh::{TlshDigest, emb_body_dist2};
-use hset::tlsh::ivf::bisect::{IvfBuildOptions, build_tlsh_ivf};
+use hset::tlsh::ivf::bisect::{IvfBuildOptions, build_tlsh_ivf, nearer};
 use hset::tlsh::ivf::{IvfIndex, TlshIvf};
 use hset_testkit::tlsh::random_digest_with_header;
 
@@ -140,4 +140,30 @@ fn equal_rows_are_allowed() {
     let ivf = build(&rows, 32, 7);
     assert_eq!(ivf.ids, vec![0, 1]);
     assert_eq!(ivf.radius2, vec![0]);
+}
+
+#[test]
+fn nearer_compares_squared_distances_exactly() {
+    // N_a / n_a^2 < N_b / n_b^2 (C++ tlsh_ivf_nearer table)
+    assert!(nearer(3, 2, 1, 1)); // 3/4 < 1
+    assert!(!nearer(1, 1, 3, 2));
+    assert!(nearer(0, 5, 1, 1));
+    assert!(!nearer(0, 5, 0, 1)); // 0 == 0
+    assert!(nearer(1, 4096, 1, 4095));
+    assert!(!nearer(1, 4095, 1, 4096));
+    assert!(!nearer(1, 4096, 0, 1));
+
+    // equal distances with different denominators: neither is nearer
+    assert!(!nearer(4, 2, 1, 1));
+    assert!(!nearer(1, 1, 4, 2));
+    assert!(!nearer(9 * 50, 3 * 10, 50, 10)); // 450 / 900 == 50 / 100
+
+    // at the bound N = 2^34, n = 4096: 2^34 / 2^24 == 1024 / 1, and one
+    // unit less in N is nearer, which a 32-bit or float product would miss
+    let big = 1u64 << 34;
+    assert!(!nearer(big, 4096, 1024, 1));
+    assert!(!nearer(1024, 1, big, 4096));
+    assert!(nearer(big - 1, 4096, 1024, 1));
+    assert!(nearer(big - 1, 4096, big, 4096));
+    assert!(!nearer(big, 4096, big - 1, 4096));
 }

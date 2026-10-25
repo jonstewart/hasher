@@ -31,6 +31,24 @@ impl Default for IvfBuildOptions {
     }
 }
 
+/// Whether the squared distance `big_a / n_a^2` is strictly smaller than
+/// `big_b / n_b^2`, compared exactly as `big_a * n_b^2 < big_b * n_a^2`
+/// (C++ `tlsh_ivf_nearer`).
+///
+/// In the flat k-means the squared distance from a row `x` to a centroid
+/// of `n` members with coordinate sum `S` is `||x - S / n||^2 = N / n^2`,
+/// `N = ||n x - S||^2`. With `x` and every member in `{-1, 0, 1}^256`,
+/// `|n x_j - S_j| <= 2n`, so `N <= 2^10 n^2`; for `n <= FLAT_MAX = 2^12`
+/// both products are at most `2^58`. Beyond that range the products wrap,
+/// as the C++ `uint64_t` products do.
+pub const fn nearer(big_a: u64, n_a: u64, big_b: u64, n_b: u64) -> bool {
+    big_a.wrapping_mul(n_b).wrapping_mul(n_b) < big_b.wrapping_mul(n_a).wrapping_mul(n_a)
+}
+
+// The products of `nearer` stay in 64 bits for nodes of up to 2^13 rows
+// (2^10 * 2^26 * 2^26 = 2^62), as C++'s static_assert requires.
+const _: () = assert!(super::FLAT_MAX <= 8192);
+
 /// The lists of one cell: per list its medoid, radius2 and size, and the
 /// members concatenated (row indexes of the whole section, ascending
 /// within a list).
