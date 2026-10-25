@@ -623,6 +623,31 @@ fn a_records_file_merged_with_a_hashsets_only_file_gives_hashsets_only() {
     }
 }
 
+/// An empty output (A − A, or the intersection of disjoint inputs) has
+/// empty sections, an empty cell index and, when written, a TIVF over no
+/// rows, whether merged or built from scratch.
+#[test]
+fn empty_outputs_load_and_verify() {
+    let c = tlsh_corpus();
+    for input in [HO, REC] {
+        let a = build_input(&c, 0..100, &MD5_TLSH, input);
+        let bare = build_input(&c, 0..100, &MD5_TLSH, input.index(false));
+        let far = build_input(&c, 200..300, &MD5_TLSH, input.index(false));
+        let mut o = opts();
+        for (op, r, policy, want_idx) in [
+            (SetOp::Subtract, &a, TlshIndexPolicy::Inherit, true),
+            (SetOp::Subtract, &bare, TlshIndexPolicy::Write, true),
+            (SetOp::Intersect, &far, TlshIndexPolicy::Write, true),
+            (SetOp::Intersect, &far, TlshIndexPolicy::Inherit, false),
+        ] {
+            o.tlsh_index = policy;
+            let out = merged(op, &a, r, &o);
+            assert!((0..2).all(|i| load(&out).count(i) == 0));
+            check_output(&out, &a, r, op, want_idx);
+        }
+    }
+}
+
 /// C++ hset_merge_type_only_on_one_side: a type on one side only is merged
 /// against an empty run.
 #[test]
