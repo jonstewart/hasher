@@ -7,6 +7,7 @@
 //! `hset::tlsh::cells`.
 
 use hset::format::Hint;
+use hset::lookup::tlsh::TlshCellLookup;
 use hset::lookup::{Lookup, hint_from_parts, make_lookup};
 use hset::{Error, HashType, Hashset};
 use hset_testkit::oracle::NaiveSet;
@@ -274,6 +275,16 @@ fn a_bad_cell_index_fails_construction() {
     let mut dec = good.clone();
     dec[8 * (c + 1)..8 * (c + 2)].copy_from_slice(&41u64.to_le_bytes());
     assert!(make_err(36, &data, &dec).contains("decrease"));
+}
+
+/// Built directly, the strategy refuses data that is not whole rows
+/// instead of panicking.
+#[test]
+fn partial_rows_fail_direct_construction() {
+    let table = table_of(&[]);
+    let e = TlshCellLookup::new(&[0u8; 37], &table).unwrap_err();
+    assert!(matches!(e, Error::Format(_)), "{e}");
+    assert!(e.to_string().contains("whole number"), "{e}");
 }
 
 /// The cell index belongs to 36-byte TLSH rows only.

@@ -9,7 +9,7 @@
 use std::ops::Range;
 
 use super::Lookup;
-use crate::error::Result;
+use crate::error::{Error, Result};
 use crate::tlsh::DIGEST_LENGTH;
 use crate::tlsh::cells::{CELL_INDEX_LEN, CellIndex};
 
@@ -27,11 +27,15 @@ pub struct TlshCellLookup<'a> {
 impl<'a> TlshCellLookup<'a> {
     /// A lookup over `data`, sorted 36-byte rows, with the `0x7400` hint
     /// `table`. A table that is not a valid cell index of `data`'s row
-    /// count ([`CellIndex::parse`]) is an [`crate::Error::Format`]; `data`
-    /// must be a whole number of rows.
+    /// count ([`CellIndex::parse`]), or `data` that is not a whole number
+    /// of rows, is an [`Error::Format`].
     pub fn new(data: &'a [u8], table: &[u8]) -> Result<Self> {
         let (rows, rest) = data.as_chunks::<DIGEST_LENGTH>();
-        assert!(rest.is_empty(), "TLSH data is not a whole number of rows");
+        if !rest.is_empty() {
+            return Err(Error::format(
+                "TLSH hash data is not a whole number of 36-byte rows",
+            ));
+        }
         let ix = CellIndex::parse(table, rows.len())?;
         // Every offset is at most the row count, so it fits in usize.
         let cells = (0..CELL_INDEX_LEN).map(|c| ix.offset(c) as usize).collect();
