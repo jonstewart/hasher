@@ -7,7 +7,7 @@ Static HTML with inline SVG, generated from the libhasher sources by
 
 | page | subject |
 |---|---|
-| `index.html` | the file: chunks, headers, records, hints, the TLSH row, TVEC and TIVF, byte by byte |
+| `index.html` | the file: chunks, headers, records, hints, the TLSH row and TIVF, byte by byte |
 | `lookup.html` | bounded exact lookup: the expected-index line, the deviation walk, per-block bounds, the branchless window search, batching, the line-fitting candidates and the evaluation |
 | `tlsh.html` | the TLSH digest and distance, the popcount kernel, the lower-bound embedding, cells, the TIVF index and its BISECT build, and the exact kNN search with a real traced query |
 | `merge.html` | set operations by merging: two pointers, row maps, records, carrying the TIVF lists through a merge, coalescing and its bounds |

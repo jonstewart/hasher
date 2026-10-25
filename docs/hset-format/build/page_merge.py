@@ -136,8 +136,7 @@ def fig_pipeline():
         (580, 20, 'HDAT', 'rows copied to their mapped positions', F_HASH),
         (580, 72, 'HINT 0x6208 / 0x7400', 'recomputed over the written rows: a pass, or a prefix sum per cell', F_NUM),
         (580, 124, 'RIDX', 'row → record, remapped through the record map', '#e6e9d7'),
-        (580, 176, 'TVEC', 'vectors copied from the contributing input, or embedded', '#f3e6cf'),
-        (580, 228, 'TIVF', 'lists carried per cell with ids remapped, then coalesced (merge_tlsh_ivf)', '#f0dcc8'),
+        (580, 176, 'TIVF', 'lists carried per cell with ids remapped, then coalesced (merge_tlsh_ivf)', '#f0dcc8'),
     ]
     for (x, y, t, sub, fill) in outs:
         s.rect(x, y, 320, 44, fill=fill, stroke=INK, sw=0.7, rx=3)
@@ -156,10 +155,10 @@ def fig_pipeline():
     s.text(448, 170, 'with records, the row merge', size=8.5, fill=INK2, italic=True, anchor='end')
     s.text(448, 182, 'follows the records\' fates (§3)', size=8.5, fill=INK2, italic=True, anchor='end')
     s.line(510, 275, 578, 146, stroke=INK2, sw=0.7, arrow=True, dash='3,3')
-    s.text(20, 130, 'no sort, no re-embedding,', size=10, italic=True, fill=INK2)
-    s.text(20, 146, 'no re-clustering: every output', size=10, italic=True, fill=INK2)
-    s.text(20, 162, 'chunk is a pass over the inputs', size=10, italic=True, fill=INK2)
-    s.text(20, 178, 'driven by the two maps.', size=10, italic=True, fill=INK2)
+    s.text(20, 130, 'no sort, no re-clustering:', size=10, italic=True, fill=INK2)
+    s.text(20, 146, 'every output chunk is a pass', size=10, italic=True, fill=INK2)
+    s.text(20, 162, 'over the inputs driven by the', size=10, italic=True, fill=INK2)
+    s.text(20, 178, 'two maps.', size=10, italic=True, fill=INK2)
     return s
 
 
@@ -351,7 +350,7 @@ def fig_sweep():
 def build():
     body = []
     B = body.append
-    B(f'''<p>A master hash set absorbs new rows every hour, an analyst wants the intersection of two collections, a corpus minus its known-good subset. Each of these is a set operation on whole files, and each output must be a complete, valid hset: sorted rows, hints, records, and for TLSH the vectors and the index. The naive route rebuilds everything from the union of the inputs: a sort, an embedding pass and a clustering. hset instead <em>merges</em>: a single two-pointer pass over the two sorted inputs decides every row's fate, and every other chunk is carried through that decision by a <em>row map</em>. Nothing is re-sorted, re-embedded or re-clustered. The hard part is the TIVF index, whose lists must stay correct and must not multiply.{sn('An hourly union of 18 000 rows into a 1M-row master takes about 42 ms with the index carried through, against 440 ms for a rebuild with the integer builder and 3.3 s with the float one; the daily 432 000-row batch takes 100–150 ms against 2.5 s. Numbers from the incremental-merge sweep in <code>docs/TLSH_EMBEDDING.md</code>, section 5.')}</p>''')
+    B(f'''<p>A master hash set absorbs new rows every hour, an analyst wants the intersection of two collections, a corpus minus its known-good subset. Each of these is a set operation on whole files, and each output must be a complete, valid hset: sorted rows, hints, records, and for TLSH the index. The naive route rebuilds everything from the union of the inputs: a sort and a clustering. hset instead <em>merges</em>: a single two-pointer pass over the two sorted inputs decides every row's fate, and every other chunk is carried through that decision by a <em>row map</em>. Nothing is re-sorted or re-clustered. The hard part is the TIVF index, whose lists must stay correct and must not multiply.{sn('An hourly union of 18 000 rows into a 1M-row master takes about 42 ms with the index carried through, against 440 ms for a rebuild with the integer builder and 3.3 s with the float one; the daily 432 000-row batch takes 100–150 ms against 2.5 s. Numbers from the incremental-merge sweep in <code>docs/TLSH_EMBEDDING.md</code>, section 5.')}</p>''')
     B('<ul class="toc">' + ''.join(f'<li><span class="n">{n}</span><a href="#{a}">{t}</a></li>' for n, t, a in [
         (1, 'Two pointers', 'two-pointers'), (2, 'Everything else follows the map', 'everything-else-follows-the-map'),
         (3, 'Records', 'records'), (4, 'Merging the TIVF lists', 'merging-the-tivf-lists'),
@@ -372,10 +371,9 @@ def build():
 <li><em>HDAT</em>: every kept input row is copied to its mapped position. The output is sorted because the merge emitted in order.</li>
 <li><em>HINT</em>: the hints depend only on the written rows, so they are recomputed from the output HDAT: the per-block deviation bounds in one pass, the TLSH cell index as a count per cell and a prefix sum.</li>
 <li><em>RIDX</em>: each kept row's record index is pushed through the record map of §3.</li>
-<li><em>TVEC</em>: each kept row's vector is copied from the input that contributed the row, 1 056 bytes of plain I/O; a row from an input that had no vectors is embedded on the spot.</li>
 <li><em>TIVF</em>: the subject of §4 and §5. When one input has no index and the output wants one, the merged rows are clustered from scratch instead.</li>
 </ul>
-<p>Which optional TLSH chunks the output gets is a choice: explicitly, or by inheritance, which writes a chunk if and only if every input that has a TLSH section has it. Under inheritance an index is always merged, never rebuilt.</p>''')
+<p>Whether the output gets the optional TLSH index is a choice: explicitly, or by inheritance, which writes it if and only if every input that has a TLSH section has one. Under inheritance an index is always merged, never rebuilt.</p>''')
 
     B(h2(3, 'Records'))
     B('''<p>When both inputs carry a record table, the operation is applied to the <em>records</em>, and the rows follow. Records are first widened to a common layout: the left input's fields in their order, then any fields only the right has; an absent field is a zero presence byte and a zero value. A side whose field order changed by the widening is re-sorted. The widened records are then merged by the same two-pointer rule, comparing whole records, and identical records collapse to the left copy. For intersection and difference only left records can be emitted, so the right record map is all "dropped".</p>''')
@@ -396,9 +394,9 @@ def build():
 
     B(h2(6, 'What it costs, what it keeps'))
     B(fig(fig_sweep(), 'The coalescing threshold sweep. Left: the merged index has fewer lists than a rebuild for any C > 0 (the invariant packs cells tighter than ⌈m/T⌉). Middle: query time is minimised at C = 2T, within 3% of the rebuilt index. Right: the price, more rows scanned per query, grows with C.', 'wide'))
-    B(f'''<p>A merged index is never incorrect; it can only be slower than a fresh one, and the sweep bounds how much: after 24 hourly merges the index answers in 29.6 µs against 28.9 µs rebuilt, scanning 16 900 rows against 12 400. The hard case is a batch that is a large fraction of the master: after seven daily batches of 432 000 rows the merged index scans 1.8× the rows of a rebuild and answers in 1.3× the time, still two orders of magnitude under brute force. When rows scanned matter, a rebuild (any merge with an explicit index option against an input without an index) restores the fresh profile and the incremental merges resume from it.{sn('The layout of the output is that of a built file: HDAT chunks on 4096-byte boundaries, TVEC data page-aligned, an FTOC listing exactly the chunks written, and the SHA-256 computed last over everything from offset 40.')}</p>''')
+    B(f'''<p>A merged index is never incorrect; it can only be slower than a fresh one, and the sweep bounds how much: after 24 hourly merges the index answers in 29.6 µs against 28.9 µs rebuilt, scanning 16 900 rows against 12 400. The hard case is a batch that is a large fraction of the master: after seven daily batches of 432 000 rows the merged index scans 1.8× the rows of a rebuild and answers in 1.3× the time, still two orders of magnitude under brute force. When rows scanned matter, a rebuild (any merge with an explicit index option against an input without an index) restores the fresh profile and the incremental merges resume from it.{sn('The layout of the output is that of a built file: HDAT chunks on 4096-byte boundaries, an FTOC listing exactly the chunks written, and the SHA-256 computed last over everything from offset 40.')}</p>''')
     B(table(['scenario (BISECT, T = 32, C = 64)', 'merges', 'rebuild', 'lists merged / rebuilt', 'kNN merged / rebuilt', 'rows per query merged / rebuilt'],
             [('24 hourly batches of 18 000 into 1M', '995 ms', '440 ms', '40 094 / 50 381', '29.6 / 28.9 µs', '16 855 / 12 386'),
              ('7 daily batches of 432 000 into 1M', '782 ms', '2 525 ms', '93 946 / 131 274', '127.6 / 94.7 µs', '56 676 / 31 668')], numeric=(1, 2, 3, 4, 5)))
     B('''<p class="note">A single hourly merge costs about 42 ms, ten times less than a rebuild; the 24 of them together cost twice a rebuild, so a daily rebuild with hourly merges between is a reasonable regime. The merge is single-threaded and dominated by copying the rows and hashing the file.</p>''')
-    return page('merge.html', 'Set operations', 'Union, intersection and difference of whole files by one merge pass, with the hints, the records, the vectors and the TIVF index carried through a row map instead of rebuilt.', ''.join(body))
+    return page('merge.html', 'Set operations', 'Union, intersection and difference of whole files by one merge pass, with the hints, the records and the TIVF index carried through a row map instead of rebuilt.', ''.join(body))

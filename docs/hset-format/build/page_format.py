@@ -15,7 +15,7 @@ HASH_TYPES = [
 
 CHUNK_FILL = {
     'FTOC': F_TYPE, 'FHDR': F_TYPE, 'RHDR': '#e9dfe6', 'RDAT': '#f1e9ef', 'HH': '#d9e4ea', 'HINT': F_NUM,
-    'HDAT': F_HASH, 'RIDX': '#e6e9d7', 'TVEC': '#f3e6cf', 'TIVF': '#f0dcc8', 'FEND': F_TYPE, 'pad': F_PAD,
+    'HDAT': F_HASH, 'RIDX': '#e6e9d7', 'TIVF': '#f0dcc8', 'FEND': F_TYPE, 'pad': F_PAD,
 }
 
 def chunk_fill(ty):
@@ -175,7 +175,7 @@ def fig_grammar():
     nodes = {
         'FTOC': (60, ya), 'FHDR': (180, ya), 'RHDR': (300, ya), 'RDAT': (420, ya),
         'HHnn': (560, ya), 'HINT': (680, ya), 'HDAT': (800, ya),
-        'RIDX': (800, yb), 'TVEC': (680, yb), 'TIVF': (560, yb), 'FEND': (300, yb),
+        'RIDX': (800, yb), 'TIVF': (560, yb), 'FEND': (300, yb),
     }
     r = 26
     def node(name, dashed=False, fill='#fff'):
@@ -220,17 +220,13 @@ def fig_grammar():
     edge('HHnn', 'HDAT', bend=-50, label='"sizes" has no HINT', dashed=True)
     edge('HDAT', 'RIDX')
     s.text(nodes['HDAT'][0] + 10, (ya + yb) / 2 + 3, 'with records', size=9, fill=INK2, italic=True)
-    edge('RIDX', 'TVEC', label='TLSH only', dashed=True, lab_dy=14)
-    edge('TVEC', 'TIVF', label='TLSH only', dashed=True, lab_dy=14)
-    edge('HDAT', 'TVEC', bend=0, dashed=True)
+    edge('RIDX', 'TIVF', label='TLSH only', dashed=True, lab_dy=14)
     edge('HDAT', 'TIVF', bend=40, dashed=True)
-    edge('RIDX', 'TIVF', bend=-40, dashed=True)
     # back to HHnn: next section
     edge('TIVF', 'HHnn')
     s.text(nodes['HHnn'][0] - 10, (ya + yb) / 2 + 3, 'next hash set', size=9, fill=INK2, italic=True, anchor='end')
     edge('RIDX', 'HHnn', bend=30, dashed=False, color=GRAY)
     edge('HDAT', 'HHnn', bend=48, color=GRAY)
-    edge('TVEC', 'HHnn', bend=-30, color=GRAY)
     # to FEND
     edge('TIVF', 'FEND')
     edge('RDAT', 'FEND', bend=-40, label='records only', lab_dy=14)
@@ -238,7 +234,7 @@ def fig_grammar():
     x, y = nodes['FEND']
     s.circle(x, y, r + 4, fill='none', stroke=INK, sw=0.8)
     for n in nodes:
-        node(n, dashed=n in ('TVEC', 'TIVF'))
+        node(n, dashed=n == 'TIVF')
     s.text(W - 10, H - 8, 'solid: every file · dashed: TLSH hash sets only · gray: shortcuts when a section has no later chunks', size=9, anchor='end', fill=INK2, italic=True)
     return s
 
@@ -340,14 +336,14 @@ def fig_hdat():
 
 def fig_alignment():
     W = 900
-    s = SVG(W, 170)
+    s = SVG(W, 100)
     x0 = 190
     scale = 0.075  # px per byte -> 4096 B = 307 px
     y = 40
     def page_marks():
         for p in range(0, 3):
             x = x0 + p * 4096 * scale
-            s.line(x, y - 14, x, y + 90, stroke=RULE, sw=0.8, dash='2,2')
+            s.line(x, y - 14, x, y + 40, stroke=RULE, sw=0.8, dash='2,2')
             s.text(x, y - 18, f'{p * 4096}' if p else 'page boundary 0', size=8.5, anchor='middle', fill=GRAY)
     page_marks()
     # row 1: HDAT chunk header starts at page boundary
@@ -359,17 +355,6 @@ def fig_alignment():
     s.rect(x0 + 12 * scale * 12, yy, 560, 26, fill=F_HASH, stroke=INK, sw=0.6)
     s.text(x0 + 12*scale*12 + 280, yy + 17, 'rows (the payload starts 12 bytes into the page)', size=9.5, anchor='middle')
     s.text(x0 - 120, yy - 6, 'HDAT: the chunk header sits on a 4096-byte boundary', size=10, italic=True, fill=INK2)
-    # row 2: TVEC: data aligned
-    yy = y + 70
-    hdr_w = 44 * scale * 12
-    s.rect(x0 - 120, yy, 120 - hdr_w, 26, fill=F_PAD, stroke=INK, sw=0.6, dash='2,2')
-    s.text(x0 - 60 - hdr_w/2, yy + 17, 'zero padding', size=9, anchor='middle', fill=INK2, italic=True)
-    s.rect(x0 - hdr_w, yy, hdr_w / 44 * 12, 26, fill=F_TYPE, stroke=INK, sw=0.6)
-    s.rect(x0 - hdr_w + hdr_w / 44 * 12, yy, hdr_w / 44 * 32, 26, fill=F_NUM, stroke=INK, sw=0.6)
-    s.text(x0 - hdr_w + hdr_w/2, yy + 17, '12 + 32 B', size=8.5, anchor='middle')
-    s.rect(x0, yy, 570, 26, fill='#f3e6cf', stroke=INK, sw=0.6)
-    s.text(x0 + 285, yy + 17, 'float32 matrix: n × 264 × 4 B, starts exactly on the page boundary', size=9.5, anchor='middle')
-    s.text(x0 - 120, yy - 6, 'TVEC: the chunk header and its 32-byte payload header end on the boundary, so the data is page-aligned', size=10, italic=True, fill=INK2)
     return s
 
 
@@ -530,20 +515,6 @@ def fig_cells_csr():
     return s
 
 
-def fig_tvec():
-    return bytefield([
-        {'name': 'version', 'size': 2, 'type': 'u16 = 1', 'fill': F_NUM, 'units': 2},
-        {'name': 'variant', 'size': 1, 'type': 'u8 = 0', 'fill': F_NUM, 'units': 2},
-        {'name': 'flags', 'size': 1, 'type': 'u8 = 0', 'fill': F_NUM, 'units': 2},
-        {'name': 'dims', 'size': 4, 'type': 'u32 = 264', 'fill': F_NUM, 'units': 3},
-        {'name': 'n', 'size': 8, 'type': 'u64 = hash count', 'fill': F_NUM, 'units': 4},
-        {'name': 'dtype', 'size': 4, 'type': 'u32 = 1 (f32)', 'fill': F_NUM, 'units': 3},
-        {'name': 'reserved', 'size': 4, 'type': 'u32 = 0', 'fill': F_PAD, 'units': 3},
-        {'name': 'reserved', 'size': 8, 'type': 'u64 = 0', 'fill': F_PAD, 'units': 3},
-        {'name': 'data: n × 264 float32, row-major', 'size': None, 'type': 'row r = φ(HDAT row r); page-aligned', 'fill': '#f3e6cf', 'units': 10, 'trunc': True, 'size_label': '1056 B per row'},
-    ], unit=24)
-
-
 def fig_tivf():
     s = bytefield([
         {'name': 'version', 'size': 2, 'type': 'u16 = 3', 'fill': F_NUM, 'units': 2},
@@ -622,8 +593,8 @@ def fig_three_kinds():
     W = 900
     s = SVG(W, 150)
     kinds = [
-        ('records + hash sets (the builder default)', ['FTOC', 'FHDR', 'RHDR', 'RDAT', 'HH(md5)', 'HINT', 'HDAT', 'RIDX', 'HH(tlsh)', 'HINT', 'HDAT', 'RIDX', 'TVEC', 'TIVF', 'FEND']),
-        ('hash sets only (write_records = false, or a merge of inputs without records)', ['FTOC', 'FHDR', 'HH(md5)', 'HINT', 'HDAT', 'HH(tlsh)', 'HINT', 'HDAT', 'TVEC', 'TIVF', 'FEND']),
+        ('records + hash sets (the builder default)', ['FTOC', 'FHDR', 'RHDR', 'RDAT', 'HH(md5)', 'HINT', 'HDAT', 'RIDX', 'HH(tlsh)', 'HINT', 'HDAT', 'RIDX', 'TIVF', 'FEND']),
+        ('hash sets only (write_records = false, or a merge of inputs without records)', ['FTOC', 'FHDR', 'HH(md5)', 'HINT', 'HDAT', 'HH(tlsh)', 'HINT', 'HDAT', 'TIVF', 'FEND']),
         ('records only (write_hashsets = false)', ['FTOC', 'FHDR', 'RHDR', 'RDAT', 'FEND']),
     ]
     y = 22
@@ -647,7 +618,7 @@ def build():
     body = []
     B = body.append
 
-    B('''<p>An <em class="term">hset</em> is a file of hashes made for one question asked millions of times: <em>is this digest in the set?</em> Its answer to that question is a sorted array of fixed-width rows, memory-mapped and searched in place, with small precomputed <em>hints</em> that let a lookup touch only a handful of cache lines. Around that array the file carries optional <em>records</em> (the other fields hashed alongside each row), and for TLSH similarity digests two more structures: a matrix of <em>embedding vectors</em> and an <em>inverted-file index</em> for exact nearest-neighbour search.</p>
+    B('''<p>An <em class="term">hset</em> is a file of hashes made for one question asked millions of times: <em>is this digest in the set?</em> Its answer to that question is a sorted array of fixed-width rows, memory-mapped and searched in place, with small precomputed <em>hints</em> that let a lookup touch only a handful of cache lines. Around that array the file carries optional <em>records</em> (the other fields hashed alongside each row), and for TLSH similarity digests one more structure: an <em>inverted-file index</em> for exact nearest-neighbour search.</p>
 <p>This page is about the bytes. Three companion pages explain the algorithms the bytes serve.</p>
 <div class="cards">
 <div class="card"><h3><a href="lookup.html">Exact lookup</a></h3><p>Why a sorted array of random hashes is nearly a straight line, how the file records the line's error per block, and how a lookup turns that into a window of a few cache lines.</p></div>
@@ -671,13 +642,13 @@ def build():
     B(f'''<p>Every chunk has the same twelve-byte frame: a four-byte type that reads as ASCII, then a little-endian 64-bit payload length, then the payload. Nothing else in the file is self-describing; the frame is what lets a reader skip what it does not understand, and what lets <code>hschunks.py</code> hash each payload separately.{sn('All integers in the file are little-endian with two deliberate exceptions: chunk types, and the 16-bit hint type at the start of a HINT payload, are big-endian so that they read as text in a hex dump (<code>FTOC</code>, <code>HH\\x00\\x01</code>, <code>b\\x08</code>).')}</p>''')
     B(fig(fig_chunk_frame(), 'The chunk frame. The type is four bytes compared as a big-endian 32-bit integer; <code>HDAT</code> is 0x48444154.', 'col'))
     B('''<p>Before the first chunk come 40 bytes: the magic string <code>SetOHash</code> and a SHA-256. The digest covers every byte from offset 40 to the end of the file, so it authenticates the table of contents, the headers, the rows and the hints together; the merge and build code compute it last, after every other byte is in place. Figure 3 is the real head of <code>test/good.hset</code>, a hash-sets-only file with one SHA-1 section.</p>''')
-    B(fig(fig_preamble(), 'The first 164 bytes of <code>test/good.hset</code>. After the magic and the SHA-256, the FTOC chunk at offset 40 lists six (offset, type) entries; the 36 zero bytes after its payload are room the writer reserved in case of optional TLSH chunks, and the FHDR chunk starts at the offset the FTOC says: 160.', 'wide'))
+    B(fig(fig_preamble(), 'The first 164 bytes of <code>test/good.hset</code>. After the magic and the SHA-256, the FTOC chunk at offset 40 lists six (offset, type) entries; the 36 zero bytes after its payload are room the writer reserved for chunks the file might have had, and the FHDR chunk starts at the offset the FTOC says: 160.', 'wide'))
 
     # 3
     B(h2(3, 'The table of contents'))
     B('''<p>The FTOC payload is a flat array of twelve-byte entries, one per chunk in file order, FTOC itself included and FEND last. Each entry is the chunk's absolute byte offset (u64, little-endian) followed by its type (u32, big-endian, the same bytes as the chunk's own type field). A reader decodes the FTOC, then visits every listed offset in turn and checks that the type it finds there matches; the sequence of types must satisfy the grammar of §5.</p>''')
     B(fig(fig_ftoc_entries(), 'The six FTOC entries of <code>test/good.hset</code>, decoded. The HH entry carries the hash type in its last two bytes.', 'wide'))
-    B('''<p>The FTOC is written first but its contents are only known once the layout is final, so the builder sizes it from the number of fields when the output is opened and reserves room for every chunk a field <em>might</em> produce (a TLSH field may add TVEC and TIVF). The chunk is then written shorter than the reservation, and the gap before FHDR is zero.</p>''')
+    B('''<p>The FTOC is written first but its contents are only known once the layout is final, so the builder sizes it from the number of fields when the output is opened and reserves room for every chunk a field <em>might</em> produce (a TLSH field may add a TIVF). The chunk is then written shorter than the reservation, and the gap before FHDR is zero.</p>''')
 
     # 4
     B(h2(4, 'The file header'))
@@ -688,7 +659,7 @@ def build():
 
     # 5
     B(h2(5, 'The chunk grammar'))
-    B('''<p>The decoder is a small state machine driven by the FTOC. After FHDR comes an optional record table (RHDR then RDAT), then any number of hash sections, then FEND. A hash section is a run of chunks that all belong to the HH header that opens it: a HINT (every hash type except <code>sizes</code>), the HDAT rows, and then only when the file has records a RIDX, and only for TLSH an optional TVEC and an optional TIVF, always in that order. A TVEC or TIVF after a non-TLSH section is a hard error.</p>''')
+    B('''<p>The decoder is a small state machine driven by the FTOC. After FHDR comes an optional record table (RHDR then RDAT), then any number of hash sections, then FEND. A hash section is a run of chunks that all belong to the HH header that opens it: a HINT (every hash type except <code>sizes</code>), the HDAT rows, and then only when the file has records a RIDX, and only for TLSH an optional TIVF, always in that order. A TIVF after a non-TLSH section is a hard error, and so is a TVEC anywhere: that chunk once stored the embedding of every row and is no longer part of the format.</p>''')
     B(fig(fig_grammar(), 'The legal chunk sequences. Reading starts at byte 40 with FTOC; each arrow is "the next chunk may be"; the doubled circle is the end of the file.', 'wide'))
 
     # 6
@@ -728,9 +699,8 @@ def build():
     B('''<p>The first two bytes of a row, L and Q, define its <em>cell</em>: c = L ≪ 8 | Q, one of 65 536. Because rows are sorted and these are the leading bytes, every cell is a contiguous run of HDAT. The hint stores where each run starts.</p>''')
     B(fig(fig_cell_hint(), 'The 0x7400 HINT payload: 65 537 little-endian offsets. The hint data begins 12 bytes into the chunk and the offsets 14 bytes in, so the array is not 8-byte aligned in the file; the reader copies it when it needs alignment.', 'wide'))
     B(fig(fig_cells_csr(), 'Compressed-sparse-row addressing: cell c owns rows [offset[c], offset[c+1]). A lookup computes c from the digest, then binary-searches only that run.', 'wide'))
-    B(h3('TVEC: the vectors'))
-    B('''<p>Optionally, after HDAT and RIDX, a TLSH section carries TVEC: the 264-dimensional float32 embedding of every row, in row order. The payload has a 32-byte header; the chunk is positioned so the matrix itself begins on a page boundary, which lets numpy, faiss or scikit-learn map it straight from the file.</p>''')
-    B(fig(fig_tvec(), 'The TVEC payload. The matrix is 1 056 bytes per row, about thirty times the digest; it is for external tools, the index below never reads it.', 'wide'))
+    B(h3('No stored embedding'))
+    B('''<p>The 264-dimensional float32 embedding of the <a href="tlsh.html">TLSH page</a> is not in the file. An early version stored it for every row in a TVEC chunk after RIDX, page-aligned for numpy and faiss; at 1 056 bytes per row, about thirty times the digest, it was most of a TLSH file, and the index below never read it. TVEC was removed before TLSH support was released: no writer emits it and a reader rejects a file that has one. Whoever needs the matrix computes it from the rows with <code>sfhash_tlsh_embed</code>.</p>''')
     B(h3('TIVF: the inverted-file index'))
     B('''<p>Last in a TLSH section comes TIVF, the index that makes exact nearest-neighbour search fast. Structurally it is a two-level CSR: cells point at ranges of <em>lists</em>, lists point at ranges of row ids. Each list carries a <em>medoid</em> (a 36-byte digest, the list's centre) and <em>radius2</em>, the largest squared body-embedding distance from the medoid to any member. Those two values are the whole of what the search relies on: how the rows were partitioned into lists is the writer's business, and <a href="tlsh.html#the-tivf-index">the TLSH page</a> describes libhasher's two builders.</p>''')
     B(fig(fig_tivf(), 'The TIVF payload (version 3). The five arrays follow the header back to back; <code>list_start</code> is only 4-byte aligned in general.', 'wide'))
@@ -738,9 +708,9 @@ def build():
 
     # 9
     B(h2(9, 'Alignment and integrity'))
-    B('''<p>Two alignment rules shape the file. Every HDAT chunk starts on a 4096-byte boundary, so the rows of each section begin 12 bytes into a page and a section's pages are its own. Every TVEC chunk is placed so that <em>its data</em> starts on a boundary: offset(TVEC) + 12 + 32 is a multiple of 4096. Zero bytes fill the gaps, and the FTOC never lists them.</p>''')
-    B(fig(fig_alignment(), 'The two alignment rules. HDAT aligns its chunk header; TVEC aligns its float data.', 'wide'))
-    B('''<p>Integrity rests on the SHA-256 at offset 8, computed over [40, end). A reader additionally checks: the magic; that every FTOC entry's offset holds a chunk of the listed type; that the chunk sequence obeys the grammar; that each HDAT is exactly count × length bytes, each RIDX count × 8, RDAT record_count × record_length; the hint type, the 0x7400 offsets (first 0, last n, non-decreasing); the TVEC header and its size; and the TIVF header, its total length and its two offset arrays. It does not read the TIVF ids or verify the sort order at load time; both would touch every page of the file.</p>''')
+    B('''<p>One alignment rule shapes the file: every HDAT chunk starts on a 4096-byte boundary, so the rows of each section begin 12 bytes into a page and a section's pages are its own. Zero bytes fill the gaps, and the FTOC never lists them.</p>''')
+    B(fig(fig_alignment(), 'The alignment rule: HDAT aligns its chunk header.', 'wide'))
+    B('''<p>Integrity rests on the SHA-256 at offset 8, computed over [40, end). A reader additionally checks: the magic; that every FTOC entry's offset holds a chunk of the listed type; that the chunk sequence obeys the grammar; that each HDAT is exactly count × length bytes, each RIDX count × 8, RDAT record_count × record_length; the hint type, the 0x7400 offsets (first 0, last n, non-decreasing); and the TIVF header, its total length and its two offset arrays. It does not read the TIVF ids or verify the sort order at load time; both would touch every page of the file.</p>''')
     B(fig(fig_three_kinds(), 'The three shapes of file the builder and the merge produce.', 'wide'))
 
     # 10
@@ -755,7 +725,7 @@ def build():
         ('HINT', '0x48494E54', 'u16 BE hint type, then 0x6208 block bounds or 0x7400 cell offsets', '4 098 or 524 298'),
         ('HDAT', '0x48444154', 'sorted rows', 'count × length'),
         ('RIDX', '0x52494458', 'row → record index', 'count × 8'),
-        ('TVEC', '0x54564543', 'TLSH embedding matrix', '32 + 1 056 n'),
+        ('TVEC', '0x54564543', 'removed: once the TLSH embedding matrix; rejected', '—'),
         ('TIVF', '0x54495646', 'TLSH inverted-file index', '32 + 262 148 + 48 C + 8 + 4 n'),
         ('FEND', '0x46454E44', 'end marker', '0'),
         ('FLTR', '0x464C5452', 'binary fuse filter; defined, never written', '—'),
@@ -768,4 +738,4 @@ def build():
                      '0x7400 cell index' if name == 'tlsh' else ('none' if name == 'sizes' else ('0x6208 block bounds' if ln else '—'))))
     B(table(['nn', 'field name', 'enum value', 'row bytes', 'chunk type', 'HINT'], rows, numeric=(0, 3), mono=(1, 2, 4)))
     B('''<p class="note">The lookup code is instantiated for row lengths 4, 8, 16, 20, 28, 32, 36, 48 and 64; a file with another hash length is rejected.</p>''')
-    return page('index.html', 'The hset file', 'A sorted array, its hints, the records behind it, and the TLSH vectors and index that ride along, byte by byte.', ''.join(body))
+    return page('index.html', 'The hset file', 'A sorted array, its hints, the records behind it, and the TLSH index that rides along, byte by byte.', ''.join(body))
