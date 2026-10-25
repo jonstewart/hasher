@@ -1071,6 +1071,8 @@ struct CppMerge {
     coalesce: u32,
     write_records: bool,
     write_hashsets: bool,
+    /// Whether the TIVF payloads are compared.
+    compare_tivf: bool,
 }
 
 const fn cpp(out: &'static str, left: &'static str, right: &'static str, op: SetOp) -> CppMerge {
@@ -1083,6 +1085,7 @@ const fn cpp(out: &'static str, left: &'static str, right: &'static str, op: Set
         coalesce: DEFAULT_COALESCE,
         write_records: true,
         write_hashsets: true,
+        compare_tivf: true,
     }
 }
 
@@ -1255,12 +1258,14 @@ fn assert_same_payloads(name: &str, ours: &[u8], theirs: &[u8]) {
 /// Re-runs the C++ merges whose inputs and outputs are on disk
 /// (`HSET_FIXTURES_DIR`) and compares the payloads; absent files are
 /// skipped. Rust writes the legacy block hint here, as C++ does.
-#[test]
-fn rust_merges_reproduce_the_cpp_merge_payloads() {
+/// Re-runs `merges` from the files on disk (`HSET_FIXTURES_DIR`) and
+/// compares the payloads; absent files are skipped. Rust writes the
+/// legacy block hint here, as C++ does.
+fn run_cpp_merges(merges: &[CppMerge]) {
     let dir = hset_testkit::fixtures::fixtures_dir();
     let read = |name: &str| std::fs::read(dir.join(name)).ok();
     let mut compared = 0;
-    for m in CPP_MERGES {
+    for m in merges {
         let (Some(theirs), Some(l), Some(r)) = (read(m.out), read(m.left), read(m.right)) else {
             eprintln!(
                 "SKIP: {} or its inputs are absent (run the C++ make check)",
@@ -1276,10 +1281,89 @@ fn rust_merges_reproduce_the_cpp_merge_payloads() {
         o.write_hashsets = m.write_hashsets;
         let ours =
             merge(m.op, &load(&l), &load(&r), &o).unwrap_or_else(|e| panic!("{}: {e}", m.out));
-        let hs = load(&ours);
-        assert!(hs.verify().is_ok(), "{}: {:?}", m.out, hs.verify().problems);
+        let report = load(&ours).verify();
+        assert!(report.is_ok(), "{}: {:?}", m.out, report.problems);
+        let ours = if m.compare_tivf {
+            ours
+        } else {
+            without_tivf(&ours)
+        };
+        let theirs = if m.compare_tivf {
+            theirs
+        } else {
+            without_tivf(&theirs)
+        };
         assert_same_payloads(m.out, &ours, &theirs);
         compared += 1;
     }
-    eprintln!("compared {compared} of {} C++ merges", CPP_MERGES.len());
+    eprintln!("compared {compared} of {} C++ merges", merges.len());
+}
+
+/// `bytes` re-encoded without its TIVF chunks.
+fn without_tivf(bytes: &[u8]) -> Vec<u8> {
+    let f = hset::format::decode(bytes).unwrap();
+    let rhdr = f.rhdr.as_ref();
+    encode(&Document {
+        version: FORMAT_VERSION,
+        name: &f.fhdr.name,
+        desc: &f.fhdr.desc,
+        time: &f.fhdr.time,
+        records: rhdr.map(|h| RecordsIn {
+            fields: &h.fields,
+            record_length: h.record_length as usize,
+            data: f.rdat.unwrap(),
+        }),
+        hashsets: f
+            .sections
+            .iter()
+            .map(|s| HashsetIn {
+                htype: s.header.htype,
+                name: &s.header.name,
+                hash_length: s.hash_length(),
+                data: s.data,
+                hint: s.hint.map(|h| match h {
+                    Hint::Block { table, .. }
+                    | Hint::Hull { table, .. }
+                    | Hint::TlshCells { table } => (h.tag(), table),
+                    Hint::Unknown { tag, data } => (tag, data),
+                }),
+                ridx: s.ridx,
+                tivf: None,
+            })
+            .collect(),
+    })
+    .unwrap()
+}
+
+#[test]
+fn rust_merges_reproduce_the_cpp_merge_payloads() {
+    run_cpp_merges(CPP_MERGES);
+}
+
+/// The large C++ merges on disk: hset_merge_timing's 200k + 200k union
+/// (merge_big_*), and hset_merge_rebuild_honours_index_kmeans's union
+/// whose index C++ last rebuilt with INDEX_KMEANS (merge_method_*), which
+/// Rust does not port: there Rust builds by BISECT and only the other
+/// payloads are compared.
+#[test]
+#[ignore = "large: run with --run-ignored and HSET_FIXTURES_DIR"]
+fn rust_merges_reproduce_the_large_cpp_merge_payloads() {
+    run_cpp_merges(&[
+        cpp(
+            "merge_big_out.hset",
+            "merge_big_a.hset",
+            "merge_big_b.hset",
+            U,
+        ),
+        CppMerge {
+            compare_tivf: false,
+            ..cpp(
+                "merge_method_out.hset",
+                "merge_method_a.hset",
+                "merge_method_b.hset",
+                U,
+            )
+            .tlsh_options(2)
+        },
+    ]);
 }
