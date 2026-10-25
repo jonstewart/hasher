@@ -110,8 +110,19 @@ pub fn embed(d: &TlshDigest) -> [f32; EMBED_DIMS] {
     out
 }
 
-/// Squared Euclidean distance between two embeddings.
+/// Squared Euclidean distance between two embeddings, summed in `f32` in
+/// dimension order; without the length, dim [`EMBED_L_DIM`]'s term is
+/// subtracted from that sum afterwards, as C++ does, so the result is
+/// bit-identical to `sfhash_tlsh_embed_dist2` (C++ `tlsh_embed_dist2` over
+/// float vectors).
 pub fn embed_dist2(a: &[f32; EMBED_DIMS], b: &[f32; EMBED_DIMS], include_length: bool) -> f32 {
-    let _ = (a, b, include_length);
-    0.0
+    let sq = |i: usize| (a[i] - b[i]) * (a[i] - b[i]);
+    let mut s = 0.0f32;
+    for i in 0..EMBED_DIMS {
+        s += sq(i);
+    }
+    if !include_length {
+        s -= sq(EMBED_L_DIM);
+    }
+    s
 }

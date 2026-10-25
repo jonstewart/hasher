@@ -107,3 +107,78 @@ fn full_embedding_dims_and_layout() {
     assert_eq!(v[262], 0.0);
     assert_approx(f64::from(v[263]), cs, 1e-6, "checksum bit 2");
 }
+
+/// `(x, y)` f32 bit patterns of the Q 16-gon vertex for q = 0..16, as
+/// `sfhash_tlsh_embed` of libhasher (x86-64, glibc) writes them into dims
+/// 257, 258 (and 259, 260 for Q2). The near-zero values (q = 4, 8, 12) are
+/// the double rounding errors of cos(pi/2), sin(pi), cos(3 pi/2).
+const CPP_Q_BITS: [(u32, u32); 16] = [
+    (0x402406cf, 0x00000000),
+    (0x40178a72, 0x3f7b14be),
+    (0x3fe7f7f8, 0x3fe7f7f8),
+    (0x3f7b14be, 0x40178a72),
+    (0x2534ee8a, 0x402406cf),
+    (0xbf7b14be, 0x40178a72),
+    (0xbfe7f7f8, 0x3fe7f7f8),
+    (0xc0178a72, 0x3f7b14be),
+    (0xc02406cf, 0x25b4ee8a),
+    (0xc0178a72, 0xbf7b14be),
+    (0xbfe7f7f8, 0xbfe7f7f8),
+    (0xbf7b14be, 0xc0178a72),
+    (0xa607b2e7, 0xc02406cf),
+    (0x3f7b14be, 0xc0178a72),
+    (0x3fe7f7f8, 0xbfe7f7f8),
+    (0x40178a72, 0xbf7b14be),
+];
+
+#[test]
+fn q_and_checksum_coordinates_are_the_cpp_bits() {
+    for (q, &(x, y)) in CPP_Q_BITS.iter().enumerate() {
+        let q = q as u8;
+        let v = embed(&TlshDigest::from_parts(50, q, 15 - q, 7, &[0; 128]));
+        assert_eq!((v[257].to_bits(), v[258].to_bits()), (x, y), "Q1 = {q}");
+        assert_eq!(
+            (v[259].to_bits(), v[260].to_bits()),
+            CPP_Q_BITS[usize::from(15 - q)],
+            "Q2 = {}",
+            15 - q
+        );
+        // checksum 7: all three bits, (float)(1 / sqrt(3.0))
+        for dim in 261..264 {
+            assert_eq!(v[dim].to_bits(), 0x3f13cd3a, "dim {dim}");
+        }
+    }
+}
+
+/// The first six example digests (`example_data.128.1.len.out_EXP`).
+const EXAMPLES: [&str; 6] = [
+    "T11FA1B357F78913B236924271569EA6D1FB2C451C33668484552C812D33138B8C73FFCE",
+    "T145D18407A78523B35A030267671FA2C2F725402973629B25545EB43C3356679477F7FC",
+    "T1C8E1E8277B98A6255FA70063B70FBAE1F6618229332C9438084FB331178ADEE53B41D5",
+    "T1E951784702042376169012B1BA5A76EAF36092FC3311A595B4856235278F9F973763EF",
+    "T106D29517F780237185070293B60E36FAB735C0F833D66460688DA22D6756E751B7BAEB",
+    "T135214031F3C6AEA059EB1ABA870E8C4758D70024C63224B5D4C89354E46315D26BF736",
+];
+
+fn example(i: usize) -> TlshDigest {
+    TlshDigest::from_hex(EXAMPLES[i]).unwrap()
+}
+
+#[test]
+fn embed_dist2_of_example_pairs_is_the_cpp_bits() {
+    // sfhash_tlsh_embed_dist2(phi(e0), phi(ei), incl) from libhasher, as
+    // f32 bit patterns: (i, with length, without length)
+    let cpp = [
+        (1, 0x42cf8d85, 0x42bd8d85),
+        (2, 0x4333f0d8, 0x4323f0d8),
+        (3, 0x432f4d2d, 0x43164d2d),
+        (4, 0x43ed83b2, 0x42e40ec8),
+        (5, 0x4388dbce, 0x4351b79c),
+    ];
+    let e0 = embed(&example(0));
+    for (i, incl, excl) in cpp {
+        let ei = embed(&example(i));
+        assert_eq!(embed_dist2(&e0, &ei, true).to_bits(), incl, "e0, e{i}, with length");
+        assert_eq!(embed_dist2(&e0, &ei, false).to_bits(), excl, "e0, e{i}, without length");
+    }
+}
