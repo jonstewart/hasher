@@ -3,7 +3,10 @@
 //! `f32` embedding whose squared distance lower-bounds the TLSH distance
 //! (`docs/TLSH_EMBEDDING.md` section 1).
 
-use hset::tlsh::embed::{EMBED_BODY_DIMS, embed_body_i8};
+use hset::tlsh::embed::{
+    EMBED_BODY_DIMS, EMBED_DIMS, EMBED_L_DIM, EMBED_MAX_BOUNDED_DIFF, embed, embed_body_i8,
+    embed_dist2,
+};
 use hset::tlsh::{TlshDigest, emb_body_dist2};
 use proptest::prelude::*;
 
@@ -64,4 +67,43 @@ proptest! {
         prop_assert_eq!(norm2, sum);
         prop_assert_eq!(norm2, emb_body_dist2(&d, &origin()));
     }
+}
+
+/// Assert `|got - want| <= eps * |want|` (Catch's `Approx(want).epsilon`).
+fn assert_approx(got: f64, want: f64, eps: f64, what: &str) {
+    assert!(
+        (got - want).abs() <= eps * want.abs(),
+        "{what}: {got} is not within {eps} of {want}"
+    );
+}
+
+#[test]
+fn full_embedding_dims_and_layout() {
+    assert_eq!(EMBED_DIMS, 264);
+    assert_eq!(EMBED_BODY_DIMS, 256);
+    assert_eq!(EMBED_L_DIM, 256);
+    assert_eq!(EMBED_MAX_BOUNDED_DIFF, 144);
+
+    let v = embed(&TlshDigest::from_parts(77, 3, 12, 0b101, &codes_mod4()));
+    // body coordinates are in {-1, 0, 1} and follow the code table
+    for i in 0..128 {
+        assert_eq!(v[2 * i], f32::from(BX[i % 4]), "bucket {i} x");
+        assert_eq!(v[2 * i + 1], f32::from(BY[i % 4]), "bucket {i} y");
+    }
+    assert_eq!(v[256], 77.0);
+    // Q points lie on the circle of radius 1 / (2 sin(pi/16))
+    let r = 1.0 / (2.0 * (std::f64::consts::PI / 16.0).sin());
+    let hypot = |x: f32, y: f32| f64::from(x).hypot(f64::from(y));
+    assert_approx(hypot(v[257], v[258]), r, 1e-5, "Q1 radius");
+    assert_approx(hypot(v[259], v[260]), r, 1e-5, "Q2 radius");
+    // Q1 = 3 -> angle 3 * 2pi / 16, Q2 = 12 -> angle 12 * 2pi / 16
+    let angle = |q: f64| q * 2.0 * std::f64::consts::PI / 16.0;
+    assert_approx(f64::from(v[257]), r * angle(3.0).cos(), 1e-5, "Q1 x");
+    assert_approx(f64::from(v[258]), r * angle(3.0).sin(), 1e-5, "Q1 y");
+    assert_approx(f64::from(v[260]), r * angle(12.0).sin(), 1e-5, "Q2 y");
+    // checksum bits 0, 1, 2 scaled by 1/sqrt(3)
+    let cs = 1.0 / 3f64.sqrt();
+    assert_approx(f64::from(v[261]), cs, 1e-6, "checksum bit 0");
+    assert_eq!(v[262], 0.0);
+    assert_approx(f64::from(v[263]), cs, 1e-6, "checksum bit 2");
 }
