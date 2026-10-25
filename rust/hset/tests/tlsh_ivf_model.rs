@@ -475,6 +475,22 @@ fn cell_lists_must_not_decrease() {
 }
 
 #[test]
+fn cell_lists_beyond_the_list_count_are_an_error_not_a_panic() {
+    // [CELL + 5] = 9 of 2 lists, then back to 2: rising past the lists
+    // before decreasing must not index past the arrays
+    let b = patched(|b| put_u32(b, 32 + 4 * (CELL + 5), 9));
+    let view = TivfView::parse(&b, 6).unwrap();
+    assert_invalid(&view, &two_lists().rows, "cell_lists");
+}
+
+#[test]
+fn list_start_beyond_the_rows_is_an_error_not_a_panic() {
+    // an owned index is not parsed: [0, 100, 6] must not index past ids
+    let (ivf, rows) = broken(|ivf, _| ivf.list_start[1] = 100);
+    assert_invalid(&ivf, &rows, "nondecreasing");
+}
+
+#[test]
 fn a_list_must_not_be_empty() {
     // lists A, an empty one, B
     let (ivf, rows) = broken(|ivf, _| {
@@ -740,6 +756,39 @@ proptest! {
         });
         prop_assert_eq!(check_invariant(&ivf, coalesce), want);
         prop_assert_eq!(check_invariant(&v, coalesce), want);
+    }
+
+    #[test]
+    fn validating_corrupt_input_returns_an_error_and_never_panics(
+        ivf in arb_parseable(),
+        rows in prop::collection::vec(any::<[u8; 36]>(), 24),
+        byte_patches in prop::collection::vec((any::<prop::sample::Index>(), any::<u8>()), 0..4),
+        offset_patches in prop::collection::vec(
+            (any::<prop::sample::Index>(), any::<u64>(), any::<bool>()), 0..3),
+    ) {
+        let rows = &rows[..ivf.n as usize];
+        // borrowed: whatever still parses after patching bytes
+        let mut b = ivf.to_bytes();
+        for (at, v) in &byte_patches {
+            let at = at.index(b.len());
+            b[at] = *v;
+        }
+        if let Ok(v) = TivfView::parse(&b, ivf.n) {
+            let _ = v.validate(rows);
+            let _ = check_invariant(&v, 64);
+        }
+        // owned: offsets parse never saw
+        let mut owned = ivf.clone();
+        for (at, v, in_cells) in &offset_patches {
+            if *in_cells {
+                let at = at.index(owned.cell_lists.len());
+                owned.cell_lists[at] = *v as u32 % 8;
+            } else {
+                let at = at.index(owned.list_start.len());
+                owned.list_start[at] = *v % 32;
+            }
+        }
+        let _ = (&owned).validate(rows);
     }
 
     #[test]

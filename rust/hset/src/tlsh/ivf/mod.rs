@@ -197,12 +197,14 @@ pub trait IvfIndex {
 
     /// The lists of cell `c`.
     fn cell_range(&self, c: usize) -> Range<usize> {
-        self.cell_lists(c) as usize..self.cell_lists(c + 1) as usize
+        let end = (self.cell_lists(c + 1) as usize).min(self.lists());
+        (self.cell_lists(c) as usize).min(end)..end
     }
 
     /// The positions in `ids` of list `l`.
     fn list_range(&self, l: usize) -> Range<usize> {
-        self.list_start(l) as usize..self.list_start(l + 1) as usize
+        let end = self.list_start(l + 1).min(self.n()) as usize;
+        (self.list_start(l) as usize).min(end)..end
     }
 
     /// Members of list `l`.
@@ -229,7 +231,6 @@ pub trait IvfIndex {
 fn check_valid<I: IvfIndex + ?Sized>(ivf: &I, rows: &[[u8; DIGEST_LENGTH]]) -> Result<()> {
     ivf.check_layout()?;
     let n = ivf.n();
-    let lists = ivf.lists();
     if rows.len() as u64 != n {
         return Err(Error::format(format!(
             "TIVF indexes {n} rows, the section has {}",
@@ -244,19 +245,7 @@ fn check_valid<I: IvfIndex + ?Sized>(ivf: &I, rows: &[[u8; DIGEST_LENGTH]]) -> R
             cell_of(&rows[i])
         )));
     }
-    if ivf.cell_lists(0) != 0 || ivf.cell_lists(CELL_COUNT) as usize != lists {
-        return Err(Error::format(format!(
-            "bad TIVF cell_lists: [0] = {}, [{CELL_COUNT}] = {}, expected 0 and {lists}",
-            ivf.cell_lists(0),
-            ivf.cell_lists(CELL_COUNT)
-        )));
-    }
-    if ivf.list_start(0) != 0 || ivf.list_start(lists) != n {
-        return Err(Error::format("TIVF list offsets do not cover the rows"));
-    }
-
-    // n distinct ids below n: every row exactly once
-    let mut seen = vec![0u64; rows.len().div_ceil(64)];
+    check_offsets(ivf)?;
     for c in 0..CELL_COUNT {
         let (first, end) = (ivf.cell_lists(c), ivf.cell_lists(c + 1));
         if first > end {
@@ -264,15 +253,20 @@ fn check_valid<I: IvfIndex + ?Sized>(ivf: &I, rows: &[[u8; DIGEST_LENGTH]]) -> R
                 "TIVF cell_lists decreases from {first} to {end} after cell 0x{c:04x}"
             )));
         }
-        for l in first as usize..end as usize {
-            let (lb, le) = (ivf.list_start(l), ivf.list_start(l + 1));
-            if lb >= le {
+    }
+
+    // From here every cell_range lies in 0..lists and every list_range in
+    // 0..n. n distinct ids below n: every row exactly once.
+    let mut seen = vec![0u64; rows.len().div_ceil(64)];
+    for c in 0..CELL_COUNT {
+        for l in ivf.cell_range(c) {
+            if ivf.list_len(l) == 0 {
                 return Err(Error::format(format!("TIVF list {l} is empty")));
             }
             let medoid = BodyQuery::new(&ivf.medoid(l));
             let radius2 = ivf.radius2(l);
             let mut prev = None;
-            for i in lb as usize..le as usize {
+            for i in ivf.list_range(l) {
                 let id = ivf.id(i);
                 let Some(row) = rows.get(id as usize) else {
                     return Err(Error::format(format!(
@@ -304,6 +298,28 @@ fn check_valid<I: IvfIndex + ?Sized>(ivf: &I, rows: &[[u8; DIGEST_LENGTH]]) -> R
                 }
             }
         }
+    }
+    Ok(())
+}
+
+/// The checks `parse` makes beyond the header, which also bound every
+/// `list_range`: `cell_lists` runs from 0 to the list count and
+/// `list_start` from 0 to n without decreasing (C++ `parse_tivf_data` and
+/// `handle_tivf`).
+fn check_offsets<I: IvfIndex + ?Sized>(ivf: &I) -> Result<()> {
+    let (n, lists) = (ivf.n(), ivf.lists());
+    if ivf.cell_lists(0) != 0 || ivf.cell_lists(CELL_COUNT) as usize != lists {
+        return Err(Error::format(format!(
+            "bad TIVF cell_lists: [0] = {}, [{CELL_COUNT}] = {}, expected 0 and {lists}",
+            ivf.cell_lists(0),
+            ivf.cell_lists(CELL_COUNT)
+        )));
+    }
+    if ivf.list_start(0) != 0 || ivf.list_start(lists) != n {
+        return Err(Error::format("TIVF list offsets do not cover the rows"));
+    }
+    if (0..lists).any(|l| ivf.list_start(l) > ivf.list_start(l + 1)) {
+        return Err(Error::format("TIVF list offsets are not nondecreasing"));
     }
     Ok(())
 }
@@ -509,21 +525,7 @@ impl<'a> TivfView<'a> {
                 "TIVF has {n} rows, expected {expected_n}"
             )));
         }
-        if v.cell_lists(0) != 0 || v.cell_lists(CELL_COUNT) as usize != lists {
-            return Err(Error::format(format!(
-                "bad TIVF cell_lists: [0] = {}, [{CELL_COUNT}] = {}, expected 0 and {lists}",
-                v.cell_lists(0),
-                v.cell_lists(CELL_COUNT)
-            )));
-        }
-        if v.list_start(0) != 0 || v.list_start(lists) != n {
-            return Err(Error::format("TIVF list offsets do not cover the rows"));
-        }
-        if v.list_start.windows(2).any(|w| {
-            u64::from_le_bytes(w[0]) > u64::from_le_bytes(w[1])
-        }) {
-            return Err(Error::format("TIVF list offsets are not nondecreasing"));
-        }
+        check_offsets(&v)?;
         Ok(v)
     }
 }
