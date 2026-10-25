@@ -52,6 +52,7 @@ use std::thread;
 use super::{DEFAULT_SEED, FLAT_MAX, TARGET_LIST_SIZE, TlshIvf};
 use crate::error::{Error, Result};
 use crate::tlsh::CELL_COUNT;
+use crate::tlsh::cells::cell_index;
 use crate::tlsh::digest::{DIGEST_LENGTH, TlshDigest};
 use crate::tlsh::distance::BodyQuery;
 use crate::tlsh::embed::{EMBED_BODY_DIMS, embed_body_i8};
@@ -136,7 +137,8 @@ pub fn build_tlsh_ivf(rows: &[Row], opts: &IvfBuildOptions) -> Result<TlshIvf> {
     if n > u64::from(u32::MAX) {
         return Err(Error::input("too many rows for a TIVF index"));
     }
-    let cells = cell_bounds(rows)?;
+    // the start of each cell's rows; this also checks that rows are sorted
+    let cells: Vec<usize> = cell_index(rows)?.into_iter().map(|c| c as usize).collect();
     let nonempty: Vec<usize> = (0..CELL_COUNT)
         .filter(|&c| cells[c] != cells[c + 1])
         .collect();
@@ -227,22 +229,6 @@ where
         .into_iter()
         .map(|r| r.expect("every cell is built"))
         .collect()
-}
-
-/// The start of each cell's rows in sorted `rows`, `CELL_COUNT + 1`
-/// entries (C++ `make_tlsh_cell_index`, whose sortedness check it keeps).
-fn cell_bounds(rows: &[Row]) -> Result<Vec<usize>> {
-    let mut cells = vec![0usize; CELL_COUNT + 1];
-    for (i, r) in rows.iter().enumerate() {
-        if i > 0 && r < &rows[i - 1] {
-            return Err(Error::input("TLSH rows are not sorted"));
-        }
-        cells[usize::from(TlshDigest(*r).cell()) + 1] += 1;
-    }
-    for c in 1..=CELL_COUNT {
-        cells[c] += cells[c - 1];
-    }
-    Ok(cells)
 }
 
 /// A pivot split leaving fewer than `1 / MIN_SIDE_DIVISOR` of a node's
