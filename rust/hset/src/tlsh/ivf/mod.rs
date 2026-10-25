@@ -6,6 +6,7 @@ pub mod merge;
 pub mod search;
 
 use std::fmt;
+use std::ops::Range;
 
 use super::CELL_COUNT;
 use super::digest::{DIGEST_LENGTH, TlshDigest};
@@ -171,6 +172,26 @@ pub trait IvfIndex {
     /// The arrays have the lengths the layout implies.
     fn check_layout(&self) -> Result<()>;
 
+    /// The lists of cell `c`.
+    fn cell_range(&self, c: usize) -> Range<usize> {
+        self.cell_lists(c) as usize..self.cell_lists(c + 1) as usize
+    }
+
+    /// The positions in `ids` of list `l`.
+    fn list_range(&self, l: usize) -> Range<usize> {
+        self.list_start(l) as usize..self.list_start(l + 1) as usize
+    }
+
+    /// Members of list `l`.
+    fn list_len(&self, l: usize) -> u64 {
+        self.list_start(l + 1).saturating_sub(self.list_start(l))
+    }
+
+    /// The row indexes of list `l`.
+    fn list_ids(&self, l: usize) -> impl Iterator<Item = u32> + '_ {
+        self.list_range(l).map(move |i| self.id(i))
+    }
+
     /// Validate against the rows.
     fn validate(self, rows: &[[u8; DIGEST_LENGTH]]) -> Result<ValidIvf<'_, Self>>
     where
@@ -262,6 +283,20 @@ fn check_valid<I: IvfIndex + ?Sized>(ivf: &I, rows: &[[u8; DIGEST_LENGTH]]) -> R
         }
     }
     Ok(())
+}
+
+/// The coalescing invariant.
+pub fn check_invariant<I: IvfIndex + ?Sized>(ivf: &I, coalesce_threshold: u32) -> bool {
+    let half = u64::from(coalesce_threshold / 2);
+    if half == 0 {
+        return true;
+    }
+    (0..CELL_COUNT).all(|c| {
+        ivf.cell_range(c)
+            .filter(|&l| ivf.list_len(l) < half)
+            .nth(1)
+            .is_none()
+    })
 }
 
 /// The cell of a raw row.

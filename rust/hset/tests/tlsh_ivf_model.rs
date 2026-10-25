@@ -6,7 +6,7 @@
 
 use hset::Error;
 use hset::tlsh::TlshDigest;
-use hset::tlsh::ivf::{IvfIndex, TivfView, TlshIvf, tivf_len};
+use hset::tlsh::ivf::{IvfIndex, TivfView, TlshIvf, check_invariant, tivf_len};
 
 // Layout (HASHSET_FORMAT, tlsh_ivf.cpp length_tivf_data): 32-byte header,
 // u32 cell_lists[65537], 36-byte medoids[C], u32 radius2[C],
@@ -234,6 +234,21 @@ fn a_written_payload_parses_back_to_the_same_index() {
     assert_eq!(v.list_start(1), 3);
     assert_eq!(v.id(1), 4);
     assert_eq!(TlshIvf::from_index(&v), ivf);
+}
+
+#[test]
+fn the_range_helpers_slice_cells_and_lists() {
+    let ivf = two_lists().ivf;
+    let b = ivf.to_bytes();
+    let v = TivfView::parse(&b, 6).unwrap();
+    assert_eq!(v.cell_range(CELL), 0..2);
+    assert_eq!(v.cell_range(CELL - 1), 0..0);
+    assert_eq!(v.cell_range(CELL + 1), 2..2);
+    assert_eq!(v.list_range(0), 0..3);
+    assert_eq!(v.list_range(1), 3..6);
+    assert_eq!(v.list_len(1), 3);
+    assert_eq!(v.list_ids(0).collect::<Vec<_>>(), [0, 4, 5]);
+    assert_eq!(ivf.list_ids(1).collect::<Vec<_>>(), [1, 2, 3]);
 }
 
 #[test]
@@ -500,6 +515,53 @@ fn every_member_lies_within_its_lists_radius() {
     // check_index_valid: tight <= radius2. {0} and {1} are 1 from {}.
     let (ivf, rows) = broken(|ivf, _| ivf.radius2[0] = 0);
     assert_invalid(&ivf, &rows, "row 4 is 1 from the medoid of list 0, beyond radius2 0");
+}
+
+//
+// the coalescing invariant (tlsh_ivf_check_invariant)
+//
+
+#[test]
+fn check_invariant_hand_built() {
+    // tlsh_ivf_check_invariant_hand_built: two lists of 3 rows in one cell
+    let h = hand_cell(&[
+        spec(
+            digest(&[], &[]),
+            1,
+            &[digest(&[], &[]), digest(&[0], &[]), digest(&[1], &[])],
+        ),
+        spec(
+            digest(&[50], &[]),
+            1,
+            &[
+                digest(&[50], &[]),
+                digest(&[50, 51], &[]),
+                digest(&[50, 52], &[]),
+            ],
+        ),
+    ]);
+    assert!(!check_invariant(&h.ivf, 8)); // two lists below 4
+    assert!(check_invariant(&h.ivf, 6)); // none below 3
+    assert!(check_invariant(&h.ivf, 7)); // 7 / 2 == 3
+    assert!(check_invariant(&h.ivf, 0));
+    assert!(check_invariant(&TlshIvf::empty(), 64));
+    // C / 2 == 0 disables it too
+    assert!(check_invariant(&h.ivf, 1));
+}
+
+#[test]
+fn check_invariant_counts_small_lists_per_cell() {
+    // the same two lists, B moved to the next cell: one small list each
+    let mut ivf = two_lists().ivf;
+    ivf.cell_lists[CELL + 1] = 1;
+    assert!(check_invariant(&ivf, 8));
+    // and through a borrowed view
+    let b = ivf.to_bytes();
+    assert!(check_invariant(&TivfView::parse(&b, 6).unwrap(), 8));
+    assert!(!check_invariant(
+        &TivfView::parse(&two_lists().ivf.to_bytes(), 6).unwrap(),
+        8
+    ));
 }
 
 #[test]
