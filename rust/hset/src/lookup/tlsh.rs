@@ -110,7 +110,8 @@ impl Lookup for TlshCellLookup<'_> {
         format!("tlsh cell index ({DIGEST_LENGTH}-byte rows, binary search within the cell)")
     }
 
+    /// The copied offsets.
     fn table_bytes(&self) -> usize {
-        0
+        size_of_val(&*self.cells)
     }
 }

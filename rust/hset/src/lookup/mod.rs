@@ -17,7 +17,8 @@ use crate::error::{Error, Result};
 use crate::format::{
     BLOCK_ENTRY_LEN, HULL_ENTRY_LEN, Hint, MAX_HINT_BITS, hint_tag_block, hint_tag_hull,
 };
-use crate::tlsh::DIGEST_LENGTH;
+use crate::tlsh::cells::CELL_TABLE_LEN;
+use crate::tlsh::{CELL_HINT_TAG, DIGEST_LENGTH};
 use model::{FlatBlocks, Full, HullBlocks};
 use search::{DynBasic, Strategy};
 use tlsh::TlshCellLookup;
@@ -343,8 +344,13 @@ pub fn resolve_bits(spec: HintSpec, n: usize, hash_length: usize, policy: &BitsP
 }
 
 /// Decode a hint table into its model and wrap a borrowed `Hint` for
-/// convenience in tests and tools.
+/// convenience in tests and tools. A `0x7400` table of the cell-index
+/// length is a [`Hint::TlshCells`]; its offsets are checked when a lookup
+/// is made from it.
 pub fn hint_from_parts<'a>(tag: u16, table: &'a [u8]) -> Hint<'a> {
+    if tag == CELL_HINT_TAG && table.len() == CELL_TABLE_LEN {
+        return Hint::TlshCells { table };
+    }
     let bits = (tag & 0xff) as u8;
     match tag >> 8 {
         0x62 if table.len() == BLOCK_ENTRY_LEN << bits => Hint::Block { bits, table },
