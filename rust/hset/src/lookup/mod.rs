@@ -9,6 +9,7 @@ pub mod block;
 pub mod hull;
 pub mod model;
 pub mod search;
+pub mod tlsh;
 
 use std::ops::Range;
 
@@ -16,8 +17,10 @@ use crate::error::{Error, Result};
 use crate::format::{
     BLOCK_ENTRY_LEN, HULL_ENTRY_LEN, Hint, MAX_HINT_BITS, hint_tag_block, hint_tag_hull,
 };
+use crate::tlsh::DIGEST_LENGTH;
 use model::{FlatBlocks, Full, HullBlocks};
 use search::{DynBasic, Strategy};
+use tlsh::TlshCellLookup;
 
 /// Exact membership queries over a sorted hash array.
 pub trait Lookup: Send + Sync {
@@ -228,6 +231,9 @@ pub fn make_lookup_with<'a>(
     cfg: SearchConfig,
 ) -> Result<Box<dyn Lookup + 'a>> {
     check_data(hash_length, data)?;
+    if let Some(Hint::TlshCells { table }) = hint {
+        return tlsh_cell_lookup(hash_length, data, table);
+    }
     let boxed: Box<dyn Lookup + 'a> = dispatch_len!(
         hash_length,
         |L| match hint {
@@ -250,6 +256,22 @@ pub fn make_lookup_with<'a>(
         Box::new(DynBasic::new(data, hash_length))
     );
     Ok(boxed)
+}
+
+/// The cell-index lookup of a TLSH section: the rows must be
+/// [`DIGEST_LENGTH`] bytes and `table` a valid cell index of them, else
+/// [`Error::Format`].
+fn tlsh_cell_lookup<'a>(
+    hash_length: usize,
+    data: &'a [u8],
+    table: &[u8],
+) -> Result<Box<dyn Lookup + 'a>> {
+    if hash_length != DIGEST_LENGTH {
+        return Err(Error::format(format!(
+            "a TLSH cell index hint needs {DIGEST_LENGTH}-byte hashes, not {hash_length}"
+        )));
+    }
+    Ok(Box::new(TlshCellLookup::new(data, table)?))
 }
 
 /// Build the hint table bytes for `spec`, returning `(tag, table)`.
