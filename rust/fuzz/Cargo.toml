@@ -75,3 +75,10 @@ path = "fuzz_targets/bisect.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "tivf"
+path = "fuzz_targets/tivf.rs"
+test = false
+doc = false
+bench = false
