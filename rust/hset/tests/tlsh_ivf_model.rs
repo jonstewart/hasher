@@ -5,7 +5,7 @@
 //! coalescing invariant on a hand-built cell).
 
 use hset::tlsh::TlshDigest;
-use hset::tlsh::ivf::{TlshIvf, tivf_len};
+use hset::tlsh::ivf::{IvfIndex, TivfView, TlshIvf, tivf_len};
 
 // Layout (HASHSET_FORMAT, tlsh_ivf.cpp length_tivf_data): 32-byte header,
 // u32 cell_lists[65537], 36-byte medoids[C], u32 radius2[C],
@@ -195,6 +195,63 @@ fn hand_built_payload_has_each_array_at_its_offset() {
         [0, 4, 5, 1, 2, 3]
     );
     assert_eq!(ids + 24, b.len());
+}
+
+//
+// parsing (parse_tivf_data)
+//
+
+/// Every array of `a` and `b`, entry by entry, through the trait.
+fn assert_same_index(a: &impl IvfIndex, b: &impl IvfIndex) {
+    assert_eq!(a.n(), b.n());
+    assert_eq!(a.lists(), b.lists());
+    for c in 0..=CELLS {
+        assert_eq!(a.cell_lists(c), b.cell_lists(c), "cell_lists[{c}]");
+    }
+    for l in 0..a.lists() {
+        assert_eq!(a.medoid(l), b.medoid(l), "medoids[{l}]");
+        assert_eq!(a.radius2(l), b.radius2(l), "radius2[{l}]");
+    }
+    for l in 0..=a.lists() {
+        assert_eq!(a.list_start(l), b.list_start(l), "list_start[{l}]");
+    }
+    for i in 0..a.n() as usize {
+        assert_eq!(a.id(i), b.id(i), "ids[{i}]");
+    }
+}
+
+#[test]
+fn a_written_payload_parses_back_to_the_same_index() {
+    // tlsh_ivf_serialization_round_trip
+    let ivf = two_lists().ivf;
+    let b = ivf.to_bytes();
+    let v = TivfView::parse(&b, 6).unwrap();
+    assert_same_index(&v, &ivf);
+    assert_eq!(v.lists(), 2);
+    assert_eq!(v.medoid(1), digest(&[50], &[]));
+    assert_eq!(v.radius2(1), 2);
+    assert_eq!(v.list_start(1), 3);
+    assert_eq!(v.id(1), 4);
+    assert_eq!(TlshIvf::from_index(&v), ivf);
+}
+
+#[test]
+fn the_empty_index_round_trips() {
+    let b = TlshIvf::empty().to_bytes();
+    let v = TivfView::parse(&b, 0).unwrap();
+    assert_eq!(v.n(), 0);
+    assert_eq!(v.lists(), 0);
+    assert_eq!(TlshIvf::from_index(&v), TlshIvf::empty());
+}
+
+#[test]
+fn parsing_does_not_rely_on_the_payload_alignment() {
+    // the format only promises 4-byte alignment, and a copy may have none
+    let ivf = two_lists().ivf;
+    let mut buf = vec![0x7F];
+    buf.extend(ivf.to_bytes());
+    let v = TivfView::parse(&buf[1..], 6).unwrap();
+    assert_eq!(TlshIvf::from_index(&v), ivf);
 }
 
 #[test]

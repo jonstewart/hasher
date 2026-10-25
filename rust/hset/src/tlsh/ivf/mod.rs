@@ -5,8 +5,11 @@ pub mod bisect;
 pub mod merge;
 pub mod search;
 
+use std::fmt;
+
 use super::CELL_COUNT;
 use super::digest::{DIGEST_LENGTH, TlshDigest};
+use crate::error::{Error, Result};
 
 /// Length of the fixed TIVF header.
 pub const TIVF_HEADER_LENGTH: usize = 32;
@@ -119,5 +122,141 @@ impl TlshIvf {
             out.extend_from_slice(&id.to_le_bytes());
         }
         out
+    }
+
+    /// An owned copy of any index.
+    pub fn from_index<I: IvfIndex + ?Sized>(index: &I) -> Self {
+        let lists = index.lists();
+        Self {
+            n: index.n(),
+            cell_lists: (0..=CELL_COUNT).map(|c| index.cell_lists(c)).collect(),
+            medoids: (0..lists).map(|l| index.medoid(l)).collect(),
+            radius2: (0..lists).map(|l| index.radius2(l)).collect(),
+            list_start: (0..=lists).map(|l| index.list_start(l)).collect(),
+            ids: (0..index.n() as usize).map(|i| index.id(i)).collect(),
+        }
+    }
+}
+
+/// Read access to a TIVF index, owned ([`TlshIvf`]) or borrowed from a
+/// payload ([`TivfView`]).
+pub trait IvfIndex {
+    /// Rows indexed.
+    fn n(&self) -> u64;
+    /// Number of lists.
+    fn lists(&self) -> usize;
+    /// Entry `c` of `cell_lists`.
+    fn cell_lists(&self, c: usize) -> u32;
+    /// Medoid of list `l`.
+    fn medoid(&self, l: usize) -> TlshDigest;
+    /// Squared radius of list `l`.
+    fn radius2(&self, l: usize) -> u32;
+    /// Entry `l` of `list_start`.
+    fn list_start(&self, l: usize) -> u64;
+    /// Entry `i` of `ids`.
+    fn id(&self, i: usize) -> u32;
+}
+
+impl IvfIndex for TlshIvf {
+    fn n(&self) -> u64 {
+        self.n
+    }
+    fn lists(&self) -> usize {
+        self.radius2.len()
+    }
+    fn cell_lists(&self, c: usize) -> u32 {
+        self.cell_lists[c]
+    }
+    fn medoid(&self, l: usize) -> TlshDigest {
+        self.medoids[l]
+    }
+    fn radius2(&self, l: usize) -> u32 {
+        self.radius2[l]
+    }
+    fn list_start(&self, l: usize) -> u64 {
+        self.list_start[l]
+    }
+    fn id(&self, i: usize) -> u32 {
+        self.ids[i]
+    }
+}
+
+/// A TIVF index borrowed from its payload.
+#[derive(Clone, Copy)]
+pub struct TivfView<'a> {
+    n: u64,
+    cell_lists: &'a [[u8; 4]],
+    medoids: &'a [[u8; DIGEST_LENGTH]],
+    radius2: &'a [[u8; 4]],
+    list_start: &'a [[u8; 8]],
+    ids: &'a [[u8; 4]],
+}
+
+impl<'a> TivfView<'a> {
+    /// Parse a payload.
+    pub fn parse(payload: &'a [u8], expected_n: u64) -> Result<Self> {
+        let _ = expected_n;
+        let Some((header, body)) = payload.split_first_chunk::<TIVF_HEADER_LENGTH>() else {
+            return Err(Error::format(format!(
+                "TIVF payload is {} bytes, shorter than its {TIVF_HEADER_LENGTH}-byte header",
+                payload.len()
+            )));
+        };
+        let lists = u32::from_le_bytes(header[8..12].try_into().expect("4 bytes"));
+        let n = u64::from_le_bytes(header[16..24].try_into().expect("8 bytes"));
+        let want = tivf_len(lists, n);
+        if payload.len() as u64 != want {
+            return Err(Error::format(format!(
+                "TIVF payload is {} bytes, expected {want} for {lists} lists over {n} rows",
+                payload.len()
+            )));
+        }
+        // The length matched, so every count below fits in memory.
+        let lists = lists as usize;
+        let (cell_lists, body) = body.split_at(4 * (CELL_COUNT + 1));
+        let (medoids, body) = body.split_at(DIGEST_LENGTH * lists);
+        let (radius2, body) = body.split_at(4 * lists);
+        let (list_start, ids) = body.split_at(8 * (lists + 1));
+        Ok(Self {
+            n,
+            cell_lists: cell_lists.as_chunks().0,
+            medoids: medoids.as_chunks().0,
+            radius2: radius2.as_chunks().0,
+            list_start: list_start.as_chunks().0,
+            ids: ids.as_chunks().0,
+        })
+    }
+}
+
+impl fmt::Debug for TivfView<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("TivfView")
+            .field("n", &self.n)
+            .field("lists", &self.radius2.len())
+            .finish_non_exhaustive()
+    }
+}
+
+impl IvfIndex for TivfView<'_> {
+    fn n(&self) -> u64 {
+        self.n
+    }
+    fn lists(&self) -> usize {
+        self.radius2.len()
+    }
+    fn cell_lists(&self, c: usize) -> u32 {
+        u32::from_le_bytes(self.cell_lists[c])
+    }
+    fn medoid(&self, l: usize) -> TlshDigest {
+        TlshDigest(self.medoids[l])
+    }
+    fn radius2(&self, l: usize) -> u32 {
+        u32::from_le_bytes(self.radius2[l])
+    }
+    fn list_start(&self, l: usize) -> u64 {
+        u64::from_le_bytes(self.list_start[l])
+    }
+    fn id(&self, i: usize) -> u32 {
+        u32::from_le_bytes(self.ids[i])
     }
 }
