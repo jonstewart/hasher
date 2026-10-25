@@ -127,6 +127,11 @@ impl Builder {
     }
 
     /// Add a record given one optional value per field.
+    ///
+    /// A TLSH value is checked with [`TlshDigest::from_bytes`]: a non-zero
+    /// reserved byte (offset 35) is an [`Error::Input`], and the null
+    /// digest (36 zero bytes) is stored as an absent value, since a null
+    /// digest has no row (C++ copies raw TLSH values unchecked).
     pub fn add_record(&mut self, values: &[Option<&[u8]>]) -> Result<()> {
         if values.len() != self.fields.len() {
             return Err(Error::input(format!(
@@ -154,10 +159,14 @@ impl Builder {
                 None => self.records.resize(self.records.len() + f.stride(), 0),
             }
         }
-        Ok(())
+        self.check_tlsh_values(start)
     }
 
     /// Add a record already laid out as `record_length` bytes.
+    ///
+    /// Present TLSH values are checked as in [`add_record`](Self::add_record):
+    /// a non-zero reserved byte is an [`Error::Input`], and a present null
+    /// digest is stored absent (its presence byte cleared).
     pub fn add_raw_record(&mut self, rec: &[u8]) -> Result<()> {
         if rec.len() != self.record_length {
             return Err(Error::input(format!(
@@ -166,7 +175,33 @@ impl Builder {
                 self.record_length
             )));
         }
+        let start = self.records.len();
         self.records.extend_from_slice(rec);
+        self.check_tlsh_values(start)
+    }
+
+    /// Check the present TLSH values of the record just appended at
+    /// `start`: a null digest becomes absent (its value bytes are already
+    /// zero), and a non-zero reserved byte removes the record again and is
+    /// an [`Error::Input`].
+    fn check_tlsh_values(&mut self, start: usize) -> Result<()> {
+        let mut off = start;
+        for f in &self.fields {
+            if is_tlsh(f) && self.records[off] == 1 {
+                let value: &[u8; TLSH_LENGTH] = self.records[off + 1..off + f.stride()]
+                    .try_into()
+                    .expect("a TLSH field is 36 bytes");
+                match TlshDigest::from_bytes(value) {
+                    Ok(d) if d.is_null() => self.records[off] = 0,
+                    Ok(_) => {}
+                    Err(e) => {
+                        self.records.truncate(start);
+                        return Err(e);
+                    }
+                }
+            }
+            off += f.stride();
+        }
         Ok(())
     }
 

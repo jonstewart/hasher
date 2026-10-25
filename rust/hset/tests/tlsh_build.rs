@@ -7,10 +7,10 @@
 //! hashsets-only files, and the `0x7400` cell hint on every TLSH section.
 
 use hset::builder::{format_value, parse_value, write_value};
-use hset::format::FieldDescriptor;
+use hset::format::{FieldDescriptor, decode};
 use hset::tlsh::TlshDigest;
-use hset::{Error, HashType};
-use hset_testkit::tlsh::VEC_HEX;
+use hset::{BuildOptions, Builder, Error, HashType};
+use hset_testkit::tlsh::{VEC_HEX, fake_md5};
 
 fn tlsh_field() -> FieldDescriptor {
     FieldDescriptor::for_type(HashType::Tlsh).unwrap()
@@ -67,4 +67,79 @@ fn malformed_tlsh_text_is_an_input_error() {
         let e = parse_value(&f, bad).unwrap_err();
         assert!(matches!(e, Error::Input(_)), "{bad:?}: {e}");
     }
+}
+
+fn opts() -> BuildOptions {
+    BuildOptions::new("TLSH test", "TLSH digests paired with fake md5s")
+        .timestamp("2024-01-01T00:00:00Z")
+}
+
+/// `(md5 present, TLSH present)` of every record of `b`'s built file, and
+/// the TLSH section's row count.
+fn presence(b: &Builder) -> (Vec<(u8, u8)>, usize) {
+    let bytes = b.build(&opts()).unwrap();
+    let f = decode(&bytes).unwrap();
+    let recs = (0..f.record_count())
+        .map(|i| {
+            let r = f.record(i).unwrap();
+            (r[0], r[17])
+        })
+        .collect();
+    let t = f.section_for(HashType::Tlsh).unwrap();
+    (recs, f.sections[t].len())
+}
+
+#[test]
+fn tnull_an_empty_column_and_a_null_digest_are_absent_values() {
+    let mut b = Builder::new(&[HashType::Md5, HashType::Tlsh]).unwrap();
+    b.add_text_line(&format!("{} TNULL", fake_md5(0))).unwrap();
+    b.add_text_line(&format!("{} ", fake_md5(1))).unwrap();
+    b.add_text_line(&format!("{} T1{}", fake_md5(2), "0".repeat(70)))
+        .unwrap();
+    b.add_text_line(&format!("{} {}", fake_md5(3), "0".repeat(70)))
+        .unwrap();
+    let md5 = hset::hex::decode(&fake_md5(4)).unwrap();
+    b.add_record(&[Some(&md5), Some(&[0u8; 36])]).unwrap();
+    let (recs, rows) = presence(&b);
+    assert_eq!(recs, vec![(1, 0); 5]);
+    assert_eq!(rows, 0);
+}
+
+#[test]
+fn a_raw_tlsh_value_with_a_nonzero_reserved_byte_is_rejected() {
+    let mut b = Builder::new(&[HashType::Md5, HashType::Tlsh]).unwrap();
+    let md5 = hset::hex::decode(&fake_md5(0)).unwrap();
+    let mut d = *TlshDigest::from_hex(VEC_HEX).unwrap().as_bytes();
+    d[35] = 7;
+    let e = b.add_record(&[Some(&md5), Some(&d)]).unwrap_err();
+    assert!(matches!(e, Error::Input(_)), "{e}");
+    assert!(e.to_string().contains("reserved"), "{e}");
+    assert_eq!(b.record_count(), 0);
+
+    let mut rec = vec![1u8];
+    rec.extend_from_slice(&md5);
+    rec.push(1);
+    rec.extend_from_slice(&d);
+    let e = b.add_raw_record(&rec).unwrap_err();
+    assert!(matches!(e, Error::Input(_)), "{e}");
+    assert_eq!(b.record_count(), 0);
+}
+
+#[test]
+fn a_present_null_digest_in_a_raw_record_is_stored_absent() {
+    let mut b = Builder::new(&[HashType::Md5, HashType::Tlsh]).unwrap();
+    let md5 = hset::hex::decode(&fake_md5(0)).unwrap();
+    let mut rec = vec![1u8];
+    rec.extend_from_slice(&md5);
+    rec.push(1);
+    rec.extend_from_slice(&[0u8; 36]);
+    b.add_raw_record(&rec).unwrap();
+    let mut d = vec![1u8];
+    d.extend_from_slice(&md5);
+    d.push(1);
+    d.extend_from_slice(TlshDigest::from_hex(VEC_HEX).unwrap().as_bytes());
+    b.add_raw_record(&d).unwrap();
+    let (recs, rows) = presence(&b);
+    assert_eq!(recs, vec![(1, 0), (1, 1)]);
+    assert_eq!(rows, 1);
 }
