@@ -351,7 +351,8 @@ python3 -I bench/vs_report/vs_report.py \
 #   --build-costs F    JSON: mkhashset builds with HSET_TLSH_OPTIONS 0 / 1 / 2
 #   --judgements F     JSON {"q1": html, "q2": html}, the author's judgements
 #   --corpus F         JSON: corpus counts for Methods
-#   --knn-k10 DIR      a vs_knn_eval run at k 10, --max-distance 144 (--no-analysis is fine)
+#   --knn-extra DIR    another vs_knn_eval run over the same queries at another k and/or
+#                      --max-distance (brute and index; --no-analysis is fine); repeatable
 #   --hset H           the evaluated hset: the header-split diagnostic (--libdir, default src/lib/.libs)
 ```
 
@@ -370,8 +371,15 @@ package), which splits the TLSH distance of embed's results and of brute's
 results that embed missed into the header terms (L, Q1, Q2:
 `tlsh_diff(q, r[:2] + q[2:])`) and the body + checksum rest
 (`tlsh_diff(q, q[:2] + r[2:])`); the report checks that the two add up to
-every row's distance. `--knn-k10` adds the run at the M5 benchmark's
-settings with its own exactness checks.
+every row's distance. Each `--knn-extra` run adds rows, with k and max
+distance columns, to the latency, speedup and index-work tables (embed only
+for the main run), a chart of index median and p99 latency against the bound
+when several runs share the main run's k, and checks: brute and index agree
+on rows, distances and result counts, the query digests are the main run's,
+each bounded brute result is the main run's brute top k cut to distance <=
+max_distance, and the means match its `summary.txt`. A k = 10, max distance
+144 run also gets the comparison with the M5 figure. (`--knn-k10 DIR` is an
+older name for one `--knn-extra`.)
 
 Any of `--knn`, `--found`, `--notfound` may be left out. The exit status is
 1 when a validation check fails: brute/index mismatches (rows, and distance

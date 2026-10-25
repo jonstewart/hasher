@@ -37,6 +37,7 @@ import svgchart as sc  # noqa: E402
 SQL_DIR = os.path.join(HERE, 'sql')
 BUILD_COMMIT = '5351b8d'   # configure: -O3 and -mpopcnt
 CROWDSTRIKE_RECALL = 0.99
+UNBOUNDED = 4294967295
 M5_US = 13.0       # the user's M5 figure: kNN at 1M synthetic rows, k = 10, T = 144
 M5_ROWS = 4659     # rows scanned per query at 1M, BISECT (docs/BENCHMARKS.md §9)
 TEXT_COLUMNS = {'qset', 'method', 'metric', 'pass', 'comparison', 'check_name', 'which', 'sha256', 'digest'}
@@ -125,6 +126,11 @@ def ns(v):
     return sc.fmt_ns(v) if isnum(v) else '–'
 
 
+def tlabel(t):
+    """A max_distance for display."""
+    return 'none' if t is None or t >= UNBOUNDED else f'{t:,}'
+
+
 def faster(x):
     """Wording for a speed ratio slow / fast."""
     return (f'{x:.3g}× faster than' if x >= 1.05 else
@@ -206,11 +212,16 @@ def build_db(db, args, run):
         if r.returncode != 0:
             sys.exit('vs_report: header_split.py failed')
         db.script(load_sql('header_split.sql', {'@HS_CSV@': sql_str(os.path.abspath(csv_path))}), 'header_split.sql')
-    if args.knn_k10:
-        with open(os.path.join(args.knn_k10, 'run.json')) as f:
-            k10 = json.load(f)
-        db.script(load_sql('knn_k10.sql', {'@K10_DIR@': sql_str(os.path.abspath(args.knn_k10)),
-                                           '@K10_K@': str(k10['params']['k'])}), 'knn_k10.sql')
+    if args.knn:
+        sql = load_sql('knn_configs_init.sql', {'@K@': str(run['params']['k']),
+                                                '@T@': str(run['params']['max_distance']),
+                                                '@KNN_DIR@': sql_str(os.path.abspath(args.knn))})
+        for i, (d, x) in enumerate(args.extra_runs, start=1):
+            sql += load_sql('knn_extra_load.sql', {'@DIR@': sql_str(os.path.abspath(d)), '@CFG@': str(i),
+                                                   '@K@': str(x['params']['k']),
+                                                   '@T@': str(x['params']['max_distance'])})
+        sql += load_sql('knn_configs.sql', {'@N_ROWS@': str(run['hset']['tlsh_rows'])})
+        db.script(sql, 'knn_configs.sql')
     if args.found or args.notfound:
         s = load_sql('lookup.sql', {'@FOUND_CSV@': sql_str(os.path.abspath(args.found or '')),
                                     '@NOTFOUND_CSV@': sql_str(os.path.abspath(args.notfound or '')),
@@ -313,28 +324,39 @@ class Report:
         self.knn_index_work(qsets)
         self.knn_density(qsets)
 
+    def cfg_list(self):
+        """The kNN configurations, main run first: [(cfg, k, max_distance)]."""
+        return [(c['cfg'], c['k'], c['max_distance']) for c in self.db.q('from cfg order by cfg')]
+
     def knn_latency(self, qsets, L, sp):
         db, run = self.db, self.run
         n_rows = self.facts['n_rows']
+        cfgs = self.cfg_list()
+        CS = by(db.q('from cfg_lat_stats'), 'cfg', 'qset', 'method')
         rows = []
         for q in qsets:
-            for m in METHODS:
-                r = L.get((q, m))
-                if not r:
-                    continue
-                rows.append([escape(q), METHOD_LABEL[m], fint(r['n']), us(r['mean_us']), us(r['median_us']),
-                             us(r['stddev_us']), us(r['p90_us']), us(r['p99_us']), us(r['p999_us']),
-                             us(r['min_us']), us(r['max_us']), f'{r["mean_us"] * 1000 / n_rows:.3g}'])
-        t_lat = table(['set', 'method', 'n', 'mean', 'median', 'stddev', 'p90', 'p99', 'p99.9', 'min', 'max',
-                       'ns/row'], rows, num_from=2)
+            for c, k, t in cfgs:
+                for m in METHODS:
+                    r = CS.get((c, q, m))
+                    if not r:
+                        continue
+                    rows.append([escape(q), fint(k), tlabel(t), METHOD_LABEL[m], fint(r['n']), us(r['mean_us']),
+                                 us(r['median_us']), us(r['stddev_us']), us(r['p90_us']), us(r['p99_us']),
+                                 us(r['p999_us']), us(r['min_us']), us(r['max_us']),
+                                 f'{r["mean_us"] * 1000 / n_rows:.3g}', f'{r["mean_results"]:.3g}',
+                                 fpct(r['n_short'] / r['n']), fpct(r['n_empty'] / r['n'])])
+        t_lat = table(['set', 'k', 'max distance', 'method', 'n', 'mean', 'median', 'stddev', 'p90', 'p99',
+                       'p99.9', 'min', 'max', 'ns/row', 'mean results', 'fewer than k', 'none'], rows, num_from=4)
 
         vals = by(db.q("select qset, method, list(us order by us) as v from lat group by all"), 'qset', 'method')
         panels = [{'title': f'{q} queries', 'series': [{'key': m, 'label': m, 'values': vals[(q, m)]['v']}
                                                      for m in METHODS if (q, m) in vals]} for q in qsets]
         leg = sc.legend([(m, METHOD_LABEL[m], 'line') for m in METHODS])
+        main_k, main_t = cfgs[0][1], cfgs[0][2]
+        cfg_note = (f' (the main run: k = {main_k}, max distance {tlabel(main_t)})' if len(cfgs) > 1 else '')
         fig_ecdf = figure(sc.ecdf(panels, sc.fmt_us, 'latency per query (log scale)', label='latency ECDF'),
-                          'Empirical CDF of per-query latency, one line per method; log x axis, shared by both '
-                          'panels. Read across at 0.5 for the median.', leg)
+                          f'Empirical CDF of per-query latency{cfg_note}, one line per method; log x axis, shared '
+                          f'by both panels. Read across at 0.5 for the median.', leg)
         groups = [{'title': f'{q} queries', 'rows': [dict(L[(q, m)], key=m, label=m, p01=L[(q, m)]['p01_us'],
                                                           p25=L[(q, m)]['p25_us'], median=L[(q, m)]['median_us'],
                                                           p75=L[(q, m)]['p75_us'], p99=L[(q, m)]['p99_us'],
@@ -342,57 +364,143 @@ class Report:
                                                           max=L[(q, m)]['max_us'])
                                                      for m in METHODS if (q, m) in L]} for q in qsets]
         fig_box = figure(sc.boxes(groups, sc.fmt_us, 'latency per query (log scale)', label='latency summary'),
-                         'Box: p25–p75; tick: median; dot: mean; whiskers: p1–p99; end ticks: min and max.')
+                         f'Box: p25–p75; tick: median; dot: mean; whiskers: p1–p99; end ticks: min and max'
+                         f'{cfg_note}.')
+        fig_thr = self.threshold_chart(qsets, cfgs, CS)
 
+        CSP = by(db.q('from cfg_speedup'), 'cfg', 'qset')
         srows = []
         for q in qsets:
-            for c in ('index vs brute', 'embed vs brute', 'index vs embed'):
-                s = sp.get((q, c))
-                if s:
-                    srows.append([escape(q), c, fx(s['ratio_of_means']), fx(s['ratio_of_medians']),
-                                  fx(s['paired_geomean']), fx(s['paired_median']), fx(s['paired_p10']),
-                                  fx(s['paired_p90']), fpct(s['frac_fast_wins'])])
-        t_sp = table(['set', 'A vs B', 'ratio of means', 'ratio of medians', 'paired geomean',
-                      'paired median', 'paired p10', 'paired p90', 'A faster'],
-                     srows, num_from=2)
+            for c, k, t in cfgs:
+                comps = (('index vs brute', 'embed vs brute', 'index vs embed') if c == 0 else ('index vs brute',))
+                for comp in comps:
+                    s_ = sp.get((q, comp)) if c == 0 else CSP.get((c, q))
+                    if s_:
+                        srows.append([escape(q), fint(k), tlabel(t), comp, fx(s_['ratio_of_means']),
+                                      fx(s_['ratio_of_medians']), fx(s_['paired_geomean']), fx(s_['paired_median']),
+                                      fx(s_['paired_p10']), fx(s_['paired_p90']), fpct(s_['frac_fast_wins'])])
+        t_sp = table(['set', 'k', 'max distance', 'A vs B', 'ratio of means', 'ratio of medians', 'paired geomean',
+                      'paired median', 'paired p10', 'paired p90', 'A faster'], srows, num_from=4)
         tov = run.get('timer_overhead_ns', {})
+        extra = ''
+        if len(cfgs) > 1:
+            extra = (f'<p>Rows with a max distance come from separate runs over the same queries, brute and index '
+                     f'only (the embedding scan is not run with a bound); there a query returns fewer than k '
+                     f'results when fewer than k rows lie within the bound, which the last three columns count. '
+                     f'Methods lists the runs.</p>')
         self.add('knn-latency', 'kNN latency', f"""
 <p>{fint(L[(qsets[0], 'brute')]['n'])} queries per set and method, each timed alone with
 <code>steady_clock</code> around the kNN call only (for embed: embedding the query, scanning every
 <code>TVEC</code> row and the top-k heap). Timer overhead {fint(tov.get('median'))} ns median, not subtracted.
 p90 / p99 / p99.9 are nearest-rank; the median interpolates; stddev is the sample stddev; ns/row is the mean
-divided by the {fint(n_rows)} rows.</p>
-{t_lat}{fig_ecdf}{fig_box}
+divided by the {fint(n_rows)} rows.</p>{extra}
+{t_lat}{fig_ecdf}{fig_box}{fig_thr}
 <h3>Speedups</h3>
 <p>Ratios are B's time over A's: above 1, method A is faster. "Paired" ratios are per query (the same
 query timed by both methods): their geometric mean, median and 10th / 90th percentiles; "A faster" is the
 share of queries where A took less time.</p>
 {t_sp}""")
 
+    def threshold_chart(self, qsets, cfgs, CS):
+        """Index median / p99 and brute median against max_distance, for the runs at the main run's k."""
+        main_k = cfgs[0][1]
+        same_k = sorted([(t, c) for c, k, t in cfgs if k == main_k], key=lambda x: x[0])
+        if len(same_k) < 2:
+            return ''
+        labels = [tlabel(t) for t, _ in same_k]
+        panels = []
+        for q in qsets:
+            def series(m, field):
+                pts, marks = [], []
+                for i, (t, c) in enumerate(same_k):
+                    r = CS.get((c, q, m))
+                    if r:
+                        pts.append((i, r[field]))
+                        marks.append((i, r[field], f'{q}, {m}, max distance {labels[i]}: '
+                                      f'{field.replace("_us", "")} {us(r[field])}'))
+                return pts, marks
+            ser = []
+            for key, m, field, dash, lab in (('brute', 'brute', 'median_us', False, 'brute median'),
+                                             ('index', 'index', 'median_us', False, 'index median'),
+                                             ('index', 'index', 'p99_us', True, 'index p99')):
+                pts, marks = series(m, field)
+                ser.append({'key': key, 'label': lab, 'points': pts, 'marks': marks, 'dash': dash})
+            panels.append({'title': f'{q} queries', 'series': ser})
+        allv = [y for p in panels for s_ in p['series'] for _, y in s_['points'] if y]
+        svg = sc.lines(panels, lambda v: labels[int(round(v))] if abs(v - round(v)) < 1e-6 and
+                       0 <= round(v) < len(labels) else '', sc.fmt_us, 'max distance (k = %d)' % main_k,
+                       'latency (log)', x_domain=(-0.3, len(labels) - 0.7), xticks=list(range(len(labels))),
+                       log_y=True, y_domain=(min(allv) / 1.5, max(allv) * 1.5), label='latency vs max distance')
+        return figure(svg, f'Index median and p99 latency and brute median latency against the distance bound, '
+                           f'k = {main_k}; "none" is the main, unbounded run. One point per run; log y axis.',
+                      sc.legend([('brute', 'brute median', 'line'), ('index', 'index median', 'line'),
+                                 ('index', 'index p99', 'dash')]))
+
     def knn_index_work(self, qsets):
         db = self.db
-        iw = by(db.q('from index_work'), 'qset')
-        rows = [[escape(q), fint(iw[q]['rows_mean']), fint(iw[q]['rows_median']), fint(iw[q]['rows_p99']),
-                 fint(iw[q]['rows_max']), fpct(iw[q]['frac_rows_mean'], 2), fint(iw[q]['lists_mean']),
-                 fint(iw[q]['cells_mean']), f3(iw[q]['corr_us_rows']), f3(iw[q]['corr_log_us_rows']),
-                 f3(iw[q]['corr_us_lists']), f3(iw[q]['corr_us_cells']), f'{iw[q]["ns_per_row_slope"]:.3g}'
-                 if isnum(iw[q]['ns_per_row_slope']) else '–', f3(iw[q]['r2_rows'])] for q in qsets if q in iw]
-        t = table(['set', 'rows mean', 'rows median', 'rows p99', 'rows max', 'share of set', 'lists mean',
-                   'cells mean', 'r(latency, rows)', 'r(log, log)', 'r(latency, lists)', 'r(latency, cells)',
-                   'ns per row (slope)', 'R² rows'], rows)
+        cfgs = self.cfg_list()
+        IW = by(db.q('from cfg_index_work'), 'cfg', 'qset')
+        rows = []
+        for q in qsets:
+            for c, k, t in cfgs:
+                r = IW.get((c, q))
+                if not r:
+                    continue
+                rows.append([escape(q), fint(k), tlabel(t), fint(r['rows_mean']), fint(r['rows_median']),
+                             fint(r['rows_p99']), fint(r['rows_max']), fpct(r['frac_rows_mean'], 2),
+                             fint(r['lists_mean']), fint(r['cells_mean']), f3(r['corr_us_rows']),
+                             f3(r['corr_log_us_rows']), f3(r['corr_us_lists']), f3(r['corr_us_cells']),
+                             f'{r["ns_per_row_slope"]:.3g}' if isnum(r['ns_per_row_slope']) else '–',
+                             f3(r['r2_rows'])])
+        t = table(['set', 'k', 'max distance', 'rows mean', 'rows median', 'rows p99', 'rows max', 'share of set',
+                   'lists mean', 'cells mean', 'r(latency, rows)', 'r(log, log)', 'r(latency, lists)',
+                   'r(latency, cells)', 'ns per row (slope)', 'R² rows'], rows, num_from=3)
         pts = db.q("select qset, qid, index_us, ivf_rows from lat_wide where index_us is not null")
         panels = [{'title': f'{q} queries', 'series': [{'key': 'index', 'label': 'index', 'points': [
             (p['ivf_rows'], p['index_us'], f'{q} #{p["qid"]}: {fint(p["ivf_rows"])} rows, {us(p["index_us"])}')
             for p in pts if p['qset'] == q]}]} for q in qsets]
+        main_note = f' (main run: k = {cfgs[0][1]}, max distance {tlabel(cfgs[0][2])})' if len(cfgs) > 1 else ''
         fig = figure(sc.scatter(panels, sc.fmt_num, sc.fmt_us, 'rows scanned by the index (log)', 'latency (log)',
                                 label='index latency vs rows scanned'),
-                     'Index latency against the rows it scanned (from a second, untimed run of the same search); '
-                     'one dot per query, log–log.')
-        self.facts['index_work'] = iw
+                     f'Index latency against the rows it scanned{main_note} (from a second, untimed run of the '
+                     f'same search); one dot per query, log–log.')
+        self.facts['index_work'] = IW
         self.add('index-work', 'Index work', f"""
 <p>For the TIVF index the program counts the header cells visited, the list bounds evaluated and the rows
 scanned. A strong correlation between latency and rows scanned means the index's cost is its pruning
-efficiency; the slope is the marginal cost of a scanned row.</p>{t}{fig}""")
+efficiency; the slope is the marginal cost of a scanned row (ns per row).</p>{t}{self.m5_note()}{fig}""")
+
+    def m5_note(self):
+        """The comparison with the M5 figure, when a k = 10, max distance 144 run is present."""
+        db = self.db
+        c = db.q('select cfg from cfg where k = 10 and max_distance = 144 order by cfg limit 1')
+        if not c:
+            return ''
+        c = c[0]['cfg']
+        st = by(db.q(f'from cfg_lat_stats where cfg = {c}'), 'qset', 'method')
+        iw = by(db.q(f'from cfg_index_work where cfg = {c}'), 'qset')
+        mi, mb, ri = st.get(('member', 'index')), st.get(('member', 'brute')), st.get(('random', 'index'))
+        if not (mi and mb and 'member' in iw):
+            return ''
+        rows_med, rows_mean = iw['member']['rows_median'], iw['member']['rows_mean']
+        n_rows = self.facts['n_rows']
+        note = (f'<p><b>Against the M5 figure.</b> The M5 reference is ~{M5_US:g} µs per query on 1M synthetic '
+                f'digests at k = 10, max distance 144; the repo\'s own figures for 1M rows are 8.3 µs (the minimum '
+                f'of repeated passes) with {fint(M5_ROWS)} rows scanned per query for the default BISECT build '
+                f'(4,848 for KMEANS; docs/BENCHMARKS.md §9, docs/TLSH_EMBEDDING.md §5). Here, at those settings on '
+                f'{fint(n_rows)} real digests (the k = 10 rows of the tables), the index\'s median member query '
+                f'takes {us(mi["median_us"])} (mean {us(mi["mean_us"])}) and scans {fint(rows_med)} rows (mean '
+                f'{fint(rows_mean)}): {rows_med / M5_ROWS:.3g}× the M5\'s rows for {n_rows / 1e6:.3g}× the data, '
+                f'about {mi["median_us"] * 1000 / rows_med:.3g} ns per scanned row against '
+                f'{8.3 * 1000 / M5_ROWS:.2g}–{M5_US * 1000 / M5_ROWS:.2g} ns on the M5. Brute force takes '
+                f'{us(mb["median_us"])}, so the index is {faster(mb["median_us"] / mi["median_us"])} brute by the '
+                f'medians.')
+        if ri and 'random' in iw:
+            note += (f' Random queries are fast (median {us(ri["median_us"])}) because '
+                     f'{fpct(ri["n_empty"] / ri["n"])} of them have no row within 144 at all and '
+                     f'{fpct(ri["n_short"] / ri["n"])} have fewer than 10; the index prunes them almost at once '
+                     f'(median {fint(iw["random"]["rows_median"])} rows scanned).')
+        return note + '</p>'
 
     def knn_density(self, qsets):
         db = self.db
@@ -513,7 +621,7 @@ distance bounds, so it should get faster as d_k shrinks.</p>{t1}{t2}{fig1}{fig2}
                            f'the recall of "fetch k\' candidates by embedding distance, re-rank them by TLSH, keep '
                            f'{k}". The wash spans the tie-aware p10 to median; dots at k\' = {k}, {2 * k}, {5 * k}, '
                            f'{deep_k}.', sc.legend([('embed', 'tie-aware (mean)', 'line'),
-                                                    ('muted', 'naive (mean)', 'line')]))
+                                                    ('muted', 'naive (mean)', 'dash')]))
         sel = [r for r in dc if r['kp'] in (k // 10 or 1, k // 2, k, int(1.5 * k), 2 * k, 3 * k, 5 * k, deep_k)]
         t_curve = table(['set', 'k\'', 'naive', 'tie-aware', 'tie-aware p10', 'tie-aware median',
                          'queries at ≥ 0.99', 'queries complete'],
@@ -548,7 +656,7 @@ distance bounds, so it should get faster as d_k shrinks.</p>{t1}{t2}{fig1}{fig2}
                         'embed\'s k results re-sorted by TLSH distance (never negative; wash p10–p90). Dashed: in '
                         'embed\'s own order (can be negative when embed puts a nearer row later). Each panel has its own y scale.',
                         sc.legend([('embed', 'sorted by TLSH distance (mean, p10–p90 wash)', 'line'),
-                                   ('muted', 'embed order (mean)', 'line')]))
+                                   ('muted', 'embed order (mean)', 'dash')]))
         ki = db.q("select qset, kth_inflation as v from ir_q")
         panels = []
         widths = []
@@ -610,7 +718,7 @@ distance bounds, so it should get faster as d_k shrinks.</p>{t1}{t2}{fig1}{fig2}
                         f'dot marks rank {k}; each curve ends at the last relevant row inside depth {deep_k}, and one '
                         f'that ends short of recall 1 has relevant rows beyond that depth (see the AUC bounds). '
                         f'{escape("; ".join(notes))}.',
-                        sc.legend([('embed', 'median-AP query', 'line'), ('muted', '10th-percentile-AP query', 'line')]))
+                        sc.legend([('embed', 'median-AP query', 'line'), ('muted', '10th-percentile-AP query', 'dash')]))
 
         defs = self.definitions(k, deep_k, n_rows)
         self.add('ir', f'Embedding kNN as retrieval: embed against the TLSH ground truth', f"""
@@ -671,78 +779,48 @@ header = tlsh_diff(q, r<sub>header</sub> + q<sub>body</sub>), rest = tlsh_diff(q
 r<sub>body</sub>); the two add up to the row's TLSH distance (checked in Validation). "Header share" is the
 total header cost over the total distance of the rows.</p>{t}{prose}"""
 
-    def knn_k10(self):
-        """The run at the M5 benchmark's settings (--knn-k10)."""
+    def knn_extra_checks(self):
+        """Validation of the --knn-extra runs: exactness, same queries, bounded = cut unbounded, summary.txt."""
         db = self.db
-        with open(os.path.join(self.args.knn_k10, 'run.json')) as f:
-            run = json.load(f)
-        self.k10_run = run
-        p = run['params']
-        k = p['k']
-        T = p['max_distance']
-        st = by(db.q('from k10_stats'), 'qset', 'method')
-        ex = by(db.q('from k10_exactness'), 'qset')
-        qsets = qset_order({r['qset'] for r in st.values()})
-        for q in qsets:
-            e = ex[q]
-            self.validation.append((f'k = {k}, T = {T} run, {q}: brute vs index identical (rows, distances, counts)',
+        cfgs = {c: (k, t) for c, k, t in self.cfg_list()}
+        EX = db.q('from cfg_exactness where cfg <> 0 order by cfg, qset')
+        SQ = by(db.q('from cfg_same_queries'), 'cfg', 'qset')
+        BC = by(db.q('from cfg_bound_check'), 'cfg', 'qset')
+        CS = by(db.q('from cfg_lat_stats'), 'cfg', 'qset', 'method')
+        for e in EX:
+            c, q = e['cfg'], e['qset']
+            k, t = cfgs[c]
+            name = f'k = {k}, max distance {tlabel(t)}, {q}'
+            self.validation.append((f'{name}: brute vs index identical (rows, distances, counts)',
                                     f'rows differ on {fint(e["row_mismatches"])}, distances on '
                                     f'{fint(e["dist_mismatches"])}, result counts on {fint(e["count_mismatches"])} '
                                     f'of {fint(e["n_queries"])} queries',
                                     e['row_mismatches'] == 0 and e['dist_mismatches'] == 0
                                     and e['count_mismatches'] == 0))
-        summ = parse_summary(os.path.join(self.args.knn_k10, 'summary.txt'))
-        if summ['mean_us']:
-            worst = max(abs(st[key]['mean_us'] - v) for key, v in summ['mean_us'].items() if key in st)
-            self.validation.append((f'k = {k}, T = {T} run: latency means agree with its summary.txt',
-                                    f'largest difference {worst:.2f} µs', worst <= 0.1))
-        if summ['mismatch']:
-            self.validation.append((f'k = {k}, T = {T} run: no mismatches in its summary.txt',
-                                    ', '.join(f'{q} {n}' for q, n in summ['mismatch'].items()),
-                                    all(n == 0 for n in summ['mismatch'].values())))
-        rows = []
-        for q in qsets:
-            for m in ('brute', 'index'):
-                r = st.get((q, m))
-                if not r:
-                    continue
-                rows.append([escape(q), METHOD_LABEL[m], fint(r['n']), us(r['mean_us']), us(r['median_us']),
-                             us(r['p90_us']), us(r['p99_us']), us(r['max_us']),
-                             fint(r['rows_mean']) if m == 'index' else '–',
-                             fint(r['rows_median']) if m == 'index' else '–',
-                             f'{r["mean_results"]:.2f}', f'{fint(r["n_short"])} ({fpct(r["n_short"] / r["n"])})',
-                             f'{fint(r["n_empty"])} ({fpct(r["n_empty"] / r["n"])})'])
-        t = table(['set', 'method', 'n', 'mean', 'median', 'p90', 'p99', 'max', 'rows scanned mean',
-                   'rows scanned median', 'mean results', f'fewer than {k}', 'none'], rows, num_from=2)
-        mi, mb = st.get(('member', 'index')), st.get(('member', 'brute'))
-        ri = st.get(('random', 'index'))
-        note = ''
-        if mi and mb:
-            rows_ratio = mi['rows_median'] / M5_ROWS
-            ns_row = mi['median_us'] * 1000 / mi['rows_median'] if mi['rows_median'] else None
-            note = (f'<p>The M5 reference figure is ~{M5_US:g} µs per query on 1M synthetic digests at these '
-                    f'settings (k = 10, T = 144); the repo\'s own figures for 1M rows are 8.3 µs (the minimum of '
-                    f'repeated passes) with {fint(M5_ROWS)} rows scanned per query for the default BISECT build '
-                    f'(4,848 for KMEANS; docs/BENCHMARKS.md §9, docs/TLSH_EMBEDDING.md §5). Here, on '
-                    f'{fint(run["hset"]["tlsh_rows"])} real digests, the index\'s median member query takes '
-                    f'{us(mi["median_us"])} (mean {us(mi["mean_us"])}) and scans {fint(mi["rows_median"])} rows '
-                    f'(mean {fint(mi["rows_mean"])}): {rows_ratio:.3g}× the M5\'s rows for '
-                    f'{run["hset"]["tlsh_rows"] / 1e6:.3g}× the data, about {ns_row:.3g} ns per scanned row '
-                    f'against {8.3 * 1000 / M5_ROWS:.2g}–{M5_US * 1000 / M5_ROWS:.2g} ns on the M5. Brute force '
-                    f'takes {us(mb["median_us"])}, so the index is {faster(mb["median_us"] / mi["median_us"])} '
-                    f'brute by the medians.')
-            if ri:
-                note += (f' Random queries are fast (median {us(ri["median_us"])}) because '
-                         f'{fpct(ri["n_empty"] / ri["n"])} of them have no row within {T} at all and '
-                         f'{fpct(ri["n_short"] / ri["n"])} have fewer than {k}; the index prunes them almost at '
-                         f'once (median {fint(ri["rows_median"])} rows scanned).')
-            note += '</p>'
-            self.facts['k10'] = {'member_index_median_us': mi['median_us'], 'rows_median': mi['rows_median']}
-        self.add('k10', f'At the M5 benchmark\'s settings: k = {k}, max distance {T}', f"""
-<p>A second run of the same eval on the same hset with k = {k} and max_distance = {T}, brute and index only,
-without the analysis pass (so no recall metrics; brute and index are exact and identical, see Validation).
-With a distance bound a query returns fewer than k results when fewer than k rows lie within {T}.</p>
-{t}{note}""")
+            sq = SQ.get((c, q))
+            if sq:
+                self.validation.append((f'{name}: same query digests as the main run',
+                                        f'{fint(sq["digest_mismatches"])} of {fint(sq["n"])} differ',
+                                        sq['digest_mismatches'] == 0 and sq['n'] == e['n_queries']))
+            b = BC.get((c, q))
+            if b:
+                self.validation.append((f'{name}: brute = the main run\'s brute top {k} cut to distance ≤ '
+                                        f'{tlabel(t)}',
+                                        f'{fint(b["mismatched_queries"])} of {fint(b["n_queries"])} queries differ; '
+                                        f'{fint(b["rows_got"])} rows against {fint(b["rows_expected"])} expected',
+                                        b['mismatched_queries'] == 0 and b['rows_got'] == b['rows_expected']))
+        for i, (d, x) in enumerate(self.args.extra_runs, start=1):
+            k, t = cfgs[i]
+            summ = parse_summary(os.path.join(d, 'summary.txt'))
+            if summ['mean_us']:
+                worst = max(abs(CS[(i, key[0], key[1])]['mean_us'] - v) for key, v in summ['mean_us'].items()
+                            if (i, key[0], key[1]) in CS)
+                self.validation.append((f'k = {k}, max distance {tlabel(t)}: latency means agree with its '
+                                        f'summary.txt', f'largest difference {worst:.2f} µs', worst <= 0.1))
+            if summ['mismatch']:
+                self.validation.append((f'k = {k}, max distance {tlabel(t)}: no mismatches in its summary.txt',
+                                        ', '.join(f'{q} {n}' for q, n in summ['mismatch'].items()),
+                                        all(n == 0 for n in summ['mismatch'].values())))
 
     def definitions(self, k, deep_k, n_rows):
         return f"""
@@ -902,6 +980,29 @@ for a few seconds, counting the gaps where the CPU was taken away.</p>{t2}""")
 
     # ------------------------------------------------------------ answers
 
+    def threshold_sentence(self, q):
+        """One generated sentence on the bounded runs at the main run's k, for set q."""
+        cfgs = self.cfg_list()
+        main_k = cfgs[0][1]
+        bounded = sorted([(t, c) for c, k, t in cfgs[1:] if k == main_k and t < UNBOUNDED])
+        if not bounded:
+            return ''
+        CS = by(self.db.q(f"from cfg_lat_stats where qset = '{q}'"), 'cfg', 'method')
+        parts, bru, short = [], [], []
+        for t, c in bounded:
+            i, b = CS.get((c, 'index')), CS.get((c, 'brute'))
+            if not (i and b):
+                continue
+            parts.append(f'{us(i["median_us"])} at max distance {tlabel(t)}')
+            bru.append(b['median_us'])
+            short.append(fpct(i['n_short'] / i['n'], 0))
+        if not parts:
+            return ''
+        none_all = all(CS[(c, 'index')]['n_empty'] == CS[(c, 'index')]['n'] for _, c in bounded if (c, 'index') in CS)
+        return (f' With a distance bound (k = {main_k}) the index\'s median falls to {", ".join(parts)}, against '
+                f'brute medians of {us(min(bru))}–{us(max(bru))}; {" / ".join(short)} of the queries return fewer '
+                f'than k results' + (' (none of them returns any)' if none_all else '') + '.')
+
     def build_cost_rows(self):
         """--build-costs: the variants, and TVEC / TIVF as differences from the TLSH-only build."""
         b = self.build_costs
@@ -1007,7 +1108,7 @@ query on average (median {us(L[(q, 'brute')]['median_us'])}); the index takes {u
 brute by the means, {faster(ib['paired_geomean'])} by the per-query geometric mean, and faster on
 {fpct(ib['frac_fast_wins'])} of queries. The pure embedding scan takes {us(L[(q, 'embed')]['mean_us'])}:
 {faster(eb['ratio_of_means'])} brute ({L[(q, 'embed')]['mean_us'] * 1000 / n_rows:.3g} against
-{L[(q, 'brute')]['mean_us'] * 1000 / n_rows:.3g} ns per row).</p>""")
+{L[(q, 'brute')]['mean_us'] * 1000 / n_rows:.3g} ns per row).{self.threshold_sentence(q)}</p>""")
                 tiles.append((f'index speedup over brute, {q}', fx(ib['paired_geomean']),
                               f'per-query geomean; means {fx(ib["ratio_of_means"])}'))
             for q in self.qsets[:1]:
@@ -1120,6 +1221,17 @@ on this hardware.</p>
                                'interrupts and VM exits; measured per pass in the lookup section). Percentiles up to '
                                'p99 measure the code; p99.9 and max measure the platform.'],
             ['Dates', f'kNN {escape(str(run.get("date", "–")))}; lookup {escape(str(mf.get("date", "–")))}'],
+        ] + [
+            [f'kNN run, k = {x["params"]["k"]}, max distance {tlabel(x["params"]["max_distance"])}',
+             f'{escape(str(x.get("date", "–")))}, commit <code>{escape(str(x.get("git_commit", "–"))[:12])}</code>; '
+             f'methods {escape(", ".join(x["params"].get("methods", [])))}; same seeds as the main run: '
+             f'{x.get("seeds", {}).get("member") == run.get("seeds", {}).get("member") and x.get("seeds", {}).get("random") == run.get("seeds", {}).get("random")}; '
+             f'{len(x.get("warmup", {}).get("file_reads", []))} file read(s), '
+             f'{x.get("warmup", {}).get("queries_per_set_method", "–")} warm-up queries per set × method; timing '
+             f'thread on CPU {x.get("machine", {}).get("pin_cpu", "–")}; residency '
+             f'{fpct(x.get("machine", {}).get("hset_resident_after_timing"))} after timing; analysis pass '
+             f'{"skipped" if not x.get("analysis_seconds") else "run"}']
+            for d, x in self.args.extra_runs
         ]
         return flag_note + table(['', ''], rows, num_from=99, cls='kv wrap') + self.corpus_html()
 
@@ -1178,7 +1290,7 @@ the hset in the page cache; other work on the VM (the scan, other agents) adds n
 The embedding scan reads 1,056 bytes per row and is memory-bound; brute TLSH reads 36.</li>
 <li><b>k = 100, unbounded distance.</b> The index's pruning depends on the distance bound; a smaller k or a
 max_distance (e.g. 144) would prune far more, so these index timings are not comparable with the M5 figure
-(k = 10, T = 144){'; the k = 10, T = 144 section is' if self.args.knn_k10 else ''}.</li></ul>"""
+(k = 10, T = 144){'; the runs with a distance bound in the tables show how much a bound prunes' if self.args.extra_runs else ''}.</li></ul>"""
 
     def median_dk(self, q):
         r = self.db.q(f"select median(d_k) as m from knn_queries where qset = '{q}'") if hasattr(self, 'L') else []
@@ -1189,10 +1301,11 @@ max_distance (e.g. 144) would prune far more, so these index timings are not com
         cmds = []
         if run.get('argv'):
             cmds.append('# kNN eval (as recorded in run.json)\n' + ' '.join(run['argv']).replace(' --', ' \\\n    --'))
-        k10 = getattr(self, 'k10_run', None)
-        if k10 and k10.get('argv'):
-            cmds.append('# kNN eval at the M5 settings (as recorded in its run.json)\n'
-                        + ' '.join(k10['argv']).replace(' --', ' \\\n    --'))
+        for d, x in self.args.extra_runs:
+            if x.get('argv'):
+                cmds.append(f'# kNN eval, k = {x["params"]["k"]}, max distance {tlabel(x["params"]["max_distance"])} '
+                            f'(run.json, {x.get("date", "?")})\n'
+                            + ' '.join(x['argv']).replace(' --', ' \\\n    --'))
         if self.args.hset and self.args.knn:
             cmds.append(f'# header split (run by vs_report with --hset)\nLD_LIBRARY_PATH={self.args.libdir} '
                         f'python3 -I bench/vs_report/header_split.py --hset {self.args.hset} \\\n'
@@ -1291,7 +1404,11 @@ def main():
     ap.add_argument('--build-costs', help='JSON: mkhashset builds with and without TVEC / TIVF (see README)')
     ap.add_argument('--judgements', help='JSON {"q1": html, "q2": html}: the author\'s judgements')
     ap.add_argument('--corpus', help='JSON: corpus counts for the Methods section')
-    ap.add_argument('--knn-k10', help='a second vs_knn_eval directory at the M5 settings (k 10, max distance 144)')
+    ap.add_argument('--knn-extra', action='append', default=[], metavar='DIR',
+                    help='another vs_knn_eval run over the same queries (other k / --max-distance, brute and '
+                         'index, --no-analysis is fine); repeatable; its rows join the latency, speedup and '
+                         'index-work tables')
+    ap.add_argument('--knn-k10', help='same as --knn-extra (kept for older command lines)')
     ap.add_argument('--hset', help='the evaluated hset, for the header-split diagnostic (needs libhasher)')
     ap.add_argument('--libdir', help='directory of libhasher.so for --hset (default REPO/src/lib/.libs)')
     ap.add_argument('--threads', type=int, default=4, help='DuckDB threads (default %(default)s)')
@@ -1310,6 +1427,18 @@ def main():
     if args.knn:
         with open(os.path.join(args.knn, 'run.json')) as f:
             run = json.load(f)
+    extra = args.knn_extra + ([args.knn_k10] if args.knn_k10 else [])
+    if extra and not args.knn:
+        ap.error('--knn-extra needs --knn')
+    runs = []
+    for d in extra:
+        with open(os.path.join(d, 'run.json')) as f:
+            runs.append((d, json.load(f)))
+    # the main run's k first, by distance bound; then other k
+    if run:
+        runs.sort(key=lambda r: (r[1]['params']['k'] != run['params']['k'], -r[1]['params']['k'],
+                                 r[1]['params']['max_distance']))
+    args.extra_runs = runs
 
     def meta(csv):
         if not csv:
@@ -1329,8 +1458,8 @@ def main():
     rep = Report(db, args, run, mf, mn)
     if args.knn:
         rep.knn()
-    if args.knn_k10:
-        rep.knn_k10()
+    if args.extra_runs:
+        rep.knn_extra_checks()
     if args.found or args.notfound:
         rep.lookup()
     out = os.path.join(args.out, 'index.html')

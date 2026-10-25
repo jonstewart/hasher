@@ -159,6 +159,8 @@ def legend(items):
         parts.append(f'<span class="key"><svg width="18" height="10" aria-hidden="true">'
                      + (f'<line x1="1" x2="17" y1="5" y2="5" class="s-{key}" stroke-width="2.5"/>'
                         if kind == 'line' else
+                        f'<line x1="1" x2="17" y1="5" y2="5" class="s-{key}" stroke-width="2.5" stroke-dasharray="4 3"/>'
+                        if kind == 'dash' else
                         f'<circle cx="9" cy="5" r="4" class="f-{key}"/>' if kind == 'dot' else
                         f'<rect x="3" y="0" width="12" height="10" rx="2" class="f-{key}"/>')
                      + f'</svg>{escape(label)}</span>')
@@ -268,11 +270,12 @@ def _y_domain(panels):
 
 
 def lines(panels, xfmt, yfmt, xlabel, ylabel, height=300, log_x=False, y_domain=None,
-          x_domain=None, refs=(), label='line chart', share_y=True):
+          x_domain=None, refs=(), label='line chart', share_y=True, xticks=None, log_y=False):
     """panels: [{'title', 'series': [{'key', 'label', 'points': [(x, y)], 'dash': bool,
     'marks': [(x, y, tip)]}], 'bands': [{'key', 'points': [(x, ylo, yhi)]}]}]; refs:
     [(y, text)] horizontal reference lines. share_y=False gives each panel its own y
-    scale (say so in the caption)."""
+    scale (say so in the caption). xticks: explicit tick positions; log_y: log y axis
+    (give y_domain)."""
     xsv = [x for p in panels for s in p['series'] for x, _ in s['points']]
     if x_domain is None:
         x_domain = (min(xsv), max(xsv))
@@ -282,8 +285,8 @@ def lines(panels, xfmt, yfmt, xlabel, ylabel, height=300, log_x=False, y_domain=
         y0, y1 = height - M_BOTTOM, M_TOP
         xs = (Log if log_x else Linear)(x_domain[0], x_domain[1], x0, x1)
         yd = y_domain or _y_domain(panels if share_y else [p])
-        ys = Linear(yd[0], yd[1], y0, y1)
-        body += _axes(xs, ys, x0, x1, y0, y1, xfmt, yfmt, xlabel, ylabel, p['title'])
+        ys = (Log if log_y else Linear)(yd[0], yd[1], y0, y1)
+        body += _axes(xs, ys, x0, x1, y0, y1, xfmt, yfmt, xlabel, ylabel, p['title'], xticks=xticks)
         for bd in p.get('bands', []):
             up = [(xs(x), ys(b)) for x, a, b in bd['points']]
             dn = [(xs(x), ys(a)) for x, a, b in reversed(bd['points'])]
