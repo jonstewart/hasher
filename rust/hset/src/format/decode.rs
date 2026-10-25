@@ -39,6 +39,14 @@ fn parse_rhdr(ch: &Chunk<'_>) -> Result<RecordHeader> {
                 "record field '{name}' has absurd length {length}"
             )));
         }
+        // a type named twice is ambiguous: lookups and merges find a field
+        // by its type (mkhashset refuses to write one)
+        if fields.iter().any(|f: &FieldDescriptor| f.htype == htype) {
+            return Err(Error::format(format!(
+                "RHDR lists the {} field twice",
+                htype.name()
+            )));
+        }
         total = total
             .checked_add(1 + length)
             .ok_or_else(|| Error::format("record length overflows"))?;
@@ -480,6 +488,38 @@ mod tests {
         v1[8] = 1;
         let err = decode(&v1).unwrap_err().to_string();
         assert!(err.contains("version 1"), "{err}");
+    }
+
+    /// An RHDR chunk of `count` records with `fields` (type, name, length).
+    fn rhdr_chunk(count: u64, fields: &[(HashType, &str, u64)]) -> (u32, Vec<u8>) {
+        let mut o = chunk::Out::default();
+        o.le_u64(fields.iter().map(|f| 1 + f.2).sum());
+        o.le_u64(count);
+        for &(t, name, len) in fields {
+            o.le_u16(t.log2());
+            o.pstring(name);
+            o.le_u64(len);
+        }
+        (chunk::RHDR, o.buf)
+    }
+
+    #[test]
+    fn an_rhdr_listing_a_hash_type_twice_is_rejected() {
+        let md5 = HashType::Md5;
+        // the shape that made the record merge read past a record
+        let mixed = rhdr_chunk(1, &[(md5, "MD5", 4), (md5, "MD5", 16)]);
+        let e = decode_err(&[mixed, (chunk::RDAT, vec![0; 22])]);
+        assert!(e.contains("lists the MD5 field twice"), "{e}");
+        // same length, apart, with no records
+        let sha1 = HashType::Sha1;
+        let apart = rhdr_chunk(0, &[(md5, "a", 16), (sha1, "b", 20), (md5, "c", 16)]);
+        let e = decode_err(&[apart, (chunk::RDAT, vec![])]);
+        assert!(e.contains("lists the MD5 field twice"), "{e}");
+        // distinct types still decode
+        let ok = rhdr_chunk(0, &[(md5, "MD5", 16), (sha1, "SHA-1", 20)]);
+        let buf = assemble(&[ok, (chunk::RDAT, vec![])]);
+        let f = decode(&buf).unwrap();
+        assert_eq!(f.rhdr.unwrap().fields.len(), 2);
     }
 
     // TLSH sections: the 0x7400 cell hint, TIVF placement, TVEC rejection.
