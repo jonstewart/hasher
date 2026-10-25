@@ -9,7 +9,11 @@ use std::time::Instant;
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use hset::format::{self, Document, HashsetIn, HsetFile};
 use hset::lookup::{self, BatchMode, BitsPolicy, HintSpec, SearchConfig, SingleMode};
-use hset::tlsh::{DIGEST_LENGTH as TLSH_LENGTH, IvfIndex, TivfView, TlshDigest};
+use hset::tlsh::cells::{cell_index, cell_table};
+use hset::tlsh::{
+    CELL_HINT_TAG, DIGEST_LENGTH as TLSH_LENGTH, IvfBuildOptions, IvfIndex, TivfView, TlshDigest,
+    build_tlsh_ivf,
+};
 use hset::{BuildOptions, Builder, HashType, Hashset, SetOp, builder, hex, ops, synth};
 
 #[derive(Parser)]
@@ -37,7 +41,7 @@ enum Cmd {
     Intersect(SetOpArgs),
     /// Records of the first hash set not in the second
     Subtract(SetOpArgs),
-    /// Rewrite a file with different hints or metadata
+    /// Rewrite a file with different hints or metadata (a TLSH section keeps its cell hint and TIVF index)
     Reindex(ReindexArgs),
     /// Time lookups against a file with synthetic queries
     Bench(BenchArgs),
@@ -746,17 +750,119 @@ fn cmd_setop(op: SetOp, a: SetOpArgs) -> CliResult<()> {
     summarize(&bytes, &a.out.output)
 }
 
+/// True for a TLSH section of 36-byte digests, the kind that gets the
+/// `0x7400` cell hint and may have a `TIVF` index.
+fn is_tlsh_section(s: &format::Section<'_>) -> bool {
+    s.header.htype == HashType::Tlsh && s.hash_length() == TLSH_LENGTH
+}
+
+/// A decoded hint as the encoder takes it: its tag and its payload.
+fn hint_parts<'a>(h: &format::Hint<'a>) -> (u16, &'a [u8]) {
+    match *h {
+        format::Hint::Block { table, .. }
+        | format::Hint::Hull { table, .. }
+        | format::Hint::TlshCells { table } => (h.tag(), table),
+        format::Hint::Unknown { tag, data } => (tag, data),
+    }
+}
+
+/// Encode `f` again under new metadata (name, description, timestamp),
+/// its records and every section's rows and record index as they are,
+/// section `i`'s hint and `TIVF` replaced by `hints[i]` and `tivfs[i]`.
+fn reencode(
+    f: &HsetFile<'_>,
+    (name, desc, time): (&str, &str, &str),
+    hints: &[Option<(u16, Vec<u8>)>],
+    tivfs: &[Option<Vec<u8>>],
+) -> CliResult<Vec<u8>> {
+    let doc = Document {
+        version: format::FORMAT_VERSION,
+        name,
+        desc,
+        time,
+        records: match (&f.rhdr, f.rdat) {
+            (Some(rhdr), Some(data)) => Some(format::RecordsIn {
+                fields: &rhdr.fields,
+                record_length: rhdr.record_length as usize,
+                data,
+            }),
+            _ => None,
+        },
+        hashsets: f
+            .sections
+            .iter()
+            .zip(hints)
+            .zip(tivfs)
+            .map(|((s, h), t)| HashsetIn {
+                htype: s.header.htype,
+                name: &s.header.name,
+                hash_length: s.hash_length(),
+                data: s.data,
+                hint: h.as_ref().map(|(t, b)| (*t, b.as_slice())),
+                ridx: s.ridx,
+                tivf: t.as_deref(),
+            })
+            .collect(),
+    };
+    format::encode(&doc).map_err(|e| e.to_string())
+}
+
+/// The `0x7400` cell hint of TLSH rows `data`.
+fn tlsh_cell_hint(data: &[u8]) -> CliResult<(u16, Vec<u8>)> {
+    let (rows, _) = data.as_chunks::<TLSH_LENGTH>();
+    let cells = cell_index(rows).map_err(|e| e.to_string())?;
+    Ok((CELL_HINT_TAG, cell_table(&cells)))
+}
+
+/// Give the TLSH section of `bytes`, a file the builder wrote from the
+/// input's records without a `TIVF`, the input's index `tivf` over the
+/// input's rows `rows`: byte for byte when the rows are unchanged (the
+/// usual case; this keeps an index a fresh build would not reproduce,
+/// such as a merged one), else a BISECT build over the new rows (records
+/// dropped, and with them the duplicate rows).
+fn restore_tivf(bytes: Vec<u8>, rows: &[u8], tivf: &[u8]) -> CliResult<Vec<u8>> {
+    let out = format::decode(&bytes).map_err(|e| e.to_string())?;
+    let Some(idx) = out.sections.iter().position(is_tlsh_section) else {
+        return Ok(bytes);
+    };
+    let s = &out.sections[idx];
+    let new_tivf = if s.data == rows {
+        tivf.to_vec()
+    } else {
+        let (new_rows, _) = s.data.as_chunks::<TLSH_LENGTH>();
+        build_tlsh_ivf(new_rows, &IvfBuildOptions::default())
+            .map_err(|e| e.to_string())?
+            .to_bytes()
+    };
+    let hints: Vec<Option<(u16, Vec<u8>)>> = out
+        .sections
+        .iter()
+        .map(|s| s.hint.map(|h| hint_parts(&h)).map(|(t, b)| (t, b.to_vec())))
+        .collect();
+    let mut tivfs: Vec<Option<Vec<u8>>> = vec![None; out.sections.len()];
+    tivfs[idx] = Some(new_tivf);
+    let meta = (
+        out.fhdr.name.as_str(),
+        out.fhdr.desc.as_str(),
+        out.fhdr.time.as_str(),
+    );
+    reencode(&out, meta, &hints, &tivfs)
+}
+
+/// Rewrite a file without records: every section's rows as they are, a
+/// new hint per `a` for each digest section and the cell hint for a TLSH
+/// section, whose `TIVF` index (if any) is kept byte for byte.
 fn reindex_sections_only(
     f: &HsetFile<'_>,
     a: &ReindexArgs,
-    name: &str,
-    desc: &str,
-    time: &str,
+    meta: (&str, &str, &str),
 ) -> CliResult<Vec<u8>> {
     let spec = a.out.hint_spec();
     let mut hints: Vec<Option<(u16, Vec<u8>)>> = Vec::new();
     for s in &f.sections {
-        let h = if s.header.htype.is_digest() {
+        let h = if is_tlsh_section(s) {
+            Some(tlsh_cell_hint(s.data)?)
+        } else if s.header.htype.is_digest() {
             let spec = lookup::resolve_bits(
                 spec,
                 s.len(),
@@ -772,28 +878,12 @@ fn reindex_sections_only(
         };
         hints.push(h);
     }
-    let doc = Document {
-        version: format::FORMAT_VERSION,
-        name,
-        desc,
-        time,
-        records: None,
-        hashsets: f
-            .sections
-            .iter()
-            .zip(&hints)
-            .map(|(s, h)| HashsetIn {
-                htype: s.header.htype,
-                name: &s.header.name,
-                hash_length: s.hash_length(),
-                data: s.data,
-                hint: h.as_ref().map(|(t, b)| (*t, b.as_slice())),
-                ridx: None,
-                tivf: None,
-            })
-            .collect(),
-    };
-    format::encode(&doc).map_err(|e| e.to_string())
+    let tivfs: Vec<Option<Vec<u8>>> = f
+        .sections
+        .iter()
+        .map(|s| s.tivf.map(<[u8]>::to_vec))
+        .collect();
+    reencode(f, meta, &hints, &tivfs)
 }
 
 fn cmd_reindex(a: ReindexArgs) -> CliResult<()> {
@@ -820,14 +910,29 @@ fn cmd_reindex(a: ReindexArgs) -> CliResult<()> {
                 b.add_raw_record(f.record(i).unwrap())
                     .map_err(|e| e.to_string())?;
             }
-            let opts = a.out.options(Some(name), Some(desc)).timestamp(time);
-            b.build(&opts).map_err(|e| e.to_string())?
+            // The builder writes the cell hint; the index is the input's
+            // (restored below), not a new build.
+            let opts = a
+                .out
+                .options(Some(name), Some(desc))
+                .timestamp(time)
+                .tlsh_index(false);
+            let bytes = b.build(&opts).map_err(|e| e.to_string())?;
+            let input_index = f
+                .sections
+                .iter()
+                .find(|s| is_tlsh_section(s))
+                .and_then(|s| Some((s.data, s.tivf?)));
+            match input_index {
+                Some((rows, tivf)) => restore_tivf(bytes, rows, tivf)?,
+                None => bytes,
+            }
         }
         _ => {
             if a.out.no_hashsets {
                 return err("input has no records; cannot write a records-only file");
             }
-            reindex_sections_only(&f, &a, name, desc, time)?
+            reindex_sections_only(&f, &a, (name, desc, time))?
         }
     };
     write_output(&a.out.output, &bytes)?;

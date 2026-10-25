@@ -809,3 +809,91 @@ fn verify_fails_on_a_wrong_cell_hint_or_an_invalid_index() {
     );
     assert!(s.contains("PROBLEM: tlsh: invalid TIVF index"), "{s}");
 }
+
+/// The TLSH section's cell table, `TIVF` payload and rows (`HDAT`) of the
+/// file at `path`.
+fn tlsh_parts(path: &Path) -> (Vec<u8>, Option<Vec<u8>>, Vec<u8>) {
+    let bytes = std::fs::read(path).unwrap();
+    let (cells, tivf) = tlsh_chunk_ranges(&bytes);
+    let f = hset::format::decode(&bytes).unwrap();
+    let rows = f
+        .sections
+        .iter()
+        .find(|s| s.header.htype == hset::HashType::Tlsh)
+        .unwrap()
+        .data
+        .to_vec();
+    (bytes[cells].to_vec(), tivf.map(|r| bytes[r].to_vec()), rows)
+}
+
+/// `reindex src -o out extra..`, which must succeed and leave a file that
+/// verifies.
+fn reindexed(src: &Path, out: &Path, extra: &[&str]) {
+    let mut args = vec!["reindex", p(src), "-o", p(out)];
+    args.extend_from_slice(extra);
+    let o = run(&args);
+    assert!(o.status.success(), "{}", stderr(&o));
+    let o = run(&["verify", p(out)]);
+    assert!(o.status.success(), "{}", stdout(&o));
+}
+
+#[test]
+fn reindex_keeps_the_tlsh_cell_hint_and_index() {
+    let dir = tmpdir("tlsh-reindex");
+    for (tag, make_extra) in [
+        ("records", &[][..]),
+        ("hashes", &["--no-records"][..]),
+        ("no-index", &["--no-tlsh-index"][..]),
+    ] {
+        let src = dir.join(format!("{tag}.hset"));
+        made_tlsh(&src, make_extra);
+        let before = tlsh_parts(&src);
+        for hint in ["legacy", "none", "hull"] {
+            let out = dir.join(format!("{tag}-{hint}.hset"));
+            reindexed(&src, &out, &["--hint", hint]);
+            assert_eq!(tlsh_parts(&out), before, "{tag} --hint {hint}");
+        }
+    }
+}
+
+#[test]
+fn reindex_to_hashes_only_indexes_the_distinct_rows() {
+    let dir = tmpdir("tlsh-reindex-ho");
+    let src = dir.join("records.hset");
+    made_tlsh(&src, &[]);
+    let out = dir.join("hashes.hset");
+    reindexed(&src, &out, &["--no-records"]);
+    // As make writes the hashes-only file: 80 rows, 76 lists.
+    let direct = dir.join("direct.hset");
+    made_tlsh(&direct, &["--no-records"]);
+    assert_eq!(tlsh_parts(&out), tlsh_parts(&direct));
+    // Without an index in, none out.
+    let src = dir.join("no-index.hset");
+    made_tlsh(&src, &["--no-tlsh-index"]);
+    let out = dir.join("no-index-ho.hset");
+    reindexed(&src, &out, &["--no-records"]);
+    assert_eq!(tlsh_parts(&out).1, None);
+}
+
+/// C++ merge outputs carry merged TIVF indexes, which a fresh build would
+/// not reproduce (a BISECT build over the same rows has 2858 lists, not
+/// 2852, for `merge_alg_ab`; 2266, not 2260, for `merge_df_out2`; 8233, not
+/// 34789, for the hashes-only `inc_out_a`): reindex keeps them byte for
+/// byte, through the records path and the sections-only path.
+#[test]
+fn reindex_keeps_a_cpp_merged_index_verbatim() {
+    let dir = tmpdir("tlsh-reindex-cpp");
+    let mut seen = 0;
+    for name in ["merge_alg_ab.hset", "merge_df_out2.hset", "inc_out_a.hset"] {
+        let src = fixture(name);
+        if !src.exists() {
+            eprintln!("skipping {name}: not generated");
+            continue;
+        }
+        seen += 1;
+        let out = dir.join(name);
+        reindexed(&src, &out, &["--hint", "legacy"]);
+        assert_eq!(tlsh_parts(&out), tlsh_parts(&src), "{name}");
+    }
+    eprintln!("{seen} C++ fixtures checked");
+}
