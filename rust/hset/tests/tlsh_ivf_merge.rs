@@ -3,9 +3,16 @@
 //! (hand-built cells, incremental unions) and `test/test_hset_merge.cpp`
 //! (`merge_tlsh_ivf_remaps_and_drops`).
 
+use hset::SetOp;
+use hset::merge::{RowMerge, RowMode, merge_rows};
+use hset::synth::SplitMix64;
 use hset::tlsh::ivf::merge::merge_tlsh_ivf;
-use hset::tlsh::ivf::{DEFAULT_COALESCE, DROPPED, IvfIndex, TlshIvf, check_invariant};
-use hset::tlsh::{TlshDigest, emb_body_dist2};
+use hset::tlsh::ivf::{DEFAULT_COALESCE, DROPPED, IvfIndex, TivfView, TlshIvf, check_invariant};
+use hset::tlsh::{BodyQuery, TlshDigest, emb_body_dist2};
+use hset_testkit::tlsh::{
+    Perturbation, cell_corpus, naive_cell_index, perturb_corpus, sorted_rows,
+};
+use proptest::prelude::*;
 
 /// No index on either side.
 const NONE: Option<(&TlshIvf, &[u32])> = None;
@@ -395,6 +402,249 @@ fn a_cell_lists_the_left_sides_lists_then_the_right_sides() {
     assert_eq!(m.medoids, [m_b, d0]);
     assert_eq!(m.radius2, [11, 0]);
     assert_eq!(list_ids(&m, 0), sorted_union(&h.ids[0], &h.ids[1]));
+}
+
+//
+// generated indexes and merges
+//
+
+/// Rows over a few cells: `n` digests in families of near bodies spread
+/// over `cells` headers. Unsorted, duplicates possible.
+fn pool(seed: u64, n: usize, cells: usize, flip: f64) -> Vec<TlshDigest> {
+    let mut rng = SplitMix64::new(seed);
+    let headers: Vec<(u8, u8, u8)> = (0..cells)
+        .map(|_| {
+            let h = rng.next_u64();
+            (h as u8, (h >> 8) as u8 & 0x0F, (h >> 12) as u8 & 0x0F)
+        })
+        .collect();
+    let per = n.div_ceil(cells.max(1));
+    let mut v: Vec<TlshDigest> = headers
+        .iter()
+        .enumerate()
+        .flat_map(|(k, &h)| cell_corpus(seed ^ (k as u64 + 1), per, h, 1 + per / 12, flip))
+        .collect();
+    v.truncate(n);
+    v
+}
+
+fn sorted_unique(digests: &[TlshDigest]) -> Vec<[u8; 36]> {
+    let mut rows = sorted_rows(digests);
+    rows.dedup();
+    rows
+}
+
+/// A valid index over sorted `rows` that is not a clustering: each cell's
+/// rows shuffled and cut into lists of 1 to `max_list` members, each list
+/// with a random member as medoid and its exact radius.
+fn random_index(rows: &[[u8; 36]], seed: u64, max_list: usize) -> TlshIvf {
+    let mut rng = SplitMix64::new(seed);
+    let mut ivf = TlshIvf::empty();
+    ivf.n = rows.len() as u64;
+    let cell = |r: &[u8; 36]| TlshDigest(*r).cell() as usize;
+    let mut start = 0;
+    for c in 0..CELLS {
+        ivf.cell_lists[c] = ivf.lists() as u32;
+        let end = start + rows[start..].iter().take_while(|r| cell(r) == c).count();
+        let mut ids: Vec<u32> = (start as u32..end as u32).collect();
+        for i in (1..ids.len()).rev() {
+            ids.swap(i, rng.below(i as u64 + 1) as usize);
+        }
+        let mut rest = &mut ids[..];
+        while !rest.is_empty() {
+            let len = 1 + rng.below(max_list.min(rest.len()) as u64) as usize;
+            let (list, tail) = rest.split_at_mut(len);
+            list.sort();
+            let medoid = TlshDigest(rows[list[rng.below(len as u64) as usize] as usize]);
+            let q = BodyQuery::new(&medoid);
+            ivf.medoids.push(medoid);
+            ivf.radius2.push(
+                list.iter()
+                    .map(|&i| q.emb_body(&rows[i as usize]))
+                    .max()
+                    .unwrap(),
+            );
+            ivf.ids.extend_from_slice(list);
+            ivf.list_start.push(ivf.ids.len() as u64);
+            rest = tail;
+        }
+        start = end;
+    }
+    ivf.cell_lists[CELLS] = ivf.lists() as u32;
+    (&ivf)
+        .validate(rows)
+        .expect("random_index builds valid indexes");
+    ivf
+}
+
+/// One side of a merge: its sorted rows and index.
+struct Side {
+    rows: Vec<[u8; 36]>,
+    ivf: TlshIvf,
+}
+
+/// The rows a set operation outputs and the row maps, by the file merge's
+/// own row merge.
+fn merge_sides(op: SetOp, l: &Side, r: &Side) -> (Vec<[u8; 36]>, RowMerge) {
+    let m = merge_rows(
+        l.rows.as_flattened(),
+        r.rows.as_flattened(),
+        36,
+        RowMode::Set(op),
+    )
+    .unwrap();
+    let out = m
+        .gather_rows(l.rows.as_flattened(), r.rows.as_flattened(), 36)
+        .unwrap();
+    (out.as_chunks::<36>().0.to_vec(), m)
+}
+
+fn merge_ivf(l: &Side, r: &Side, out: &[[u8; 36]], m: &RowMerge, c: u32) -> TlshIvf {
+    merge_tlsh_ivf(
+        Some((&l.ivf, &m.lmap[..])),
+        Some((&r.ivf, &m.rmap[..])),
+        out,
+        c,
+    )
+    .unwrap()
+}
+
+/// Everything a merged index promises: valid over its rows, every radius
+/// exact (the inputs' radii are, and the merge keeps them so), the
+/// coalescing invariant at `c`, and so at most `m / (c / 2) + 1` lists
+/// in a cell of `m` rows.
+fn check_merged(m: &TlshIvf, rows: &[[u8; 36]], c: u32) {
+    let v = m.validate(rows).expect("a merged index is valid");
+    for l in 0..v.lists() {
+        let q = BodyQuery::new(&v.medoid(l));
+        let exact = v.list_ids(l).map(|i| q.emb_body(&rows[i as usize])).max();
+        assert_eq!(exact, Some(v.radius2(l)), "list {l} radius is not exact");
+    }
+    assert!(check_invariant(&v, c), "coalescing invariant at C = {c}");
+    let half = (c / 2) as usize;
+    if half > 0 {
+        let cells = naive_cell_index(rows);
+        for cell in 0..CELLS {
+            let rows_in = (cells[cell + 1] - cells[cell]) as usize;
+            let lists = v.cell_range(cell).len();
+            if rows_in > 0 {
+                assert!(
+                    lists <= rows_in / half + 1,
+                    "cell {cell:04x}: {lists} lists"
+                );
+            }
+        }
+    }
+}
+
+const CELLS: usize = 65536;
+
+fn set_op() -> impl Strategy<Value = SetOp> {
+    prop_oneof![
+        Just(SetOp::Union),
+        Just(SetOp::Intersect),
+        Just(SetOp::Subtract)
+    ]
+}
+
+proptest! {
+    // Every case walks all 65,536 cells a few times.
+    #![proptest_config(ProptestConfig::with_cases(32))]
+
+    #[test]
+    fn a_merge_of_any_two_indexes_is_valid_exact_and_coalesced(
+        seed in any::<u64>(),
+        n in 0usize..400,
+        cells in 1usize..6,
+        max_list in 1usize..20,
+        c in prop_oneof![Just(0u32), Just(1), Just(2), Just(5), Just(10), Just(64)],
+        op in set_op(),
+    ) {
+        // two overlapping samples of one pool, so the operations drop rows
+        let all = pool(seed, n, cells, 0.04);
+        let mut rng = SplitMix64::new(seed ^ 0x5eed);
+        let (mut a, mut b) = (Vec::new(), Vec::new());
+        for d in &all {
+            match rng.below(3) {
+                0 => a.push(*d),
+                1 => b.push(*d),
+                _ => { a.push(*d); b.push(*d); }
+            }
+        }
+        let l = { let rows = sorted_unique(&a); let ivf = random_index(&rows, seed ^ 1, max_list); Side { rows, ivf } };
+        let r = { let rows = sorted_unique(&b); let ivf = random_index(&rows, seed ^ 2, max_list); Side { rows, ivf } };
+        let (out, m) = merge_sides(op, &l, &r);
+        let merged = merge_ivf(&l, &r, &out, &m, c);
+        check_merged(&merged, &out, c);
+
+        // the same merge from the parsed payloads gives the same bytes
+        let (lp, rp) = (l.ivf.to_bytes(), r.ivf.to_bytes());
+        let (lv, rv) = (
+            TivfView::parse(&lp, l.rows.len() as u64).unwrap(),
+            TivfView::parse(&rp, r.rows.len() as u64).unwrap(),
+        );
+        let from_views = merge_tlsh_ivf(Some((&lv, &m.lmap[..])), Some((&rv, &m.rmap[..])), &out, c).unwrap();
+        prop_assert_eq!(from_views.to_bytes(), merged.to_bytes());
+    }
+
+    #[test]
+    fn the_identity_map_without_coalescing_reproduces_any_index(
+        seed in any::<u64>(),
+        n in 0usize..300,
+        cells in 1usize..6,
+        max_list in 1usize..20,
+    ) {
+        let rows = sorted_unique(&pool(seed, n, cells, 0.04));
+        let ivf = random_index(&rows, seed, max_list);
+        let map: Vec<u32> = (0..rows.len() as u32).collect();
+        prop_assert_eq!(&merge_tlsh_ivf(Some((&ivf, &map[..])), NONE, &rows, 0).unwrap(), &ivf);
+        prop_assert_eq!(&merge_tlsh_ivf(NONE, Some((&ivf, &map[..])), &rows, 0).unwrap(), &ivf);
+        // and coalescing a valid index keeps its rows and only joins lists
+        let c = merge_tlsh_ivf(Some((&ivf, &map[..])), NONE, &rows, DEFAULT_COALESCE).unwrap();
+        check_merged(&c, &rows, DEFAULT_COALESCE);
+        prop_assert!(c.lists() <= ivf.lists());
+    }
+}
+
+#[test]
+fn incremental_unions_keep_the_invariant_and_the_list_bound() {
+    // hset_merge_incremental_unions, scaled down: a master absorbs batches,
+    // half near copies of master rows, half new families, each batch with
+    // an index of small random lists
+    const MASTER: usize = 3000;
+    const STEPS: u64 = 12;
+    const HALF_BATCH: usize = 150;
+    let master_corpus = pool(101, MASTER, 8, 0.04);
+    let batches: Vec<Vec<TlshDigest>> = (0..STEPS)
+        .map(|i| {
+            let mut b = pool(1000 + i, HALF_BATCH, 8, 0.04);
+            let p = Perturbation::body_only(0.03);
+            b.extend(perturb_corpus(2000 + i, &master_corpus, HALF_BATCH, &p));
+            b
+        })
+        .collect();
+
+    for c in [2 * 32, 32, 0] {
+        let rows = sorted_unique(&master_corpus);
+        let ivf = random_index(&rows, 7, 32);
+        let mut master = Side { rows, ivf };
+        for (step, batch) in batches.iter().enumerate() {
+            let rows = sorted_unique(batch);
+            let ivf = random_index(&rows, 8 + step as u64, 8);
+            let batch = Side { rows, ivf };
+            let (out, m) = merge_sides(SetOp::Union, &master, &batch);
+
+            let mut expected = master.rows.clone();
+            expected.extend_from_slice(&batch.rows);
+            expected.sort();
+            expected.dedup();
+            assert_eq!(out, expected);
+
+            let ivf = merge_ivf(&master, &batch, &out, &m, c);
+            check_merged(&ivf, &out, c);
+            master = Side { rows: out, ivf };
+        }
+    }
 }
 
 //

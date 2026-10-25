@@ -17,8 +17,8 @@ pub fn merge_tlsh_ivf<A: IvfIndex + ?Sized, B: IvfIndex + ?Sized>(
     rows: &[[u8; DIGEST_LENGTH]],
     coalesce_threshold: u32,
 ) -> Result<TlshIvf> {
-    let n_out = u32::try_from(rows.len())
-        .map_err(|_| Error::input("too many rows for a TIVF index"))?;
+    let n_out =
+        u32::try_from(rows.len()).map_err(|_| Error::input("too many rows for a TIVF index"))?;
     let half = coalesce_threshold / 2;
     if let Some((index, map)) = a {
         check_side(index, map, "left")?;
@@ -173,7 +173,9 @@ fn coalesce_cell(lists: &mut Vec<MergeList>, rows: &[[u8; DIGEST_LENGTH]], half:
     let mut version = vec![0u32; s];
     let push = |heap: &mut BinaryHeap<_>, dist: &[u32], version: &[u32], i: usize, j: usize| {
         let radius2 = about(dist, i, j).min(about(dist, j, i));
-        heap.push(Reverse((radius2, i as u32, j as u32, version[i], version[j])));
+        heap.push(Reverse((
+            radius2, i as u32, j as u32, version[i], version[j],
+        )));
     };
     for i in 0..s {
         for j in i + 1..s {
