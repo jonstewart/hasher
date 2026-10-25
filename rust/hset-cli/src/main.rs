@@ -71,6 +71,12 @@ enum Cmd {
     #[command(alias = "difference")]
     Subtract(SetOpArgs),
     /// Rewrite a file with different hints or metadata (a TLSH section keeps its cell hint and TIVF index)
+    ///
+    /// A file with records is rebuilt from its records as `make` builds
+    /// them, so equal hashes in a section list their records in descending
+    /// record order (a merged file lists the left input's first; both are
+    /// valid), and a TLSH section new to the file (from a records-only
+    /// input) gets a TIVF index unless --no-tlsh-index.
     Reindex(ReindexArgs),
     /// Time lookups against a file with synthetic queries
     Bench(BenchArgs),
@@ -376,6 +382,12 @@ struct ReindexArgs {
     /// Keep the input's name, description, and timestamp
     #[arg(long)]
     keep_metadata: bool,
+    /// Write no TIVF kNN index for the TLSH section (it still gets its
+    /// cell hint). Without this flag a TLSH section keeps the input's
+    /// index, or none if it had none, and a TLSH section new to the file
+    /// (a records-only input) gets one, as `make` writes it
+    #[arg(long)]
+    no_tlsh_index: bool,
 }
 
 #[derive(Args)]
@@ -1108,7 +1120,8 @@ fn restore_tivf(bytes: Vec<u8>, rows: &[u8], tivf: &[u8]) -> CliResult<Vec<u8>> 
 
 /// Rewrite a file without records: every section's rows as they are, a
 /// new hint per `a` for each digest section and the cell hint for a TLSH
-/// section, whose `TIVF` index (if any) is kept byte for byte.
+/// section, whose `TIVF` index (if any) is kept byte for byte unless
+/// `--no-tlsh-index`.
 fn reindex_sections_only(
     f: &HsetFile<'_>,
     a: &ReindexArgs,
@@ -1138,7 +1151,7 @@ fn reindex_sections_only(
     let tivfs: Vec<Option<Vec<u8>>> = f
         .sections
         .iter()
-        .map(|s| s.tivf.map(<[u8]>::to_vec))
+        .map(|s| s.tivf.filter(|_| !a.no_tlsh_index).map(<[u8]>::to_vec))
         .collect();
     reencode(f, meta, &hints, &tivfs)
 }
@@ -1167,18 +1180,18 @@ fn cmd_reindex(a: ReindexArgs) -> CliResult<()> {
                 b.add_raw_record(f.record(i).unwrap())
                     .map_err(|e| e.to_string())?;
             }
-            // The builder writes the cell hint; the index is the input's
-            // (restored below), not a new build.
+            // The builder writes the cell hint. An input TLSH section's
+            // index is restored below, not built anew; without one (a
+            // records-only input) the builder indexes as make does.
+            let input_tlsh = f.sections.iter().find(|s| is_tlsh_section(s));
             let opts = a
                 .out
                 .options(Some(name), Some(desc))
                 .timestamp(time)
-                .tlsh_index(false);
+                .tlsh_index(!a.no_tlsh_index && input_tlsh.is_none());
             let bytes = b.build(&opts).map_err(|e| e.to_string())?;
-            let input_index = f
-                .sections
-                .iter()
-                .find(|s| is_tlsh_section(s))
+            let input_index = input_tlsh
+                .filter(|_| !a.no_tlsh_index)
                 .and_then(|s| Some((s.data, s.tivf?)));
             match input_index {
                 Some((rows, tivf)) => restore_tivf(bytes, rows, tivf)?,

@@ -945,6 +945,48 @@ fn reindex_to_hashes_only_indexes_the_distinct_rows() {
     assert_eq!(tlsh_parts(&out).1, None);
 }
 
+#[test]
+fn reindex_of_a_records_only_file_indexes_its_new_tlsh_section_as_make_does() {
+    let dir = tmpdir("tlsh-reindex-ro");
+    let src = dir.join("records-only.hset");
+    made_tlsh(&src, &["--no-hashsets"]);
+    let direct = dir.join("direct.hset");
+    made_tlsh(&direct, &[]);
+    let out = dir.join("out.hset");
+    reindexed(&src, &out, &[]);
+    assert!(tlsh_parts(&out).1.is_some());
+    assert_eq!(tlsh_parts(&out), tlsh_parts(&direct));
+}
+
+#[test]
+fn reindex_with_no_tlsh_index_writes_none() {
+    let dir = tmpdir("tlsh-reindex-none");
+    for (tag, make_extra) in [
+        ("records", &[][..]),
+        ("hashes", &["--no-records"][..]),
+        ("records-only", &["--no-hashsets"][..]),
+    ] {
+        let src = dir.join(format!("{tag}.hset"));
+        made_tlsh(&src, make_extra);
+        let out = dir.join(format!("{tag}-out.hset"));
+        reindexed(&src, &out, &["--no-tlsh-index"]);
+        let (cells, tivf, rows) = tlsh_parts(&out);
+        assert_eq!(tivf, None, "{tag}");
+        // the cell hint and rows are still written
+        let direct = dir.join(format!("{tag}-direct.hset"));
+        let extra: &[&str] = if tag == "hashes" {
+            &["--no-records", "--no-tlsh-index"]
+        } else {
+            &["--no-tlsh-index"]
+        };
+        made_tlsh(&direct, extra);
+        assert_eq!((cells, rows), {
+            let (c, _, r) = tlsh_parts(&direct);
+            (c, r)
+        });
+    }
+}
+
 /// C++ merge outputs carry merged TIVF indexes, which a fresh build would
 /// not reproduce (a BISECT build over the same rows has 2858 lists, not
 /// 2852, for `merge_alg_ab`; 2266, not 2260, for `merge_df_out2`; 8233, not

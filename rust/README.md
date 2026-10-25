@@ -156,7 +156,12 @@ it reads `HSET_TLSH_OPTIONS` as `mkhashset` does (2 = index, 0 = none; 1 and
 4 are ignored), and rejects a negative or non-numeric value, the k-means
 bit 8, or any other bit. `hset reindex` keeps a TLSH section's TIVF index
 byte for byte (rebuilding it only when `--no-records` drops duplicate rows)
-and rewrites its cell hint.
+and rewrites its cell hint; a TLSH section new to the file (reindexing a
+records-only file) gets an index as `make` writes it, and
+`--no-tlsh-index` writes none. A file with records is rebuilt from its
+records, so the record indexes (RIDX) of equal hashes come out in the
+builder's order, descending record index, where a merged file lists the
+left input's first; both orders are valid and the rows are unchanged.
 
 The set operations merge the inputs' sorted sections, as the C++
 `hsetop` and `sfhash_hashset_merge` do (HASHSET_FORMAT, "Set operations");
@@ -176,7 +181,10 @@ Without the flag `HSET_TLSH_OPTIONS` is read as `hsetop` reads it (4 =
 inherit, winning over 2 = write, 0 = none; 1 is ignored; the k-means bit 8
 or any other bit is an error). `--coalesce C` (else `HSET_COALESCE`, else
 64) sets the threshold below which a merged index coalesces a cell's small
-lists; 0 disables it. Both values must be plain nonnegative decimals. One
+lists; 0 disables it, and 4294967295 selects the default 64, as `hsetop`
+reads it (`SFHASH_HSET_COALESCE_DEFAULT`; the library's
+`MergeOptions::coalesce_threshold` has no sentinel and takes the value as
+given). Both values must be plain nonnegative decimals. One
 deliberate difference from C++: the builder-shaped C++ set operations
 default to writing the index, Rust's always to inheriting it.
 
