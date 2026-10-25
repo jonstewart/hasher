@@ -34,6 +34,7 @@ pub mod hashset;
 pub mod hex;
 pub mod key;
 pub mod lookup;
+pub mod merge;
 pub mod ops;
 pub mod synth;
 pub mod tlsh;
