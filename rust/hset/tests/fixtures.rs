@@ -5,8 +5,8 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use hset::format::{Document, HashsetIn, Hint, RecordsIn, decode, encode};
-use hset::tlsh::cells::{cell_index, cell_table};
 use hset::merge::{MergeOptions, merge};
+use hset::tlsh::cells::{cell_index, cell_table};
 use hset::{BuildOptions, Builder, HashType, Hashset, HintSpec, SetOp, hex};
 use sha2::{Digest, Sha256};
 
