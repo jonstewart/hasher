@@ -37,10 +37,12 @@ The rest runs through `just` (`just --list` for the menu):
 | `verify` | `cargo kani -p hset` inside the same capped `systemd-run` scope as `mutants` (`MemoryMax=$KANI_MEMORY`); without `systemd-run` run uncapped with a warning | nightly |
 | `check-slow` | `prop fuzz-ci verify`, then `just mutants` for `hset` and `hset-cli` | nightly |
 
-`cargo test --workspace` run bare, without `just`, runs the same test set
-but takes about 44 s on the 4-core VM because it lacks nextest's
-process-per-test parallelism; the commit-gate's 30 s budget is measured on
-`just test` (21 to 25 s), not the bare command.
+Test builds use `[profile.test] opt-level = 1` (Cargo.toml): unoptimized,
+the TLSH index builds and the property tests took `just test` to 42 s on the
+16-core VM; at opt-level 1 the run takes about 6 s. `cargo test --workspace`
+run bare, without `just`, runs the same test set but is slower because it
+lacks nextest's process-per-test parallelism; the commit-gate's 30 s budget is
+measured on `just test`, not the bare command.
 
 Variables with environment overrides: `FUZZ_SECONDS` (default 60),
 `FUZZ_SANITIZER` (default `none`; the crate has one `unsafe`, the prefetch

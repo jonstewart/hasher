@@ -25,6 +25,12 @@ hset-testkit = { path = "hset-testkit" }
 [workspace.lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(kani)'] }
 
+# Tests (cargo test, nextest, cargo-mutants) build at opt-level 1: the TLSH
+# index builds and the property tests run 5-7x faster than unoptimized, which
+# keeps `just test` inside the commit gate's budget. `cargo build` is unchanged.
+[profile.test]
+opt-level = 1
+
 [profile.release]
 debug = 1
 lto = "thin"
