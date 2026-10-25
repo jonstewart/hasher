@@ -6,6 +6,7 @@
 
 use hset::Error;
 use hset::tlsh::TlshDigest;
+use hset::tlsh::ivf;
 use hset::tlsh::ivf::{IvfIndex, TivfView, TlshIvf, check_invariant, tivf_len};
 
 // Layout (HASHSET_FORMAT, tlsh_ivf.cpp length_tivf_data): 32-byte header,
@@ -118,6 +119,17 @@ fn u32_at(b: &[u8], at: usize) -> u32 {
 
 fn u64_at(b: &[u8], at: usize) -> u64 {
     u64::from_le_bytes(b[at..at + 8].try_into().unwrap())
+}
+
+#[test]
+fn constants_match_tlsh_ivf_h() {
+    // TLSH_IVF_TARGET_LIST_SIZE, _DEFAULT_SEED, _DEFAULT_COALESCE
+    // (2 * target), _BISECT_FLAT_MAX, _DROPPED (UINT32_MAX)
+    assert_eq!(ivf::TARGET_LIST_SIZE, 32);
+    assert_eq!(ivf::DEFAULT_SEED, 0x71_7565_7279); // "query"
+    assert_eq!(ivf::DEFAULT_COALESCE, 64);
+    assert_eq!(ivf::FLAT_MAX, 4096);
+    assert_eq!(ivf::DROPPED, 0xFFFF_FFFF);
 }
 
 #[test]

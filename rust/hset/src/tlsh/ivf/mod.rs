@@ -13,6 +13,29 @@ use super::digest::{DIGEST_LENGTH, TlshDigest};
 use super::distance::BodyQuery;
 use crate::error::{Error, Result};
 
+/// Lists hold about this many rows each: the clustering target `T` of the
+/// BISECT build (C++ `TLSH_IVF_TARGET_LIST_SIZE`).
+pub const TARGET_LIST_SIZE: usize = 32;
+
+/// Default seed of the BISECT build's random draws, ASCII `"query"`
+/// (C++ `TLSH_IVF_DEFAULT_SEED`).
+pub const DEFAULT_SEED: u64 = 0x71_7565_7279;
+
+/// Default coalescing threshold `C` of a merge, `2 * TARGET_LIST_SIZE`:
+/// two lists of a cell are coalesced while both have fewer than `C / 2`
+/// members (C++ `TLSH_IVF_DEFAULT_COALESCE`). See [`check_invariant`].
+pub const DEFAULT_COALESCE: u32 = 2 * TARGET_LIST_SIZE as u32;
+
+/// BISECT splits a node in two only while it has more than this many rows;
+/// smaller nodes are clustered flat by integer k-means into at most
+/// `ceil(s / T)` lists. A quality and build-cost knob only
+/// (C++ `TLSH_IVF_BISECT_FLAT_MAX`).
+pub const FLAT_MAX: usize = 4096;
+
+/// The output row of an input row that a merge drops, in merge row maps
+/// (C++ `TLSH_IVF_DROPPED`).
+pub const DROPPED: u32 = u32::MAX;
+
 /// Length of the fixed TIVF header.
 pub const TIVF_HEADER_LENGTH: usize = 32;
 
