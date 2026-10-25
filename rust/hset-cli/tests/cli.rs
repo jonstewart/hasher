@@ -329,12 +329,12 @@ fn errors_are_reported() {
     let o = run(&[
         "union",
         p(&fixture("good.hset")),
-        p(&fixture("md5_sha1_a.hset")),
+        "/nonexistent/file.hset",
         "-o",
         p(&out),
     ]);
     assert_eq!(o.status.code(), Some(2));
-    assert!(stderr(&o).contains("mismatch"));
+    assert!(stderr(&o).contains("/nonexistent/file.hset"));
 }
 
 #[test]
@@ -1179,4 +1179,395 @@ fn knn_on_the_cpp_fixture() {
             assert_eq!(stdout(&o), want, "{strategy}");
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Set operations by merge
+// ---------------------------------------------------------------------------
+
+/// `hset args..` with `env` set, `HSET_TLSH_OPTIONS` and `HSET_COALESCE`
+/// removed first.
+fn run_env(args: &[&str], env: &[(&str, &str)]) -> Output {
+    let mut cmd = bin();
+    cmd.args(args)
+        .env_remove("HSET_TLSH_OPTIONS")
+        .env_remove("HSET_COALESCE");
+    for (k, v) in env {
+        cmd.env(k, v);
+    }
+    cmd.output().unwrap()
+}
+
+/// `hset OP left right -o out extra..` with `env`.
+fn setop(op: &str, l: &Path, r: &Path, out: &Path, extra: &[&str], env: &[(&str, &str)]) -> Output {
+    let mut args = vec![op, p(l), p(r), "-o", p(out)];
+    args.extend_from_slice(extra);
+    run_env(&args, env)
+}
+
+/// [`setop`] that must succeed and leave a file that verifies.
+fn setop_ok(op: &str, l: &Path, r: &Path, out: &Path, extra: &[&str], env: &[(&str, &str)]) {
+    let o = setop(op, l, r, out, extra, env);
+    assert!(o.status.success(), "{op} {extra:?} {env:?}: {}", stderr(&o));
+    let o = run(&["verify", p(out)]);
+    assert!(o.status.success(), "{op} {extra:?} {env:?}: {}", stdout(&o));
+}
+
+/// `make -t types -o out extra..` over `text`, which must succeed.
+fn make_text(out: &Path, types: &str, text: &str, extra: &[&str]) {
+    let mut args = vec!["make", "-t", types, "-o", p(out)];
+    args.extend_from_slice(extra);
+    let o = run_with_stdin(&args, text);
+    assert!(o.status.success(), "{}", stderr(&o));
+}
+
+/// Two `md5,tlsh` files over overlapping parts of the example text
+/// (records 0..50 and 30..83), made with `extra_a` and `extra_b`.
+fn tlsh_halves(dir: &Path, extra_a: &[&str], extra_b: &[&str]) -> (PathBuf, PathBuf) {
+    let text = hset_testkit::tlsh::example_text(false);
+    let lines: Vec<&str> = text.lines().collect();
+    let (a, b) = (dir.join("a.hset"), dir.join("b.hset"));
+    make_text(&a, "md5,tlsh", &(lines[..50].join("\n") + "\n"), extra_a);
+    make_text(&b, "md5,tlsh", &(lines[30..].join("\n") + "\n"), extra_b);
+    (a, b)
+}
+
+/// The library's merge of the files `l` and `r` under `opts`, written to
+/// `out`.
+fn library_merge(
+    op: hset::SetOp,
+    l: &Path,
+    r: &Path,
+    opts: &hset::merge::MergeOptions,
+    out: &Path,
+) {
+    let (lb, rb) = (std::fs::read(l).unwrap(), std::fs::read(r).unwrap());
+    let (lh, rh) = (
+        hset::Hashset::load(&lb).unwrap(),
+        hset::Hashset::load(&rb).unwrap(),
+    );
+    std::fs::write(out, hset::merge::merge(op, &lh, &rh, opts).unwrap()).unwrap();
+}
+
+/// The number of lists of `f`'s TLSH index, `None` without one.
+fn tivf_lists(f: &Path) -> Option<usize> {
+    let line = tlsh_info_line(f);
+    let rest = line.split_once("index TIVF, ")?.1;
+    Some(rest.split_once(" lists").unwrap().0.parse().unwrap())
+}
+
+#[test]
+fn union_of_tlsh_files_carries_the_merged_index() {
+    let dir = tmpdir("setop-tlsh");
+    let (a, b) = tlsh_halves(&dir, &[], &[]);
+    let out = dir.join("u.hset");
+    setop_ok("union", &a, &b, &out, &[], &[]);
+    let s = stdout(&run(&["verify", p(&out)]));
+    assert!(s.contains("tlsh cells_exact=true, index lists="), "{s}");
+    assert!(s.contains("valid=true"), "{s}");
+    // the index is the library merge's (merged, not rebuilt)
+    let lib = dir.join("lib.hset");
+    library_merge(
+        hset::SetOp::Union,
+        &a,
+        &b,
+        &hset::merge::MergeOptions::new("", ""),
+        &lib,
+    );
+    let parts = tlsh_parts(&out);
+    assert!(parts.1.is_some(), "no TIVF");
+    assert_eq!(parts, tlsh_parts(&lib));
+    // 83 input records, all in the union: the full example's rows
+    let full = dir.join("full.hset");
+    made_tlsh(&full, &["--no-tlsh-index"]);
+    assert_eq!(parts.2, tlsh_parts(&full).2);
+
+    // the index answers as brute force does
+    let queries = dir.join("q.txt");
+    let mut q = hset_testkit::tlsh::example_digests();
+    q.extend((0..10).map(absent_digest));
+    std::fs::write(&queries, q.join("\n") + "\n").unwrap();
+    let knn = |strategy: &str| {
+        let o = run(&[
+            "knn",
+            p(&out),
+            "-f",
+            p(&queries),
+            "-k",
+            "5",
+            "--strategy",
+            strategy,
+        ]);
+        assert!(o.status.code().is_some_and(|c| c < 2), "{}", stderr(&o));
+        stdout(&o)
+    };
+    assert_eq!(knn("index"), knn("brute"));
+
+    // `difference` is `subtract`
+    let (d1, d2) = (dir.join("d1.hset"), dir.join("d2.hset"));
+    setop_ok("subtract", &a, &b, &d1, &[], &[]);
+    setop_ok("difference", &a, &b, &d2, &[], &[]);
+    assert_eq!(
+        stdout(&run(&["dump", p(&d1)])),
+        stdout(&run(&["dump", p(&d2)]))
+    );
+    assert_eq!(tlsh_parts(&d1), tlsh_parts(&d2));
+    assert_eq!(stdout(&run(&["dump", p(&d1)])).lines().count(), 30);
+}
+
+#[test]
+fn tlsh_index_flag_inherits_writes_or_omits_the_index() {
+    let dir = tmpdir("setop-tlsh-index");
+    let (a, bare) = tlsh_halves(&dir, &[], &["--no-tlsh-index"]);
+    let b = dir.join("b-indexed.hset");
+    let text = hset_testkit::tlsh::example_text(false);
+    let lines: Vec<&str> = text.lines().collect();
+    make_text(&b, "md5,tlsh", &(lines[30..].join("\n") + "\n"), &[]);
+    let out = dir.join("o.hset");
+    // inherit (the default): an index only when every input has one
+    for extra in [&[][..], &["--tlsh-index", "inherit"][..]] {
+        setop_ok("union", &a, &bare, &out, extra, &[]);
+        assert_eq!(tlsh_info_line(&out), NO_INDEX, "{extra:?}");
+        setop_ok("union", &a, &b, &out, extra, &[]);
+        assert!(tivf_lists(&out).is_some(), "{extra:?}");
+    }
+    // write: built from the merged rows when an input lacks one
+    setop_ok("union", &a, &bare, &out, &["--tlsh-index", "write"], &[]);
+    assert!(tivf_lists(&out).is_some());
+    let lib = dir.join("lib.hset");
+    let mut opts = hset::merge::MergeOptions::new("", "");
+    opts.tlsh_index = hset::merge::TlshIndexPolicy::Write;
+    library_merge(hset::SetOp::Union, &a, &bare, &opts, &lib);
+    assert_eq!(tlsh_parts(&out), tlsh_parts(&lib));
+    // omit: never, the cell hint still written
+    setop_ok("union", &a, &b, &out, &["--tlsh-index", "omit"], &[]);
+    assert_eq!(tlsh_info_line(&out), NO_INDEX);
+    let o = setop("union", &a, &b, &out, &["--tlsh-index", "kmeans"], &[]);
+    assert_eq!(o.status.code(), Some(2), "{}", stderr(&o));
+}
+
+#[test]
+fn set_operations_read_hset_tlsh_options_as_hsetop_does() {
+    let dir = tmpdir("setop-tlsh-env");
+    let (a, bare) = tlsh_halves(&dir, &[], &["--no-tlsh-index"]);
+    let out = dir.join("o.hset");
+    // 0 none, 2 (INDEX) write, 4 (INHERIT) inherit, INHERIT winning over
+    // INDEX; bit 1 is ignored
+    for (value, indexed) in [
+        ("0", false),
+        ("1", false),
+        ("2", true),
+        ("3", true),
+        ("4", false),
+        ("6", false),
+    ] {
+        setop_ok(
+            "union",
+            &a,
+            &bare,
+            &out,
+            &[],
+            &[("HSET_TLSH_OPTIONS", value)],
+        );
+        assert_eq!(
+            tivf_lists(&out).is_some(),
+            indexed,
+            "HSET_TLSH_OPTIONS={value}"
+        );
+    }
+    setop_ok("union", &a, &a, &out, &[], &[("HSET_TLSH_OPTIONS", "0")]);
+    assert_eq!(tivf_lists(&out), None);
+    // the flag wins over the variable, which is then not read at all
+    for value in ["2", "junk"] {
+        let env = [("HSET_TLSH_OPTIONS", value)];
+        setop_ok("union", &a, &bare, &out, &["--tlsh-index", "omit"], &env);
+        assert_eq!(tivf_lists(&out), None, "{value}");
+    }
+    // not a nonnegative decimal integer (ruling 4), the k-means bit, unknown
+    // bits
+    for value in [
+        "-1",
+        "abc",
+        "",
+        " 2",
+        "+2",
+        "0x2",
+        "4294967296",
+        "8",
+        "10",
+        "16",
+    ] {
+        let o = setop(
+            "union",
+            &a,
+            &bare,
+            &out,
+            &[],
+            &[("HSET_TLSH_OPTIONS", value)],
+        );
+        assert_eq!(o.status.code(), Some(2), "HSET_TLSH_OPTIONS={value:?}");
+        assert!(
+            stderr(&o).contains("HSET_TLSH_OPTIONS"),
+            "{value:?}: {}",
+            stderr(&o)
+        );
+    }
+}
+
+/// A `tlsh`-only text of `n` random digests in the single header cell
+/// (L 50, Q 0x23), from `seed`.
+fn one_cell_text(seed: u64, n: usize) -> String {
+    let mut rng = hset::synth::SplitMix64::new(seed);
+    (0..n)
+        .map(|_| hset_testkit::tlsh::random_digest_with_header(&mut rng, 50, 2, 3).to_hex() + "\n")
+        .collect()
+}
+
+#[test]
+fn coalesce_threshold_comes_from_the_flag_or_hset_coalesce() {
+    let dir = tmpdir("setop-coalesce");
+    // a master and a batch whose rows share one cell: a list each, both
+    // below half the default threshold 64
+    let (master, batch) = (dir.join("master.hset"), dir.join("batch.hset"));
+    make_text(&master, "tlsh", &one_cell_text(1, 10), &[]);
+    make_text(&batch, "tlsh", &one_cell_text(2, 10), &[]);
+    assert_eq!(
+        (tivf_lists(&master), tivf_lists(&batch)),
+        (Some(1), Some(1))
+    );
+    let out = dir.join("o.hset");
+    for (extra, env, lists) in [
+        (&[][..], &[][..], 1),
+        (&["--coalesce", "0"][..], &[][..], 2),
+        (&["--coalesce", "64"][..], &[][..], 1),
+        (&[][..], &[("HSET_COALESCE", "0")][..], 2),
+        (&[][..], &[("HSET_COALESCE", "64")][..], 1),
+        (&["--coalesce", "64"][..], &[("HSET_COALESCE", "0")][..], 1),
+        (
+            &["--coalesce", "0"][..],
+            &[("HSET_COALESCE", "junk")][..],
+            2,
+        ),
+    ] {
+        setop_ok("union", &master, &batch, &out, extra, env);
+        assert_eq!(tivf_lists(&out), Some(lists), "{extra:?} {env:?}");
+    }
+    for value in ["-1", "abc", "", " 1", "+5", "0x10", "4294967296"] {
+        let o = setop(
+            "union",
+            &master,
+            &batch,
+            &out,
+            &[],
+            &[("HSET_COALESCE", value)],
+        );
+        assert_eq!(o.status.code(), Some(2), "HSET_COALESCE={value:?}");
+        assert!(
+            stderr(&o).contains("HSET_COALESCE"),
+            "{value:?}: {}",
+            stderr(&o)
+        );
+        let o = setop("union", &master, &batch, &out, &["--coalesce", value], &[]);
+        assert_eq!(o.status.code(), Some(2), "--coalesce {value:?}");
+        assert!(stderr(&o).contains("coalesce"), "{value:?}: {}", stderr(&o));
+    }
+}
+
+/// The lines `hset dump f extra..` prints, as a set.
+fn dump_set(f: &Path, extra: &[&str]) -> std::collections::BTreeSet<String> {
+    let mut args = vec!["dump", p(f)];
+    args.extend_from_slice(extra);
+    let o = run(&args);
+    assert!(o.status.success(), "{}", stderr(&o));
+    stdout(&o).lines().map(str::to_string).collect()
+}
+
+#[test]
+fn set_operations_widen_fields_and_merge_differently_shaped_inputs() {
+    let dir = tmpdir("setop-widen");
+    const MD5_C: &str = "88888888888888888888888888888888";
+    let (x, y) = (dir.join("x.hset"), dir.join("y.hset"));
+    make_text(&x, "md5,size", &format!("{MD5_A} 10\n{MD5_B} 20\n"), &[]);
+    make_text(&y, "md5", &format!("{MD5_A}\n{MD5_C}\n"), &[]);
+    // records widened to left's fields then right's extras; a record with
+    // the size absent is not one with a size
+    let out = dir.join("u.hset");
+    for (l, r) in [(&x, &y), (&y, &x)] {
+        setop_ok("union", l, r, &out, &[], &[]);
+        let info = stdout(&run(&["info", p(&out)]));
+        assert!(info.contains("records:     4 x 26 bytes"), "{info}");
+        let fields: Vec<&str> = info
+            .lines()
+            .filter_map(|l| l.strip_prefix("  field "))
+            .map(|l| l.split_whitespace().next().unwrap())
+            .collect();
+        assert_eq!(fields, ["md5", "sizes"]);
+        assert_eq!(
+            stdout(&run(&["dump", p(&out)])),
+            format!("{MD5_A} \n{MD5_A} 10\n{MD5_C} \n{MD5_B} 20\n")
+        );
+    }
+    setop_ok("intersect", &x, &y, &out, &[], &[]);
+    assert!(stdout(&run(&["info", p(&out)])).contains("records:     0 x 26 bytes"));
+
+    // a side without records gives a hashsets-only output, a section per
+    // type of either input (left's first), each the set union of the rows
+    let (good, rec) = (fixture("good.hset"), fixture("md5_sha1_a.hset"));
+    setop_ok("union", &good, &rec, &out, &[], &[]);
+    let info = stdout(&run(&["info", p(&out)]));
+    assert!(info.contains("records:     none"), "{info}");
+    assert!(
+        info.contains("[0] sha1") && info.contains("[1] md5"),
+        "{info}"
+    );
+    let sha1: std::collections::BTreeSet<String> = dump_set(&good, &["-t", "sha1"])
+        .union(&dump_set(&rec, &["-t", "sha1"]))
+        .cloned()
+        .collect();
+    assert_eq!(dump_set(&out, &["-t", "sha1"]), sha1);
+    assert_eq!(
+        dump_set(&out, &["-t", "md5"]),
+        dump_set(&rec, &["-t", "md5"])
+    );
+    // --no-records on two record files: each row once
+    setop_ok("union", &x, &y, &out, &["--no-records"], &[]);
+    assert_eq!(
+        stdout(&run(&["dump", p(&out), "-t", "md5"])),
+        format!("{MD5_A}\n{MD5_C}\n{MD5_B}\n")
+    );
+    // --no-hashsets: the record table only
+    setop_ok("union", &x, &y, &out, &["--no-hashsets"], &[]);
+    let info = stdout(&run(&["info", p(&out)]));
+    assert!(
+        info.contains("sections:    0") && info.contains("records:     4"),
+        "{info}"
+    );
+}
+
+#[test]
+fn set_operations_refuse_records_only_against_sections_and_nothing_to_write() {
+    let dir = tmpdir("setop-refuse");
+    let (two, ro) = (dir.join("two.hset"), dir.join("ro.hset"));
+    make_two(&two, &[]);
+    make_two(&ro, &["--no-hashsets"]);
+    let out = dir.join("o.hset");
+    let refused = |l: &Path, r: &Path, extra: &[&str], want: &str| {
+        let o = setop("union", l, r, &out, extra, &[]);
+        assert_eq!(o.status.code(), Some(2), "{extra:?}: {}", stderr(&o));
+        assert!(stderr(&o).contains(want), "{extra:?}: {}", stderr(&o));
+    };
+    let records_only = "cannot merge a records-only hashset with one that has hash sections";
+    refused(&ro, &two, &[], records_only);
+    refused(&two, &ro, &[], records_only);
+    let nothing = "neither records nor hash sections are to be written";
+    refused(&two, &two, &["--no-records", "--no-hashsets"], nothing);
+    refused(&ro, &ro, &["--no-records"], nothing);
+    refused(&fixture("good.hset"), &two, &["--no-hashsets"], nothing);
+    // two records-only files merge to a records-only file
+    setop_ok("union", &ro, &ro, &out, &[], &[]);
+    let info = stdout(&run(&["info", p(&out)]));
+    assert!(
+        info.contains("records:     2 x 38 bytes") && info.contains("sections:    0"),
+        "{info}"
+    );
 }

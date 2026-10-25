@@ -10,12 +10,13 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
 use hset::format::{self, Document, HashsetIn, HsetFile};
 use hset::hashset::KnnStrategy;
 use hset::lookup::{self, BatchMode, BitsPolicy, HintSpec, SearchConfig, SingleMode};
+use hset::merge::{MergeOptions, TlshIndexPolicy, merge};
 use hset::tlsh::cells::{cell_index, cell_table};
 use hset::tlsh::{
     CELL_HINT_TAG, DIGEST_LENGTH as TLSH_LENGTH, IvfBuildOptions, IvfIndex, KnnStats, TivfView,
     TlshDigest, build_tlsh_ivf,
 };
-use hset::{BuildOptions, Builder, HashType, Hashset, SetOp, builder, hex, ops, synth};
+use hset::{BuildOptions, Builder, HashType, Hashset, SetOp, builder, hex, synth};
 
 #[derive(Parser)]
 #[command(name = "hset", version, about = "Make and query .hset hash-set files", long_about = None)]
@@ -56,11 +57,18 @@ enum Cmd {
     Knn(KnnArgs),
     /// Check digest, ordering, record links, hint soundness, and TLSH cell hints and indexes
     Verify(FileArg),
-    /// Union of two hash sets
+    /// Union of two hash sets, by merging their sorted sections
+    ///
+    /// The output has a record table only when both inputs do, with the
+    /// left's fields then the right's extras, and the operation applies to
+    /// the records; otherwise it is hashsets-only, with a section per type
+    /// of either input. A TLSH section's cell hint is recomputed and its
+    /// TIVF index merged (see --tlsh-index and --coalesce).
     Union(SetOpArgs),
-    /// Intersection of two hash sets
+    /// Intersection of two hash sets, by merging (see `union`)
     Intersect(SetOpArgs),
-    /// Records of the first hash set not in the second
+    /// The first hash set minus the second, by merging (see `union`)
+    #[command(alias = "difference")]
     Subtract(SetOpArgs),
     /// Rewrite a file with different hints or metadata (a TLSH section keeps its cell hint and TIVF index)
     Reindex(ReindexArgs),
@@ -188,8 +196,37 @@ struct MakeArgs {
     inputs: Vec<PathBuf>,
 }
 
-/// The environment variable `mkhashset` reads its TLSH option bits from.
+/// The environment variable `mkhashset` and `hsetop` read their TLSH
+/// option bits from.
 const TLSH_OPTIONS_ENV: &str = "HSET_TLSH_OPTIONS";
+
+/// The environment variable `hsetop` reads its coalescing threshold from.
+const COALESCE_ENV: &str = "HSET_COALESCE";
+
+/// A nonnegative decimal `u32`: digits only, no sign, space or prefix
+/// (ruling 4; the C++ tools' `lexical_cast<uint32_t>` accepts `-1` as
+/// 4294967295).
+fn parse_count(text: &str) -> Result<u32, String> {
+    text.bytes()
+        .all(|b| b.is_ascii_digit())
+        .then(|| text.parse::<u32>().ok())
+        .flatten()
+        .ok_or_else(|| format!("not a nonnegative integer: '{text}'"))
+}
+
+/// Environment variable `name`'s `value` as [`parse_count`] reads it, an
+/// error naming the variable.
+fn env_count(name: &str, value: &std::ffi::OsStr) -> CliResult<u32> {
+    value
+        .to_str()
+        .and_then(|v| parse_count(v).ok())
+        .ok_or_else(|| {
+            format!(
+                "{name} is not a nonnegative integer: '{}'",
+                value.to_string_lossy()
+            )
+        })
+}
 
 /// `opts` with the TLSH index choice of `make`: none with
 /// `--no-tlsh-index` (the environment is then not read), else the bits of
@@ -208,16 +245,7 @@ fn make_tlsh_options(
     let Some(value) = env else {
         return Ok(opts);
     };
-    let bits = value
-        .to_str()
-        .filter(|v| v.bytes().all(|b| b.is_ascii_digit()))
-        .and_then(|v| v.parse::<u32>().ok())
-        .ok_or_else(|| {
-            format!(
-                "{TLSH_OPTIONS_ENV} is not a nonnegative integer: '{}'",
-                value.to_string_lossy()
-            )
-        })?;
+    let bits = env_count(TLSH_OPTIONS_ENV, &value)?;
     opts.tlsh_options(bits)
         .map_err(|e| format!("{TLSH_OPTIONS_ENV}: {e}"))
 }
@@ -309,12 +337,34 @@ struct QueryArgs {
     hashes: Vec<String>,
 }
 
+#[derive(Clone, Copy, Debug, ValueEnum, PartialEq, Eq)]
+enum TlshIndexKind {
+    /// Write it iff every input with the TLSH section has one
+    Inherit,
+    /// Always write it, built from the merged rows when an input lacks one
+    Write,
+    /// Never write it
+    Omit,
+}
+
 #[derive(Args)]
 struct SetOpArgs {
     left: PathBuf,
     right: PathBuf,
     #[command(flatten)]
     out: OutputArgs,
+    /// Whether the TLSH section gets a TIVF kNN index. Without this flag,
+    /// HSET_TLSH_OPTIONS is read as hsetop reads it: a nonnegative integer
+    /// of option bits, 4 to inherit (the default when unset; it wins over
+    /// 2), 2 to write, 0 for none; 1 is ignored, and 8 (k-means build) or
+    /// any other bit is an error
+    #[arg(long, value_enum)]
+    tlsh_index: Option<TlshIndexKind>,
+    /// Coalescing threshold C of a merged TIVF index: per header cell,
+    /// lists of fewer than C/2 rows are coalesced; 0 disables coalescing
+    /// [default: HSET_COALESCE when set, else 64]
+    #[arg(long, value_parser = parse_count, allow_negative_numbers = true)]
+    coalesce: Option<u32>,
 }
 
 #[derive(Args)]
@@ -893,20 +943,60 @@ fn cmd_verify(a: FileArg) -> CliResult<ExitCode> {
     }
 }
 
+/// The merge options of a set operation: `a.out`'s name, timestamp, write
+/// flags, hint and budget, and the description `desc`; the TLSH index
+/// policy of `--tlsh-index`, else of `HSET_TLSH_OPTIONS` (`tlsh_env`) when
+/// it is set, else inherited; the coalescing threshold of `--coalesce`,
+/// else of `HSET_COALESCE` (`coalesce_env`), else the default. A variable
+/// is read only when its flag is absent.
+fn setop_options(
+    a: &SetOpArgs,
+    desc: String,
+    tlsh_env: Option<std::ffi::OsString>,
+    coalesce_env: Option<std::ffi::OsString>,
+) -> CliResult<MergeOptions> {
+    let mut o = MergeOptions::new(a.out.name.clone(), desc);
+    o.timestamp = a.out.timestamp.clone();
+    o.write_records = !a.out.no_records;
+    o.write_hashsets = !a.out.no_hashsets;
+    o.hint = a.out.hint_spec();
+    o.bits_policy = BitsPolicy {
+        budget: a.out.budget,
+        ..BitsPolicy::default()
+    };
+    o.tlsh_index = match (a.tlsh_index, tlsh_env) {
+        (Some(TlshIndexKind::Inherit), _) => TlshIndexPolicy::Inherit,
+        (Some(TlshIndexKind::Write), _) => TlshIndexPolicy::Write,
+        (Some(TlshIndexKind::Omit), _) => TlshIndexPolicy::Omit,
+        (None, Some(v)) => TlshIndexPolicy::from_tlsh_options(env_count(TLSH_OPTIONS_ENV, &v)?)
+            .map_err(|e| format!("{TLSH_OPTIONS_ENV}: {e}"))?,
+        (None, None) => TlshIndexPolicy::Inherit,
+    };
+    match (a.coalesce, coalesce_env) {
+        (Some(c), _) => o.coalesce_threshold = c,
+        (None, Some(v)) => o.coalesce_threshold = env_count(COALESCE_ENV, &v)?,
+        (None, None) => {}
+    }
+    Ok(o)
+}
+
 fn cmd_setop(op: SetOp, a: SetOpArgs) -> CliResult<()> {
     let ml = map_file(&a.left)?;
     let mr = map_file(&a.right)?;
-    let fl = format::decode(&ml).map_err(|e| format!("{}: {e}", a.left.display()))?;
-    let fr = format::decode(&mr).map_err(|e| format!("{}: {e}", a.right.display()))?;
-    let b = ops::apply(op, &fl, &fr).map_err(|e| e.to_string())?;
+    let hl = load(&ml, &a.left)?;
+    let hr = load(&mr, &a.right)?;
     let desc = if a.out.desc.is_empty() {
-        format!("{} of '{}' and '{}'", op.name(), fl.fhdr.name, fr.fhdr.name)
+        format!("{} of '{}' and '{}'", op.name(), hl.name(), hr.name())
     } else {
         a.out.desc.clone()
     };
-    let bytes = b
-        .build(&a.out.options(None, Some(&desc)))
-        .map_err(|e| e.to_string())?;
+    let opts = setop_options(
+        &a,
+        desc,
+        std::env::var_os(TLSH_OPTIONS_ENV),
+        std::env::var_os(COALESCE_ENV),
+    )?;
+    let bytes = merge(op, &hl, &hr, &opts).map_err(|e| e.to_string())?;
     write_output(&a.out.output, &bytes)?;
     summarize(&bytes, &a.out.output)
 }
