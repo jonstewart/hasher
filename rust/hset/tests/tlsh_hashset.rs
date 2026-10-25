@@ -8,7 +8,8 @@
 //!
 //! Debug builds are slow: only one test builds an index over 5000 rows.
 
-use hset::hashset::{KnnStrategies, KnnStrategy};
+use hset::format::Hint;
+use hset::hashset::{IndexReport, KnnStrategies, KnnStrategy, TlshReport};
 use hset::tlsh::{IvfIndex, KnnStats, TlshDigest, TlshMatch, knn_brute};
 use hset::{BuildOptions, Builder, Error, HashType, Hashset};
 use hset_testkit::tlsh::{Perturbation, corpus, fake_md5, naive_knn, perturb_corpus};
@@ -280,6 +281,102 @@ fn invalid_tivf_ids_fail_index_searches_but_not_brute_force() {
         hs.tlsh_knn_with(t, &q, 5, 200, true, KnnStrategy::Brute, None)
             .unwrap(),
         naive_knn(rows, &q, 5, 200, true)
+    );
+}
+
+/// `verify` reports, per TLSH section, that the cell hint is the cell
+/// index of the rows and the TIVF index is valid, and nothing TLSH for
+/// other sections.
+#[test]
+fn verify_checks_the_cell_hint_and_the_tivf_of_a_sound_file() {
+    let (bytes, _) = indexed_file();
+    let hs = Hashset::load(&bytes).unwrap();
+    let t = tidx(&hs);
+    let lists = hs.tlsh_index(t).unwrap().unwrap().lists();
+    assert!(lists > 1, "{lists}");
+    let report = hs.verify();
+    assert!(report.is_ok(), "{:?}", report.problems);
+    assert_eq!(
+        report.sections[t].tlsh,
+        Some(TlshReport {
+            cells_exact: Some(true),
+            index: Some(IndexReport { lists, valid: true }),
+        })
+    );
+    let m = hs.index_for_type(HashType::Md5).unwrap();
+    assert_eq!(report.sections[m].tlsh, None);
+
+    // without an index
+    let bytes = md5_tlsh_file(&corpus(6, 300), &opts().tlsh_index(false));
+    let hs = Hashset::load(&bytes).unwrap();
+    let report = hs.verify();
+    assert!(report.is_ok(), "{:?}", report.problems);
+    assert_eq!(
+        report.sections[tidx(&hs)].tlsh,
+        Some(TlshReport {
+            cells_exact: Some(true),
+            index: None,
+        })
+    );
+}
+
+/// An invalid TIVF index is a `verify` problem naming the index.
+#[test]
+fn verify_reports_an_invalid_tivf() {
+    let bytes = file_with_a_bad_tivf_id();
+    let hs = Hashset::load(&bytes).unwrap();
+    let t = tidx(&hs);
+    let report = hs.verify();
+    let tivf: Vec<&String> = report
+        .problems
+        .iter()
+        .filter(|p| p.contains("TIVF"))
+        .collect();
+    assert_eq!(tivf.len(), 1, "{:?}", report.problems);
+    assert!(tivf[0].starts_with("tlsh: "), "{}", tivf[0]);
+    assert!(tivf[0].contains("out of range"), "{}", tivf[0]);
+    let index = report.sections[t].tlsh.unwrap().index.unwrap();
+    assert!(!index.valid);
+    // validation ran once; searching still reports it
+    assert!(matches!(hs.tlsh_index(t), Err(Error::Format(_))));
+}
+
+/// A cell hint that still loads (offsets from 0 to n, nondecreasing) but
+/// is not the rows' cell index is a `verify` problem.
+#[test]
+fn verify_reports_a_cell_hint_that_is_not_the_cell_index() {
+    let (mut bytes, _) = indexed_file();
+    let hs = Hashset::load(&bytes).unwrap();
+    let t = tidx(&hs);
+    let Some(Hint::TlshCells { table }) = hs.section(t).hint else {
+        panic!("no cell hint");
+    };
+    let at = offset_in(&bytes, table);
+    let offsets: Vec<u64> = table
+        .as_chunks::<8>()
+        .0
+        .iter()
+        .map(|b| u64::from_le_bytes(*b))
+        .collect();
+    // a cell after the first with two rows or more: moving its start up
+    // one row keeps the offsets nondecreasing
+    let c = (1..65536)
+        .find(|&c| offsets[c + 1] >= offsets[c] + 2)
+        .unwrap();
+    drop(hs);
+    let entry = at + 8 * c;
+    bytes[entry..entry + 8].copy_from_slice(&(offsets[c] + 1).to_le_bytes());
+
+    let hs = Hashset::load(&bytes).unwrap();
+    let report = hs.verify();
+    assert_eq!(report.sections[t].tlsh.unwrap().cells_exact, Some(false));
+    assert!(
+        report
+            .problems
+            .iter()
+            .any(|p| p.starts_with("tlsh: ") && p.contains("cell index")),
+        "{:?}",
+        report.problems
     );
 }
 

@@ -37,9 +37,10 @@ use std::ops::Range;
 use std::sync::OnceLock;
 
 use crate::error::{Error, Result};
-use crate::format::{self, FieldDescriptor, HsetFile, RecordHeader, Section};
+use crate::format::{self, FieldDescriptor, Hint, HsetFile, RecordHeader, Section};
 use crate::hash_type::HashType;
 use crate::lookup::{self, Lookup, SearchConfig};
+use crate::tlsh::cells::{cell_index, cell_table};
 use crate::tlsh::{
     DIGEST_LENGTH, IvfIndex, KnnStats, TivfView, TlshDigest, TlshMatch, ValidIvf, knn_brute,
     knn_ivf,
@@ -466,7 +467,42 @@ impl<'a> Hashset<'a> {
         }
     }
 
-    /// Check structural invariants: digest, sortedness, hint soundness.
+    /// The TLSH checks of [`verify`](Self::verify) for section `idx`, its
+    /// problems appended to `problems`; `None` for a section that is not
+    /// TLSH.
+    fn verify_tlsh(&self, idx: usize, problems: &mut Vec<String>) -> Option<TlshReport> {
+        let part = self.tlsh[idx].as_ref()?;
+        let s = &self.file.sections[idx];
+        let cells_exact = match s.hint {
+            // rows out of order have no cell index (and are reported as
+            // unsorted already)
+            Some(Hint::TlshCells { table }) => {
+                Some(cell_index(part.rows).is_ok_and(|cells| cell_table(&cells) == table))
+            }
+            _ => None,
+        };
+        if cells_exact == Some(false) {
+            problems.push(format!(
+                "{}: TLSH cell hint is not the cell index of the rows",
+                s.header.name
+            ));
+        }
+        let index = part.tivf.map(|view| {
+            let valid = self.tlsh_index(idx).is_ok();
+            if let Some(Err(e)) = part.valid.get() {
+                problems.push(format!("{}: invalid TIVF index: {e}", s.header.name));
+            }
+            IndexReport {
+                lists: view.lists(),
+                valid,
+            }
+        });
+        Some(TlshReport { cells_exact, index })
+    }
+
+    /// Check structural invariants: digest, sortedness, hint soundness,
+    /// and for TLSH sections that the cell hint is the cell index of the
+    /// rows and the `TIVF` index is valid ([`TlshReport`]).
     pub fn verify(&self) -> VerifyReport {
         let mut report = VerifyReport {
             digest_ok: self.verify_digest(),
@@ -510,6 +546,7 @@ impl<'a> Hashset<'a> {
                 max_window: 0,
                 mean_window: 0.0,
                 table_bytes: lk.table_bytes(),
+                tlsh: None,
             };
             let mut total_window = 0u128;
             let mut bad_ridx = 0usize;
@@ -558,6 +595,7 @@ impl<'a> Hashset<'a> {
                     s.header.name
                 ));
             }
+            sr.tlsh = self.verify_tlsh(idx, &mut report.problems);
             report.sections.push(sr);
         }
         report
@@ -578,6 +616,28 @@ pub struct SectionReport {
     pub max_window: usize,
     pub mean_window: f64,
     pub table_bytes: usize,
+    /// The TLSH checks, for a TLSH section of 36-byte rows; `None` for
+    /// any other section.
+    pub tlsh: Option<TlshReport>,
+}
+
+/// The TLSH findings of [`Hashset::verify`] for one section.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TlshReport {
+    /// The `0x7400` cell hint is exactly the cell index recomputed from
+    /// the rows; `None` when the section has no cell hint.
+    pub cells_exact: Option<bool>,
+    /// The `TIVF` index, if the file has one for the section.
+    pub index: Option<IndexReport>,
+}
+
+/// The `TIVF` index of a TLSH section, as [`Hashset::verify`] found it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct IndexReport {
+    /// Number of lists (the header's count).
+    pub lists: usize,
+    /// It passed the full validation ([`Hashset::tlsh_index`]).
+    pub valid: bool,
 }
 
 /// Result of [`Hashset::verify`].
