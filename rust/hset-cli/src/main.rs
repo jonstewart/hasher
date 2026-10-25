@@ -1023,12 +1023,17 @@ fn cmd_bench(a: BenchArgs) -> CliResult<()> {
     if a.compare {
         let basic = lookup::make_lookup_with(hl, s.data, None, cfg).map_err(|e| e.to_string())?;
         run(basic.as_ref(), "no hint (auto search)");
-        let legacy = lookup::build_hint(hl, s.data, HintSpec::LEGACY).map_err(|e| e.to_string())?;
-        if let Some((t, b)) = &legacy {
-            let h = lookup::hint_from_parts(*t, b);
-            let lk =
-                lookup::make_lookup_with(hl, s.data, Some(&h), cfg).map_err(|e| e.to_string())?;
-            run(lk.as_ref(), "legacy block8 hint");
+        // The legacy table exists only for some hash lengths (not for
+        // 36-byte TLSH rows, which always use their cell index).
+        match lookup::build_hint(hl, s.data, HintSpec::LEGACY) {
+            Ok(Some((t, b))) => {
+                let h = lookup::hint_from_parts(t, &b);
+                let lk = lookup::make_lookup_with(hl, s.data, Some(&h), cfg)
+                    .map_err(|e| e.to_string())?;
+                run(lk.as_ref(), "legacy block8 hint");
+            }
+            Ok(None) => {}
+            Err(e) => out!("{:<28} skipped: {e}", "legacy block8 hint"),
         }
     }
     Ok(())

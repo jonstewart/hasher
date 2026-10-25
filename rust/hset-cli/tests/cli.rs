@@ -276,6 +276,30 @@ fn bench_runs_and_agrees() {
 }
 
 #[test]
+fn bench_compare_on_a_tlsh_section_skips_the_legacy_hint() {
+    let dir = tmpdir("tlsh-bench");
+    let f = dir.join("t.hset");
+    made_tlsh(&f, &[]);
+    let o = run(&[
+        "bench",
+        p(&f),
+        "-t",
+        "tlsh",
+        "--queries",
+        "2000",
+        "--compare",
+        "--hit-fraction",
+        "1",
+    ]);
+    assert!(o.status.success(), "{}", stderr(&o));
+    let s = stdout(&o);
+    assert!(s.contains("tlsh cell index"), "{s}");
+    assert_eq!(s.matches("hits 2000/2000").count(), 2, "{s}");
+    assert!(s.contains("legacy block8 hint"), "{s}");
+    assert!(s.contains("skipped"), "{s}");
+}
+
+#[test]
 fn errors_are_reported() {
     let o = run(&["info", p(&fixture("bogus.hset"))]);
     assert_eq!(o.status.code(), Some(2));
