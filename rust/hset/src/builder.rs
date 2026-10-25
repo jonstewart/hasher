@@ -305,6 +305,7 @@ impl Builder {
                     data: &p.data,
                     hint: p.hint.as_ref().map(|(t, b)| (*t, b.as_slice())),
                     ridx: p.ridx.as_deref(),
+                    tivf: None,
                 })
                 .collect(),
         };

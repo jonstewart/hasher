@@ -75,6 +75,7 @@ fn main() -> ExitCode {
             data: &data,
             hint: hint.as_ref().map(|(t, b)| (*t, b.as_slice())),
             ridx: None,
+            tivf: None,
         }],
     };
     let bytes = encode(&doc).expect("encode");

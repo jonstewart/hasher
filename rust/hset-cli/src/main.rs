@@ -688,6 +688,7 @@ fn reindex_sections_only(
                 data: s.data,
                 hint: h.as_ref().map(|(t, b)| (*t, b.as_slice())),
                 ridx: None,
+                tivf: None,
             })
             .collect(),
     };

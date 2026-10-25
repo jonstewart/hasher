@@ -89,6 +89,9 @@ pub const fn hint_tag_hull(bits: u8) -> u16 {
     0x6800 | bits as u16
 }
 
+/// Hint type tag of the TLSH cell index ([`crate::tlsh::CELL_HINT_TAG`]).
+pub const HINT_TLSH_CELLS: u16 = crate::tlsh::CELL_HINT_TAG;
+
 /// Bytes per entry of a flat block table (`min i64`, `max i64`).
 pub const BLOCK_ENTRY_LEN: usize = 16;
 /// Bytes per entry of a hull table (`slope u32`, `rmin i32`, `rmax i32`).
@@ -104,6 +107,11 @@ pub enum Hint<'a> {
     Block { bits: u8, table: &'a [u8] },
     /// Per-block fixed-point line fitted via convex hull with exact residual bounds.
     Hull { bits: u8, table: &'a [u8] },
+    /// The TLSH cell index (tag `0x7400`): [`crate::tlsh::cells::CELL_INDEX_LEN`]
+    /// little-endian `u64` row offsets, one per (L, Q) cell plus the row
+    /// count. The decoder has checked it with
+    /// [`crate::tlsh::cells::CellIndex::parse`].
+    TlshCells { table: &'a [u8] },
     /// A hint this crate does not understand (ignored; lookups fall back to binary search).
     Unknown { tag: u16, data: &'a [u8] },
 }
@@ -114,6 +122,7 @@ impl Hint<'_> {
         match self {
             Hint::Block { bits, .. } => hint_tag_block(*bits),
             Hint::Hull { bits, .. } => hint_tag_hull(*bits),
+            Hint::TlshCells { .. } => HINT_TLSH_CELLS,
             Hint::Unknown { tag, .. } => *tag,
         }
     }
@@ -127,6 +136,9 @@ impl Hint<'_> {
             Hint::Hull { bits, .. } => {
                 format!("hull{bits} (convex-hull lines, {} entries)", 1usize << bits)
             }
+            Hint::TlshCells { table } => {
+                format!("tlsh cells (cell index, {} offsets)", table.len() / 8)
+            }
             Hint::Unknown { tag, data } => format!("unknown 0x{tag:04x} ({} bytes)", data.len()),
         }
     }
@@ -134,7 +146,9 @@ impl Hint<'_> {
     /// Size in bytes of the hint data including the 2-byte tag.
     pub fn byte_len(&self) -> usize {
         2 + match self {
-            Hint::Block { table, .. } | Hint::Hull { table, .. } => table.len(),
+            Hint::Block { table, .. } | Hint::Hull { table, .. } | Hint::TlshCells { table } => {
+                table.len()
+            }
             Hint::Unknown { data, .. } => data.len(),
         }
     }
@@ -149,6 +163,9 @@ pub struct Section<'a> {
     pub data: &'a [u8],
     /// `hash_count` little-endian `u64` record indices, if present.
     pub ridx: Option<&'a [u8]>,
+    /// The raw payload of a TLSH section's `TIVF` index chunk, if present;
+    /// [`crate::tlsh::ivf`] parses it.
+    pub tivf: Option<&'a [u8]>,
 }
 
 impl<'a> Section<'a> {
@@ -257,6 +274,7 @@ mod tests {
             hint: None,
             data: &[],
             ridx: None,
+            tivf: None,
         };
         assert!(section(0).is_empty());
         assert!(!section(1).is_empty());

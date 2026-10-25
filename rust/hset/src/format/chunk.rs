@@ -22,6 +22,10 @@ pub const HDAT: u32 = 0x4844_4154;
 pub const HINT: u32 = 0x4849_4E54;
 pub const FLTR: u32 = 0x464C_5452;
 pub const RIDX: u32 = 0x5249_4458;
+/// TLSH inverted-file index; only after a TLSH section's `HDAT` / `RIDX`.
+pub const TIVF: u32 = 0x5449_5646;
+/// TLSH embedding vectors, written by older C++ builds; rejected.
+pub const TVEC: u32 = 0x5456_4543;
 pub const FEND: u32 = 0x4645_4E44;
 
 /// Is this an `HHnn` hash set header tag?

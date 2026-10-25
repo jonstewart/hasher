@@ -30,6 +30,9 @@ pub struct HashsetIn<'a> {
     pub hint: Option<(u16, &'a [u8])>,
     /// `hash_count` little-endian `u64` record indices.
     pub ridx: Option<&'a [u8]>,
+    /// The payload of a TLSH section's `TIVF` index, written after
+    /// `RIDX` (see [`crate::tlsh::ivf`]).
+    pub tivf: Option<&'a [u8]>,
 }
 
 /// Everything needed to write a file.
@@ -91,7 +94,11 @@ pub fn encode(doc: &Document<'_>) -> Result<Vec<u8>> {
         + doc
             .hashsets
             .iter()
-            .map(|h| 2 + usize::from(h.hint.is_some()) + usize::from(h.ridx.is_some()))
+            .map(|h| {
+                2 + usize::from(h.hint.is_some())
+                    + usize::from(h.ridx.is_some())
+                    + usize::from(h.tivf.is_some())
+            })
             .sum::<usize>()
         + 1; // FEND
 
@@ -100,7 +107,10 @@ pub fn encode(doc: &Document<'_>) -> Result<Vec<u8>> {
             .hashsets
             .iter()
             .map(|h| {
-                h.data.len() + h.ridx.map_or(0, <[u8]>::len) + h.hint.map_or(0, |(_, t)| t.len())
+                h.data.len()
+                    + h.ridx.map_or(0, <[u8]>::len)
+                    + h.tivf.map_or(0, <[u8]>::len)
+                    + h.hint.map_or(0, |(_, t)| t.len())
             })
             .sum::<usize>();
     let mut out =
@@ -164,6 +174,12 @@ pub fn encode(doc: &Document<'_>) -> Result<Vec<u8>> {
             let off = out.chunk(chunk::RIDX, |w| w.bytes(r));
             toc.push((off as u64, chunk::RIDX));
         }
+
+        // HDAT [RIDX] [TIVF], unpadded, as hset_encoder.cpp lays them out.
+        if let Some(t) = h.tivf {
+            let off = out.chunk(chunk::TIVF, |w| w.bytes(t));
+            toc.push((off as u64, chunk::TIVF));
+        }
     }
 
     let off = out.chunk(chunk::FEND, |_| {});
@@ -212,6 +228,7 @@ mod tests {
                 data: &hashes,
                 hint: None,
                 ridx: None,
+                tivf: None,
             }],
         };
         let bytes = encode(&doc).unwrap();
@@ -259,6 +276,7 @@ mod tests {
                 data: &[0u8; 17],
                 hint: None,
                 ridx: None,
+                tivf: None,
             }],
         };
         assert!(encode(&doc).is_err());
@@ -280,6 +298,7 @@ mod tests {
                 data: &[1, 2, 3, 4],
                 hint: None,
                 ridx: Some(&[0; 8]),
+                tivf: None,
             }],
         };
         let bytes = encode(&doc).unwrap();
@@ -311,5 +330,92 @@ mod tests {
                 "record length {record_length}"
             );
         }
+    }
+
+    /// Five sorted TLSH rows in cells 0x0000, 0x0000, 0x0102, 0x0102, 0xFFFF.
+    fn tlsh_rows() -> Vec<u8> {
+        let mut rows = vec![0u8; 5 * 36];
+        rows[36 * 2..36 * 2 + 2].copy_from_slice(&[1, 2]);
+        rows[36 * 3..36 * 3 + 2].copy_from_slice(&[1, 2]);
+        rows[36 * 3 + 34] = 1;
+        rows[36 * 4..36 * 4 + 2].copy_from_slice(&[0xff, 0xff]);
+        rows
+    }
+
+    fn tlsh_cell_table(rows: &[u8]) -> Vec<u8> {
+        use crate::tlsh::cells::{cell_index, cell_table};
+        cell_table(&cell_index(rows.as_chunks::<36>().0).unwrap())
+    }
+
+    fn tlsh_doc<'a>(
+        rows: &'a [u8],
+        table: &'a [u8],
+        ridx: Option<&'a [u8]>,
+        tivf: Option<&'a [u8]>,
+    ) -> Document<'a> {
+        Document {
+            version: FORMAT_VERSION,
+            name: "",
+            desc: "",
+            time: "",
+            records: None,
+            hashsets: vec![HashsetIn {
+                htype: HashType::Tlsh,
+                name: "tlsh",
+                hash_length: 36,
+                data: rows,
+                hint: Some((0x7400, table)),
+                ridx,
+                tivf,
+            }],
+        }
+    }
+
+    fn tags(f: &HsetFile<'_>) -> Vec<u32> {
+        f.toc.iter().map(|&(_, t)| t).collect()
+    }
+
+    #[test]
+    fn a_tlsh_section_round_trips_its_cell_hint_record_index_and_tivf() {
+        let rows = tlsh_rows();
+        let table = tlsh_cell_table(&rows);
+        let ridx: Vec<u8> = (0..5u64).rev().flat_map(u64::to_le_bytes).collect();
+        let tivf = b"thirteen byte";
+        let bytes = encode(&tlsh_doc(&rows, &table, Some(&ridx), Some(tivf))).unwrap();
+        let f = decode(&bytes).unwrap();
+        let s = &f.sections[0];
+        assert_eq!(s.header.htype, HashType::Tlsh);
+        assert_eq!(s.data, &rows[..]);
+        assert!(matches!(s.hint, Some(Hint::TlshCells { table: t }) if t == &table[..]));
+        assert_eq!(s.ridx, Some(&ridx[..]));
+        assert_eq!(s.tivf, Some(&tivf[..]));
+        use chunk::*;
+        assert_eq!(
+            tags(&f),
+            [FTOC, FHDR, HHDR | 15, HINT, HDAT, RIDX, TIVF, FEND]
+        );
+        // The HINT is the tag and 65,537 offsets (test_hset_tlsh.cpp
+        // `length_hint_tlsh`: 2 + 65537 * 8 data bytes).
+        let hint = read_chunk(&bytes, f.toc[3].0 as usize).unwrap();
+        assert_eq!(hint.data.len(), 524298);
+        assert_eq!(&hint.data[..2], &[0x74, 0x00]);
+        // TIVF follows RIDX with no padding.
+        let (ridx_off, tivf_off) = (f.toc[5].0, f.toc[6].0);
+        assert_eq!(tivf_off, ridx_off + 12 + 40);
+        assert_eq!(read_chunk(&bytes, tivf_off as usize).unwrap().data, tivf);
+    }
+
+    #[test]
+    fn without_a_record_index_tivf_follows_hdat() {
+        let rows = tlsh_rows();
+        let table = tlsh_cell_table(&rows);
+        let tivf = [7u8; 4];
+        let bytes = encode(&tlsh_doc(&rows, &table, None, Some(&tivf))).unwrap();
+        let f = decode(&bytes).unwrap();
+        assert_eq!(f.sections[0].tivf, Some(&tivf[..]));
+        assert_eq!(f.sections[0].ridx, None);
+        use chunk::*;
+        assert_eq!(tags(&f), [FTOC, FHDR, HHDR | 15, HINT, HDAT, TIVF, FEND]);
+        assert_eq!(f.toc[5].0, f.toc[4].0 + 12 + rows.len() as u64);
     }
 }

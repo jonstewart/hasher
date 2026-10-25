@@ -4,6 +4,8 @@ use super::chunk::{self, Chunk, Cursor, read_chunk};
 use super::structs::*;
 use crate::error::{Error, Result};
 use crate::hash_type::HashType;
+use crate::tlsh::DIGEST_LENGTH;
+use crate::tlsh::cells::CellIndex;
 
 fn parse_fhdr(ch: &Chunk<'_>) -> Result<FileHeader> {
     let mut c = Cursor::new(ch.data, 0)?;
@@ -80,10 +82,27 @@ fn parse_hhdr(ch: &Chunk<'_>) -> Result<HashsetHeader> {
     })
 }
 
-fn parse_hint<'a>(ch: &Chunk<'a>) -> Result<Hint<'a>> {
+/// Decode a HINT chunk of the section `header`. Block and hull tables of
+/// the wrong size decode as [`Hint::Unknown`]; a TLSH cell index must be
+/// valid, and only on a TLSH section (C++ checks the length and offsets
+/// when it builds the lookup strategy, and the hash length; Rust also
+/// requires the type).
+fn parse_hint<'a>(ch: &Chunk<'a>, header: &HashsetHeader) -> Result<Hint<'a>> {
     let mut c = Cursor::new(ch.data, 0)?;
     let tag = c.be_u16()?;
     let rest = c.bytes(c.remaining())?;
+    if tag == HINT_TLSH_CELLS {
+        if header.htype != HashType::Tlsh || header.hash_length != DIGEST_LENGTH as u64 {
+            return Err(Error::format(format!(
+                "TLSH cell index hint on the {} hash set '{}' of hash length {}",
+                header.htype, header.name, header.hash_length
+            )));
+        }
+        let n = usize::try_from(header.hash_count)
+            .map_err(|_| Error::format("hash count overflows usize"))?;
+        CellIndex::parse(rest, n)?;
+        return Ok(Hint::TlshCells { table: rest });
+    }
     let family = (tag >> 8) as u8;
     let bits = (tag & 0xff) as u8;
     let hint = match family {
@@ -226,6 +245,7 @@ pub fn decode(buf: &[u8]) -> Result<HsetFile<'_>> {
                     hint: None,
                     data: &[],
                     ridx: None,
+                    tivf: None,
                 });
                 open = true;
             }
@@ -236,7 +256,7 @@ pub fn decode(buf: &[u8]) -> Result<HsetFile<'_>> {
                 if s.hint.is_some() {
                     return Err(unexpected("duplicate HINT"));
                 }
-                s.hint = Some(parse_hint(&ch)?);
+                s.hint = Some(parse_hint(&ch, &s.header)?);
             }
             chunk::FLTR => {
                 if !open {
@@ -259,6 +279,9 @@ pub fn decode(buf: &[u8]) -> Result<HsetFile<'_>> {
                 if s.ridx.is_some() {
                     return Err(unexpected("duplicate RIDX"));
                 }
+                if s.tivf.is_some() {
+                    return Err(unexpected("RIDX must precede TIVF"));
+                }
                 let expected = s
                     .header
                     .hash_count
@@ -266,6 +289,27 @@ pub fn decode(buf: &[u8]) -> Result<HsetFile<'_>> {
                     .ok_or_else(|| Error::format("record index size overflows"))?;
                 expect_len(&ch, expected)?;
                 s.ridx = Some(ch.data);
+            }
+            chunk::TIVF => {
+                // HDAT [RIDX] [TIVF]: the chunk before is this section's
+                // HDAT or RIDX.
+                let follows_data = i > 0 && matches!(toc[i - 1].1, chunk::HDAT | chunk::RIDX);
+                let Some(s) = sections.last_mut().filter(|_| follows_data) else {
+                    return Err(unexpected("TIVF must follow HDAT or RIDX"));
+                };
+                if s.header.htype != HashType::Tlsh {
+                    return Err(unexpected(&format!(
+                        "TIVF in the {} hash set '{}'",
+                        s.header.htype, s.header.name
+                    )));
+                }
+                s.tivf = Some(ch.data);
+            }
+            chunk::TVEC => {
+                return Err(Error::format(
+                    "TVEC chunk (TLSH embedding vectors) is no longer part of the \
+                     format and is not read; rebuild the file without it",
+                ));
             }
             chunk::FEND => {
                 if open {
@@ -342,6 +386,7 @@ mod tests {
                 data: &hashes,
                 hint: Some((tag, table)),
                 ridx: None,
+                tivf: None,
             }],
         })
         .unwrap()
@@ -423,5 +468,151 @@ mod tests {
         v1[8] = 1;
         let err = decode(&v1).unwrap_err().to_string();
         assert!(err.contains("version 1"), "{err}");
+    }
+
+    // TLSH sections: the 0x7400 cell hint, TIVF placement, TVEC rejection.
+
+    type Chunks = Vec<(u32, Vec<u8>)>;
+
+    fn hhdr(htype: HashType, hash_length: u64, count: u64) -> (u32, Vec<u8>) {
+        let mut o = chunk::Out::default();
+        o.pstring(htype.field_name());
+        o.le_u64(hash_length);
+        o.le_u64(count);
+        (chunk::HHDR | u32::from(htype.log2()), o.buf)
+    }
+
+    /// The HINT chunk of a cell index whose rows all sit in cell 0.
+    fn cells_hint(n: u64) -> (u32, Vec<u8>) {
+        let mut cells = vec![n; crate::tlsh::cells::CELL_INDEX_LEN];
+        cells[0] = 0;
+        let mut data = HINT_TLSH_CELLS.to_be_bytes().to_vec();
+        data.extend(crate::tlsh::cells::cell_table(&cells));
+        (chunk::HINT, data)
+    }
+
+    /// One TLSH section of two all-zero rows (cell 0).
+    fn tlsh_section() -> Chunks {
+        vec![
+            hhdr(HashType::Tlsh, 36, 2),
+            cells_hint(2),
+            (chunk::HDAT, vec![0; 72]),
+        ]
+    }
+
+    fn with(mut chunks: Chunks, more: &[(u32, Vec<u8>)]) -> Chunks {
+        chunks.extend_from_slice(more);
+        chunks
+    }
+
+    fn ridx() -> (u32, Vec<u8>) {
+        (chunk::RIDX, vec![0; 16])
+    }
+
+    fn tivf() -> (u32, Vec<u8>) {
+        (chunk::TIVF, b"tivf".to_vec())
+    }
+
+    fn decode_err(chunks: &[(u32, Vec<u8>)]) -> String {
+        match decode(&assemble(chunks)) {
+            Err(e @ Error::Format(_)) => e.to_string(),
+            Err(e) => panic!("expected a format error, got {e}"),
+            Ok(f) => panic!("expected a format error, decoded {:?}", f.toc),
+        }
+    }
+
+    #[test]
+    fn a_hand_built_tlsh_section_decodes() {
+        for tail in [vec![], vec![tivf()], vec![ridx(), tivf()]] {
+            let buf = assemble(&with(tlsh_section(), &tail));
+            let f = decode(&buf).unwrap();
+            let s = &f.sections[0];
+            assert!(matches!(s.hint, Some(Hint::TlshCells { table }) if table.len() == 524296));
+            assert_eq!(s.tivf.is_some(), !tail.is_empty());
+            assert_eq!(s.ridx.is_some(), tail.len() == 2);
+        }
+    }
+
+    #[test]
+    fn a_cell_hint_outside_a_36_byte_tlsh_section_is_rejected() {
+        let md5 = [
+            hhdr(HashType::Md5, 16, 2),
+            cells_hint(2),
+            (chunk::HDAT, vec![0; 32]),
+        ];
+        let e = decode_err(&md5);
+        assert!(e.contains("TLSH cell index hint on the MD5"), "{e}");
+        let short = [
+            hhdr(HashType::Tlsh, 35, 2),
+            cells_hint(2),
+            (chunk::HDAT, vec![0; 70]),
+        ];
+        let e = decode_err(&short);
+        assert!(e.contains("hash length 35"), "{e}");
+    }
+
+    #[test]
+    fn a_bad_cell_index_is_rejected() {
+        let mut wrong_n = tlsh_section();
+        wrong_n[1] = cells_hint(3);
+        let e = decode_err(&wrong_n);
+        assert!(e.contains("last offset is 3, expected 2"), "{e}");
+        let mut short = tlsh_section();
+        short[1].1.pop();
+        let e = decode_err(&short);
+        assert!(e.contains("bad TLSH cell index"), "{e}");
+    }
+
+    #[test]
+    fn tivf_outside_a_tlsh_section_is_rejected() {
+        let md5 = [
+            hhdr(HashType::Md5, 16, 1),
+            (chunk::HDAT, vec![0; 16]),
+            tivf(),
+        ];
+        let e = decode_err(&md5);
+        assert!(e.contains("TIVF in the MD5 hash set 'md5'"), "{e}");
+    }
+
+    #[test]
+    fn tivf_must_follow_the_sections_hdat_or_ridx() {
+        // Before HDAT.
+        let mut before = tlsh_section();
+        before.insert(2, tivf());
+        let e = decode_err(&before);
+        assert!(e.contains("TIVF must follow HDAT or RIDX"), "{e}");
+        // Twice.
+        let e = decode_err(&with(tlsh_section(), &[tivf(), tivf()]));
+        assert!(e.contains("TIVF must follow HDAT or RIDX"), "{e}");
+        // After records that follow a closed section.
+        let mut rhdr = chunk::Out::default();
+        rhdr.le_u64(0);
+        rhdr.le_u64(0);
+        let records = [(chunk::RHDR, rhdr.buf), (chunk::RDAT, vec![])];
+        let e = decode_err(&with(with(tlsh_section(), &records), &[tivf()]));
+        assert!(e.contains("TIVF must follow HDAT or RIDX"), "{e}");
+        // As the first chunk after the FHDR.
+        let e = decode_err(&[tivf()]);
+        assert!(e.contains("TIVF must follow HDAT or RIDX"), "{e}");
+    }
+
+    #[test]
+    fn ridx_after_tivf_is_rejected() {
+        let e = decode_err(&with(tlsh_section(), &[tivf(), ridx()]));
+        assert!(e.contains("RIDX must precede TIVF"), "{e}");
+    }
+
+    #[test]
+    fn tvec_is_rejected_by_name() {
+        let tvec = (chunk::TVEC, vec![0; 32]);
+        for chunks in [
+            with(tlsh_section(), std::slice::from_ref(&tvec)),
+            with(tlsh_section(), &[ridx(), tvec.clone(), tivf()]),
+            vec![tvec.clone()],
+        ] {
+            let e = decode_err(&chunks);
+            assert!(e.contains("TVEC chunk"), "{e}");
+            assert!(!e.contains("unknown chunk"), "{e}");
+        }
     }
 }
