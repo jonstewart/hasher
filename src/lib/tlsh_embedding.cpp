@@ -129,6 +129,13 @@ void sfhash_tlsh_embed(const void* digest, float* out) {
   tlsh_embed(*static_cast<const TlshDigest*>(digest), out);
 }
 
+void sfhash_tlsh_embed_n(const void* digests, size_t n, float* out) {
+  const TlshDigest* d = static_cast<const TlshDigest*>(digests);
+  for (size_t r = 0; r < n; ++r) {
+    tlsh_embed(d[r], out + r * TLSH_EMBED_DIMS);
+  }
+}
+
 float sfhash_tlsh_embed_dist2(const float* a, const float* b, bool include_length) {
   return tlsh_embed_dist2(a, b, include_length);
 }

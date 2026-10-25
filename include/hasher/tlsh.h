@@ -79,6 +79,14 @@ int sfhash_tlsh_diff(const void* a, const void* b, bool include_length);
 
 void sfhash_tlsh_embed(const void* digest, float* out);
 
+/*
+ * Embeds n digests, stored contiguously (SFHASH_TLSH_DIGEST_LENGTH bytes
+ * each, as the rows of a TLSH hash set are), into out, which has room for
+ * n * SFHASH_TLSH_EMBEDDING_DIMS floats: row r of out is the
+ * sfhash_tlsh_embed of digest r.
+ */
+void sfhash_tlsh_embed_n(const void* digests, size_t n, float* out);
+
 /* Squared Euclidean distance between two embeddings. */
 float sfhash_tlsh_embed_dist2(const float* a, const float* b, bool include_length);
 

@@ -65,6 +65,35 @@ TEST_CASE("tlsh_embed_dims_and_layout") {
   CHECK(c == v);
 }
 
+TEST_CASE("tlsh_embed_n_embeds_each_contiguous_digest") {
+  // row r of the batch is the single-digest embedding of digest r, for
+  // digests laid out as hash set rows are, 36 bytes apart
+  const auto digests = make_tlsh_corpus(3, 100);
+  REQUIRE(sizeof(TlshDigest) == SFHASH_TLSH_DIGEST_LENGTH);
+  const size_t n = digests.size();
+
+  // a sentinel past the last row is left alone
+  std::vector<float> out(n * SFHASH_TLSH_EMBEDDING_DIMS + 1, -7.f);
+  sfhash_tlsh_embed_n(digests.data(), n, out.data());
+  CHECK(out.back() == -7.f);
+
+  std::vector<float> one(SFHASH_TLSH_EMBEDDING_DIMS);
+  for (size_t r = 0; r < n; ++r) {
+    sfhash_tlsh_embed(&digests[r], one.data());
+    const std::vector<float> row(
+      out.begin() + r * SFHASH_TLSH_EMBEDDING_DIMS,
+      out.begin() + (r + 1) * SFHASH_TLSH_EMBEDDING_DIMS
+    );
+    INFO("row " << r);
+    CHECK(row == one);
+  }
+
+  // no digests, nothing written
+  float untouched = -7.f;
+  sfhash_tlsh_embed_n(nullptr, 0, &untouched);
+  CHECK(untouched == -7.f);
+}
+
 TEST_CASE("tlsh_embed_body_component_bounds") {
   // every pair of codes in a single bucket, all else equal
   const uint32_t cost[4] = { 0, 1, 2, 6 };
