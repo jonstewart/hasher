@@ -527,3 +527,111 @@ fn hashsets_only_merges_over_the_option_matrix() {
 fn record_merges_over_the_option_matrix() {
     run_matrix(REC);
 }
+
+/// C++ hset_merge_algebra: A ∪ B = B ∪ A as row sets, A − A is empty,
+/// A ∩ A = A, (A ∪ B) − B = A − B, for records and hashsets-only files.
+#[test]
+fn merges_obey_the_set_algebra() {
+    let c = tlsh_corpus();
+    for input in [HO, REC] {
+        let a = build_input(&c, 0..800, &MD5_TLSH, input);
+        let b = build_input(&c, 400..1200, &MD5_TLSH, input);
+        let o = opts();
+
+        let ab = merged(SetOp::Union, &a, &b, &o);
+        let ba = merged(SetOp::Union, &b, &a, &o);
+        for t in MD5_TLSH {
+            assert_eq!(rows_of(&load(&ab), t), rows_of(&load(&ba), t), "{t}");
+        }
+        assert_eq!(load(&ab).record_count(), load(&ba).record_count());
+        check_output(&ba, &b, &a, SetOp::Union, true);
+
+        let aa = merged(SetOp::Subtract, &a, &a, &o);
+        assert_eq!(load(&aa).section_count(), 2);
+        assert!((0..2).all(|i| load(&aa).count(i) == 0));
+        assert_eq!(load(&aa).record_count(), 0);
+        check_output(&aa, &a, &a, SetOp::Subtract, true);
+
+        let ai = merged(SetOp::Intersect, &a, &a, &o);
+        for t in MD5_TLSH {
+            assert_eq!(rows_of(&load(&ai), t), rows_of(&load(&a), t), "{t}");
+        }
+        check_output(&ai, &a, &a, SetOp::Intersect, true);
+
+        let ab_b = merged(SetOp::Subtract, &ab, &b, &o);
+        let a_b = merged(SetOp::Subtract, &a, &b, &o);
+        for t in MD5_TLSH {
+            assert_eq!(rows_of(&load(&ab_b), t), rows_of(&load(&a_b), t), "{t}");
+        }
+        check_output(&ab_b, &ab, &b, SetOp::Subtract, true);
+    }
+}
+
+/// C++ hset_merge_records_differing_fields: md5 + tlsh records merged with
+/// sha1 + tlsh records widen to md5, tlsh, sha1 (and the reverse order to
+/// sha1, tlsh, md5, re-sorting the right side).
+#[test]
+fn records_with_differing_fields_widen_to_the_union_of_the_fields() {
+    let c = tlsh_corpus();
+    let a = build_input(&c, 0..500, &MD5_TLSH, REC);
+    let b = build_input(&c, 250..750, &[HashType::Sha1, HashType::Tlsh], REC);
+    for op in OPS {
+        let o = merged(op, &a, &b, &opts());
+        let types: Vec<HashType> = load(&o)
+            .record_header()
+            .unwrap()
+            .fields
+            .iter()
+            .map(|f| f.htype)
+            .collect();
+        assert_eq!(types, [HashType::Md5, HashType::Tlsh, HashType::Sha1]);
+        check_output(&o, &a, &b, op, true);
+        if op == SetOp::Union {
+            // no record of one side can equal a record of the other
+            assert_eq!(load(&o).record_count(), 1000);
+        }
+    }
+    let o = merged(SetOp::Union, &b, &a, &opts());
+    assert_eq!(
+        load(&o).record_header().unwrap().fields[0].htype,
+        HashType::Sha1
+    );
+    check_output(&o, &b, &a, SetOp::Union, true);
+}
+
+/// C++ hset_merge_mixed_records_and_hashsets_only: with records on one
+/// side only the output is hashsets-only and rows deduplicate, the record
+/// side's duplicate rows included.
+#[test]
+fn a_records_file_merged_with_a_hashsets_only_file_gives_hashsets_only() {
+    let c = tlsh_corpus();
+    let a = build_input(&c, 0..800, &MD5_TLSH, REC);
+    let b = build_input(&c, 400..1200, &MD5_TLSH, HO);
+    for op in OPS {
+        let o = merged(op, &a, &b, &opts());
+        assert!(load(&o).record_header().is_none());
+        check_output(&o, &a, &b, op, true);
+        let p = merged(op, &b, &a, &opts());
+        check_output(&p, &b, &a, op, true);
+    }
+}
+
+/// C++ hset_merge_type_only_on_one_side: a type on one side only is merged
+/// against an empty run.
+#[test]
+fn a_type_on_one_side_only_is_merged_against_nothing() {
+    let c = tlsh_corpus();
+    let a = build_input(&c, 0..600, &MD5_TLSH, HO);
+    let b = build_input(&c, 300..900, &[HashType::Tlsh], HO);
+    for op in OPS {
+        let o = merged(op, &a, &b, &opts());
+        let hs = load(&o);
+        assert_eq!(hs.section_count(), 2);
+        let m = hs.index_for_type(HashType::Md5).unwrap();
+        // union and difference copy the left md5 section, intersection
+        // empties it
+        let want = if op == SetOp::Intersect { 0 } else { 600 };
+        assert_eq!(hs.count(m), want, "{}", op.name());
+        check_output(&o, &a, &b, op, true);
+    }
+}
