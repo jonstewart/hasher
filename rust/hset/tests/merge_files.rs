@@ -456,3 +456,16 @@ fn a_union_of_hashsets_only_md5_files_is_the_set_union_of_their_rows() {
     check_output(&o, &a, &b, SetOp::Union, false);
     assert_eq!(load(&o).count(0), 300);
 }
+
+#[test]
+fn record_merges_apply_the_operation_to_records_and_rows_follow_them() {
+    let c = corpus(31, 300);
+    let types = [HashType::Md5, HashType::Sha1];
+    let a = build_input(&c, 0..200, &types, REC);
+    let b = build_input(&c, 100..300, &types, REC);
+    for (op, want) in OPS.into_iter().zip([300, 100, 100]) {
+        let o = merged(op, &a, &b, &opts());
+        check_output(&o, &a, &b, op, false);
+        assert_eq!(load(&o).record_count(), want, "{}", op.name());
+    }
+}

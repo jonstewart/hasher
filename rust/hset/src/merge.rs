@@ -11,7 +11,8 @@ use std::cmp::Ordering;
 use crate::builder::{TLSH_OPTION_INDEX, TLSH_OPTION_INDEX_KMEANS, TLSH_OPTION_INHERIT, now_utc};
 use crate::error::{Error, Result};
 use crate::format::{
-    self, Document, FORMAT_VERSION, FieldDescriptor, HashsetIn, HsetFile, RecordHeader,
+    self, Document, FORMAT_VERSION, FieldDescriptor, HashsetIn, HsetFile, RecordHeader, RecordsIn,
+    Section,
 };
 use crate::hash_type::HashType;
 use crate::hashset::Hashset;
@@ -111,10 +112,27 @@ pub fn merge(
     opts: &MergeOptions,
 ) -> Result<Vec<u8>> {
     let (lf, rf) = (left.file(), right.file());
-    let ofields = section_fields(lf, rf);
+    // the operation is applied to the records when both sides have them
+    let rm = match (records_of(lf), records_of(rf)) {
+        (Some((lh, ld)), Some((rh, rd))) => Some(merge_records(op, lh, ld, rh, rd)?),
+        _ => None,
+    };
+    let with_records = rm.is_some() && opts.write_records;
+    let ofields = match &rm {
+        Some(m) => m.fields.clone(),
+        None => section_fields(lf, rf),
+    };
+    let ctx = SectionMerge {
+        op,
+        left,
+        right,
+        records: rm.as_ref(),
+        with_records,
+        opts,
+    };
     let mut secs = Vec::with_capacity(ofields.len());
     for f in &ofields {
-        secs.push(OutSection::merge(op, f, left, right, opts)?);
+        secs.push(ctx.section(f)?);
     }
     let time = match &opts.timestamp {
         Some(t) => t.clone(),
@@ -125,9 +143,19 @@ pub fn merge(
         name: &opts.name,
         desc: &opts.desc,
         time: &time,
-        records: None,
+        records: rm.as_ref().filter(|_| with_records).map(|m| RecordsIn {
+            fields: &m.fields,
+            record_length: m.record_length as usize,
+            data: &m.rdat,
+        }),
         hashsets: secs.iter().map(OutSection::input).collect(),
     })
+}
+
+/// The record table of `f`, if it has one with fields (C++ `has_records`).
+fn records_of<'f, 'a>(f: &'f HsetFile<'a>) -> Option<(&'f RecordHeader, &'a [u8])> {
+    let rhdr = f.rhdr.as_ref().filter(|h| !h.fields.is_empty())?;
+    Some((rhdr, f.rdat.unwrap_or(&[])))
 }
 
 /// The output fields of a merge without records: left's section types,
@@ -146,9 +174,16 @@ fn section_fields(lf: &HsetFile<'_>, rf: &HsetFile<'_>) -> Vec<FieldDescriptor> 
     fields
 }
 
-/// The rows of `hs`'s section of type `t`, empty if it has none.
-fn rows_of<'a>(hs: &Hashset<'a>, t: HashType) -> &'a [u8] {
-    hs.index_for_type(t).map_or(&[], |i| hs.section(i).data)
+/// What every output section of one merge shares.
+struct SectionMerge<'m, 'l, 'r> {
+    op: SetOp,
+    left: &'m Hashset<'l>,
+    right: &'m Hashset<'r>,
+    /// The record merge, when both inputs have records.
+    records: Option<&'m RecordMerge>,
+    /// Whether the output has the record table (and so `RIDX` chunks).
+    with_records: bool,
+    opts: &'m MergeOptions,
 }
 
 /// One output hash section of a merge, ready to encode.
@@ -156,23 +191,49 @@ struct OutSection {
     field: FieldDescriptor,
     data: Vec<u8>,
     hint: Option<(u16, Vec<u8>)>,
+    ridx: Option<Vec<u8>>,
 }
 
-impl OutSection {
+impl SectionMerge<'_, '_, '_> {
     /// The section of field `f`: the merge of the inputs' sections of its
     /// type (an absent one is an empty run).
-    fn merge(
-        op: SetOp,
-        f: &FieldDescriptor,
-        left: &Hashset<'_>,
-        right: &Hashset<'_>,
-        opts: &MergeOptions,
-    ) -> Result<Self> {
+    fn section(&self, f: &FieldDescriptor) -> Result<OutSection> {
         let len = usize::try_from(f.length)
             .map_err(|_| Error::input(format!("{} hashes are too long", f.name)))?;
-        let (lrows, rrows) = (rows_of(left, f.htype), rows_of(right, f.htype));
-        let m = merge_rows(lrows, rrows, len, RowMode::Set(op))?;
+        let ls = section_of(self.left, f.htype);
+        let rs = section_of(self.right, f.htype);
+        let (lrows, rrows) = (
+            ls.map_or(&[][..], |s| s.data),
+            rs.map_or(&[][..], |s| s.data),
+        );
+        let owners = self.records.map(|m| {
+            (
+                RowOwners {
+                    ridx: ls.and_then(|s| s.ridx).unwrap_or(&[]),
+                    recmap: &m.lmap,
+                },
+                RowOwners {
+                    ridx: rs.and_then(|s| s.ridx).unwrap_or(&[]),
+                    recmap: &m.rmap,
+                },
+            )
+        });
+        let mode = match owners {
+            None => RowMode::Set(self.op),
+            Some((left, right)) => RowMode::Records {
+                left,
+                right,
+                // a hashsets-only output has each row once
+                collapse_equal: !self.with_records,
+            },
+        };
+        let m = merge_rows(lrows, rrows, len, mode)?;
         let data = m.gather_rows(lrows, rrows, len)?;
+        let ridx = match owners {
+            Some((l, r)) if self.with_records => Some(m.gather_ridx(l, r)?),
+            _ => None,
+        };
+        let opts = self.opts;
         let hint = if f.htype.is_digest() {
             let spec = lookup::resolve_bits(opts.hint, data.len() / len, len, &opts.bits_policy);
             lookup::build_hint(len, &data, spec)?
@@ -183,9 +244,17 @@ impl OutSection {
             field: f.clone(),
             data,
             hint,
+            ridx,
         })
     }
+}
 
+/// `hs`'s section of type `t`.
+fn section_of<'s, 'a>(hs: &'s Hashset<'a>, t: HashType) -> Option<&'s Section<'a>> {
+    hs.index_for_type(t).map(|i| hs.section(i))
+}
+
+impl OutSection {
     fn input(&self) -> HashsetIn<'_> {
         HashsetIn {
             htype: self.field.htype,
@@ -193,7 +262,7 @@ impl OutSection {
             hash_length: self.field.length as usize,
             data: &self.data,
             hint: self.hint.as_ref().map(|(t, b)| (*t, b.as_slice())),
-            ridx: None,
+            ridx: self.ridx.as_deref(),
             tivf: None,
         }
     }
