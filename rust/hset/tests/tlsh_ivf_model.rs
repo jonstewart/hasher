@@ -66,7 +66,10 @@ struct HandCell {
 fn hand_cell(lists: &[ListSpec]) -> HandCell {
     let mut rows: Vec<TlshDigest> = lists.iter().flat_map(|l| l.members.clone()).collect();
     rows.sort();
-    assert!(rows.windows(2).all(|w| w[0] < w[1]), "rows must be distinct");
+    assert!(
+        rows.windows(2).all(|w| w[0] < w[1]),
+        "rows must be distinct"
+    );
 
     let mut ivf = TlshIvf::empty();
     ivf.n = rows.len() as u64;
@@ -199,10 +202,7 @@ fn hand_built_payload_has_each_array_at_its_offset() {
     let radius2 = MEDOIDS + 72;
     assert_eq!(b[radius2..radius2 + 8], [1, 0, 0, 0, 2, 0, 0, 0]);
     let list_start = radius2 + 8;
-    assert_eq!(
-        [0, 1, 2].map(|i| u64_at(&b, list_start + 8 * i)),
-        [0, 3, 6]
-    );
+    assert_eq!([0, 1, 2].map(|i| u64_at(&b, list_start + 8 * i)), [0, 3, 6]);
     let ids = list_start + 24;
     assert_eq!(
         [0, 1, 2, 3, 4, 5].map(|i| u32_at(&b, ids + 4 * i)),
@@ -326,11 +326,7 @@ fn a_payload_of_the_wrong_length_is_rejected() {
     // the header's counts no longer describe the bytes
     assert_rejected(&patched(|b| put_u32(b, 8, 3)), 6, "expected 262356");
     assert_rejected(&patched(|b| put_u64(b, 16, 7)), 6, "expected 262312");
-    assert_rejected(
-        &patched(|b| put_u32(b, 8, u32::MAX)),
-        6,
-        "4294967295 lists",
-    );
+    assert_rejected(&patched(|b| put_u32(b, 8, u32::MAX)), 6, "4294967295 lists");
 }
 
 #[test]
@@ -355,11 +351,7 @@ fn a_row_count_other_than_the_sections_is_rejected() {
 #[test]
 fn cell_lists_must_start_at_0_and_end_at_the_list_count() {
     assert_rejected(&patched(|b| put_u32(b, 32, 1)), 6, "cell_lists");
-    assert_rejected(
-        &patched(|b| put_u32(b, 32 + 4 * CELLS, 1)),
-        6,
-        "cell_lists",
-    );
+    assert_rejected(&patched(|b| put_u32(b, 32 + 4 * CELLS, 1)), 6, "cell_lists");
 }
 
 #[test]
@@ -529,7 +521,11 @@ fn every_row_is_in_exactly_one_list() {
 fn every_id_is_in_its_lists_cell() {
     // row 5 ({1}, the last row) moved to the next L: still sorted by cell
     let (ivf, rows) = broken(|_, rows| rows[5][0] = CELL_L + 1);
-    assert_invalid(&ivf, &rows, "row 5 of cell 0x6557 is in a list of cell 0x6457");
+    assert_invalid(
+        &ivf,
+        &rows,
+        "row 5 of cell 0x6557 is in a list of cell 0x6457",
+    );
 }
 
 #[test]
@@ -543,7 +539,11 @@ fn the_rows_must_be_sorted_by_cell() {
 fn every_member_lies_within_its_lists_radius() {
     // check_index_valid: tight <= radius2. {0} and {1} are 1 from {}.
     let (ivf, rows) = broken(|ivf, _| ivf.radius2[0] = 0);
-    assert_invalid(&ivf, &rows, "row 4 is 1 from the medoid of list 0, beyond radius2 0");
+    assert_invalid(
+        &ivf,
+        &rows,
+        "row 4 is 1 from the medoid of list 0, beyond radius2 0",
+    );
 }
 
 //
@@ -679,10 +679,11 @@ fn reference_index(rows: &[[u8; 36]], labels: &[u8], pick: usize) -> TlshIvf {
     let mut at = 0;
     for c in 0..CELLS {
         ivf.cell_lists[c] = ivf.radius2.len() as u32;
-        let end = at + rows[at..]
-            .iter()
-            .take_while(|r| usize::from(u16::from_be_bytes([r[0], r[1]])) == c)
-            .count();
+        let end = at
+            + rows[at..]
+                .iter()
+                .take_while(|r| usize::from(u16::from_be_bytes([r[0], r[1]])) == c)
+                .count();
         for label in 0..4 {
             let members: Vec<u32> = (at..end)
                 .filter(|&i| labels[i] % 4 == label)

@@ -1,5 +1,76 @@
 //! The TIVF inverted-file index over a TLSH hash set: its in-memory model,
-//! the on-disk chunk payload, and validation.
+//! the on-disk chunk payload, and validation. C++: `include/hashset/
+//! tlsh_ivf.h`, `src/lib/hashset/tlsh_ivf.cpp`; docs/TLSH_EMBEDDING.md
+//! section 3.
+//!
+//! # Model
+//!
+//! The rows of a TLSH hash set (sorted 36-byte digests, `HDAT`) are grouped
+//! by cell, `(L << 8) | Q`, which is contiguous in sorted order, and each
+//! cell's rows are split into lists. Each list keeps a medoid (a digest
+//! central to the list; after a merge not necessarily a member) and
+//! `radius2`, an upper bound on the squared body-embedding distance
+//! ([`emb_body_dist2`](super::emb_body_dist2)) from the medoid to every
+//! member. The header part of the TLSH distance is exact per cell, and
+//! `radius2` with the triangle inequality bounds the body part per list,
+//! which is what the search ([`search`]) prunes with.
+//!
+//! With `C` lists over `n` rows the index is five arrays:
+//!
+//! ```text
+//! cell_lists[65537]  u32  lists of cell c are cell_lists[c]..cell_lists[c + 1]
+//! medoids[C]         36-byte digest
+//! radius2[C]         u32
+//! list_start[C + 1]  u64  members of list l are ids[list_start[l]..list_start[l + 1]]
+//! ids[n]             u32  row indexes into HDAT, ascending within a list
+//! ```
+//!
+//! # Payload
+//!
+//! The `TIVF` chunk payload (HASHSET_FORMAT; C++ `write_tivf_data`,
+//! `parse_tivf_data`) is a 32-byte little-endian header, then the arrays in
+//! the order above, little-endian, with no padding:
+//!
+//! ```text
+//! offset  0  u16 version   3
+//! offset  2  u16 flags     0
+//! offset  4  u32 dims      256
+//! offset  8  u32 lists     C
+//! offset 12  u32 reserved  0
+//! offset 16  u64 n
+//! offset 24  u64 reserved  0
+//! ```
+//!
+//! Its length is [`tivf_len`]. The chunk is only 4-byte aligned in a file
+//! (so `list_start` may be misaligned for `u64`), and [`TivfView`] assumes
+//! no alignment at all: it reads every entry with `from_le_bytes`.
+//!
+//! # Owned and borrowed
+//!
+//! [`TlshIvf`] owns the arrays; the BISECT build ([`bisect`]) and merge
+//! ([`merge`]) produce one and [`TlshIvf::to_bytes`] writes its payload.
+//! [`TivfView`] borrows them from a payload, as mapped from a file. Both
+//! implement [`IvfIndex`], the read interface the search and the merge take.
+//!
+//! # Validation
+//!
+//! [`TivfView::parse`] checks what C++ checks at load (header values,
+//! length, row count, the ends of `cell_lists` and `list_start`, and that
+//! `list_start` never decreases), which is O(lists). [`IvfIndex::validate`]
+//! checks the rest against the rows, O(n), and returns a [`ValidIvf`]; the
+//! hash set runs it lazily on first indexed use (controller ruling 5).
+//! [`check_invariant`] is the merge's coalescing invariant, a property of
+//! good indexes rather than a validity condition.
+//!
+//! # Differences from the C++ library
+//!
+//! * `parse` rejects non-zero flags and reserved header fields, which
+//!   `parse_tivf_data` ignores.
+//! * C++ never checks the ids, `cell_lists` monotonicity, cells or radii of
+//!   a loaded index; Rust's `validate` does, so an inconsistent index is a
+//!   format error instead of a wrong (or out-of-bounds) search.
+//! * A hash set without an index has no `TivfView` (C++ uses an empty
+//!   `TlshIvfView`); [`TlshIvf::empty`] is the index of no rows.
 
 pub mod bisect;
 pub mod merge;
@@ -36,14 +107,14 @@ pub const FLAT_MAX: usize = 4096;
 /// (C++ `TLSH_IVF_DROPPED`).
 pub const DROPPED: u32 = u32::MAX;
 
-/// Length of the fixed TIVF header.
+/// Length of the fixed TIVF payload header.
 pub const TIVF_HEADER_LENGTH: usize = 32;
 
-/// TIVF payload version written and accepted.
+/// TIVF payload version written and accepted (C++ `TIVF_VERSION`).
 pub const TIVF_VERSION: u16 = 3;
 
-/// Embedding dimensions recorded in the header: the 256-dimensional body
-/// embedding.
+/// Embedding dimensions recorded in the header: the 256 dimensions of the
+/// body embedding (C++ `TLSH_EMBED_BODY_DIMS`).
 pub const TIVF_DIMS: u32 = 256;
 
 /// Length in bytes of a TIVF payload with `lists` lists over `n` rows:
@@ -58,25 +129,35 @@ pub const fn tivf_len(lists: u32, n: u64) -> u64 {
         .saturating_add(n.saturating_mul(4))
 }
 
-/// An owned TIVF index (C++ `TlshIvf`).
+/// An owned TIVF index (C++ `TlshIvf`); see the [module docs](self).
+///
+/// The fields are public so builders can fill them; the list count is
+/// `radius2.len()`. Nothing is checked on construction:
+/// [`IvfIndex::validate`] checks an index against its rows, and
+/// [`TlshIvf::to_bytes`] panics on arrays of inconsistent lengths.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TlshIvf {
-    /// Rows indexed.
+    /// Rows indexed: the `HDAT` row count.
     pub n: u64,
-    /// `CELL_COUNT + 1` entries.
+    /// `CELL_COUNT + 1` entries, nondecreasing from 0 to the list count:
+    /// the lists of cell `c` are `cell_lists[c]..cell_lists[c + 1]`.
     pub cell_lists: Vec<u32>,
-    /// One per list.
+    /// One per list: the digest the list's `radius2` is measured from.
     pub medoids: Vec<TlshDigest>,
-    /// One per list.
+    /// One per list: at least the largest squared body-embedding distance
+    /// from the medoid to a member (exact as built and merged).
     pub radius2: Vec<u32>,
-    /// Lists + 1 entries.
+    /// Lists + 1 entries, nondecreasing from 0 to `n`: the members of list
+    /// `l` are `ids[list_start[l]..list_start[l + 1]]`.
     pub list_start: Vec<u64>,
-    /// `n` row indexes.
+    /// `n` row indexes into `HDAT`, ascending within a list; every row
+    /// once.
     pub ids: Vec<u32>,
 }
 
 impl TlshIvf {
-    /// The index of no rows.
+    /// The index of no rows: no lists, all offsets 0. It is valid over an
+    /// empty row set and is the index of a merge side with no rows.
     pub fn empty() -> Self {
         Self {
             n: 0,
@@ -88,7 +169,7 @@ impl TlshIvf {
         }
     }
 
-    /// Number of lists.
+    /// Number of lists, `radius2.len()` (C++ `TlshIvf::lists`).
     pub fn lists(&self) -> usize {
         self.radius2.len()
     }
@@ -124,12 +205,13 @@ impl TlshIvf {
         None
     }
 
-    /// The TIVF payload (C++ `write_tivf_data`).
+    /// The TIVF payload (C++ `write_tivf_data`), [`tivf_len`] bytes. The
+    /// contents are written as they are; only the lengths are checked.
     ///
     /// # Panics
     ///
     /// If the arrays disagree in length with each other or with `n` (see
-    /// the field docs).
+    /// the field docs), or there are more than `u32::MAX` lists.
     pub fn to_bytes(&self) -> Vec<u8> {
         if let Some(e) = self.layout_error() {
             panic!("{e}");
@@ -161,7 +243,8 @@ impl TlshIvf {
         out
     }
 
-    /// An owned copy of any index.
+    /// An owned copy of any index, entry by entry (for a view, the arrays
+    /// its payload holds).
     pub fn from_index<I: IvfIndex + ?Sized>(index: &I) -> Self {
         let lists = index.lists();
         Self {
@@ -176,48 +259,97 @@ impl TlshIvf {
 }
 
 /// Read access to a TIVF index, owned ([`TlshIvf`]) or borrowed from a
-/// payload ([`TivfView`]).
+/// payload ([`TivfView`]), entry by entry; the arrays are those of the
+/// [module docs](self). The search, the merge and validation are written
+/// against this trait, so they take either kind, a reference to one, or a
+/// [`ValidIvf`].
+///
+/// The accessors take indexes into the arrays: `c` in `0..=CELL_COUNT`,
+/// `l` in `0..lists()` (`0..=lists()` for [`list_start`](Self::list_start)),
+/// `i` in `0..n`. They panic outside those bounds, and are cheap (an array
+/// read and, for a view, a `from_le_bytes`). What the entries promise
+/// depends on the index:
+///
+/// * after [`TivfView::parse`]: the array lengths, `cell_lists[0] == 0`,
+///   `cell_lists[CELL_COUNT] == lists()`, `list_start[0] == 0`,
+///   `list_start[lists()] == n` and `list_start` nondecreasing. Nothing
+///   about the ids, and inner `cell_lists` entries may exceed `lists()`.
+/// * through a [`ValidIvf`]: everything [`IvfIndex::validate`] lists.
+/// * a [`TlshIvf`] promises nothing until validated.
+///
+/// The provided range helpers ([`cell_range`](Self::cell_range),
+/// [`list_range`](Self::list_range)) clamp to the arrays, so walking a
+/// parsed but unvalidated view through them never panics; on a valid
+/// index they are the exact ranges.
+///
+/// Implementors provide the seven accessors and
+/// [`check_layout`](Self::check_layout); the rest is provided.
 pub trait IvfIndex {
-    /// Rows indexed.
+    /// Rows indexed (the header's `n`).
     fn n(&self) -> u64;
-    /// Number of lists.
+    /// Number of lists, `C`.
     fn lists(&self) -> usize;
-    /// Entry `c` of `cell_lists`.
+    /// Entry `c` of `cell_lists`, `c <= CELL_COUNT`.
     fn cell_lists(&self, c: usize) -> u32;
     /// Medoid of list `l`.
     fn medoid(&self, l: usize) -> TlshDigest;
-    /// Squared radius of list `l`.
+    /// `radius2` of list `l`: a bound on the squared body-embedding
+    /// distance from the medoid to each member.
     fn radius2(&self, l: usize) -> u32;
-    /// Entry `l` of `list_start`.
+    /// Entry `l` of `list_start`, `l <= lists()`.
     fn list_start(&self, l: usize) -> u64;
-    /// Entry `i` of `ids`.
+    /// Entry `i` of `ids`: an `HDAT` row index.
     fn id(&self, i: usize) -> u32;
-    /// The arrays have the lengths the layout implies.
+    /// `Ok` when the arrays have the lengths the layout implies for
+    /// `lists()` lists over `n()` rows (always, for a parsed view); a
+    /// format error naming the first array that does not.
     fn check_layout(&self) -> Result<()>;
 
-    /// The lists of cell `c`.
+    /// The lists of cell `c` (`c < CELL_COUNT`):
+    /// `cell_lists[c]..cell_lists[c + 1]`, clamped into `0..lists()`.
     fn cell_range(&self, c: usize) -> Range<usize> {
         let end = (self.cell_lists(c + 1) as usize).min(self.lists());
         (self.cell_lists(c) as usize).min(end)..end
     }
 
-    /// The positions in `ids` of list `l`.
+    /// The positions in `ids` of list `l`'s members:
+    /// `list_start[l]..list_start[l + 1]`, clamped into `0..n`.
     fn list_range(&self, l: usize) -> Range<usize> {
         let end = self.list_start(l + 1).min(self.n()) as usize;
         (self.list_start(l) as usize).min(end)..end
     }
 
-    /// Members of list `l`.
+    /// Number of members of list `l`, `list_start[l + 1] - list_start[l]`
+    /// (0 if that would be negative).
     fn list_len(&self, l: usize) -> u64 {
         self.list_start(l + 1).saturating_sub(self.list_start(l))
     }
 
-    /// The row indexes of list `l`.
+    /// The row indexes of list `l`'s members, in `ids` order (ascending on
+    /// a valid index).
     fn list_ids(&self, l: usize) -> impl Iterator<Item = u32> + '_ {
         self.list_range(l).map(move |i| self.id(i))
     }
 
-    /// Validate against the rows.
+    /// Check the index against the `HDAT` rows it indexes and wrap it as a
+    /// [`ValidIvf`], or return the first problem as [`Error::Format`]
+    /// (controller ruling 5). Checks, in O(n + lists + CELL_COUNT):
+    ///
+    /// * [`check_layout`](Self::check_layout), `rows.len() == n`, and the
+    ///   offset checks of [`TivfView::parse`] (repeated, for owned indexes);
+    /// * the rows are sorted by cell, so each cell's rows are contiguous;
+    /// * `cell_lists` never decreases;
+    /// * no list is empty;
+    /// * every id is below `n`, ids ascend strictly within a list, and
+    ///   every row is in exactly one list;
+    /// * every member lies in its list's cell, so the lists of cell `c`
+    ///   hold exactly the rows of cell `c`;
+    /// * every member is within its list's `radius2` of the medoid
+    ///   ([`BodyQuery::emb_body`]). The medoid need not be a member.
+    ///
+    /// The coalescing invariant ([`check_invariant`]) is not required.
+    ///
+    /// Takes the index by value; pass `&index` to keep it.
     fn validate(self, rows: &[[u8; DIGEST_LENGTH]]) -> Result<ValidIvf<'_, Self>>
     where
         Self: Sized,
@@ -237,7 +369,10 @@ fn check_valid<I: IvfIndex + ?Sized>(ivf: &I, rows: &[[u8; DIGEST_LENGTH]]) -> R
             rows.len()
         )));
     }
-    if let Some(i) = rows.windows(2).position(|w| cell_of(&w[0]) > cell_of(&w[1])) {
+    if let Some(i) = rows
+        .windows(2)
+        .position(|w| cell_of(&w[0]) > cell_of(&w[1]))
+    {
         return Err(Error::format(format!(
             "TIVF rows are not sorted by cell: row {} of cell 0x{:04x} follows cell 0x{:04x}",
             i + 1,
@@ -324,7 +459,14 @@ fn check_offsets<I: IvfIndex + ?Sized>(ivf: &I) -> Result<()> {
     Ok(())
 }
 
-/// The coalescing invariant.
+/// The coalescing invariant of a merge (C++ `tlsh_ivf_check_invariant`):
+/// at most one list per cell has fewer than `coalesce_threshold / 2`
+/// members. True when `coalesce_threshold / 2 == 0` (coalescing disabled)
+/// and for an index with no lists. A merge with threshold `C` leaves it
+/// true; a fresh BISECT build need not satisfy it.
+///
+/// Never panics on a parsed view, validated or not (the walk uses the
+/// clamped [`IvfIndex::cell_range`]).
 pub fn check_invariant<I: IvfIndex + ?Sized>(ivf: &I, coalesce_threshold: u32) -> bool {
     let half = u64::from(coalesce_threshold / 2);
     if half == 0 {
@@ -343,7 +485,16 @@ fn cell_of(row: &[u8; DIGEST_LENGTH]) -> u16 {
     TlshDigest(*row).cell()
 }
 
-/// A validated index.
+/// An index that passed [`IvfIndex::validate`] against `rows()`, made only
+/// by `validate`. It implements [`IvfIndex`] by forwarding, and code taking
+/// one may rely on every check `validate` lists, in particular:
+///
+/// * `rows()` are the indexed rows, sorted by cell, `rows().len() == n`;
+/// * the members of the lists of cell `c` are exactly the rows of cell
+///   `c`, a contiguous range of `rows()`, so a cell with a single list
+///   holds the rows `ids[list_start[l]]..` in order;
+/// * every list is nonempty, ascending, and within `radius2` of its medoid;
+/// * all ranges are in bounds, so no accessor panics on them.
 #[derive(Clone, Copy, Debug)]
 pub struct ValidIvf<'r, I> {
     index: I,
@@ -351,7 +502,7 @@ pub struct ValidIvf<'r, I> {
 }
 
 impl<'r, I: IvfIndex> ValidIvf<'r, I> {
-    /// The index.
+    /// The validated index.
     pub fn index(&self) -> &I {
         &self.index
     }
@@ -361,7 +512,7 @@ impl<'r, I: IvfIndex> ValidIvf<'r, I> {
         self.rows
     }
 
-    /// The index, giving up the guarantee.
+    /// The index, without the guarantee.
     pub fn into_inner(self) -> I {
         self.index
     }
@@ -451,7 +602,9 @@ impl IvfIndex for TlshIvf {
     }
 }
 
-/// A TIVF index borrowed from its payload.
+/// A TIVF index borrowed from its payload (C++ `TlshIvfView`), e.g. a
+/// `TIVF` chunk of a mapped file. Zero-copy: the arrays are slices of the
+/// payload, read with `from_le_bytes`, so any alignment works.
 #[derive(Clone, Copy)]
 pub struct TivfView<'a> {
     n: u64,
@@ -463,7 +616,20 @@ pub struct TivfView<'a> {
 }
 
 impl<'a> TivfView<'a> {
-    /// Parse a payload.
+    /// Parse a `TIVF` payload over a section of `expected_n` rows (C++
+    /// `parse_tivf_data` and the checks of `handle_tivf`), in O(lists).
+    /// Errors are [`Error::Format`]:
+    ///
+    /// * fewer than 32 bytes, version other than 3, dims other than 256,
+    ///   non-zero flags or reserved fields;
+    /// * a length other than [`tivf_len`]`(lists, n)`;
+    /// * `n != expected_n`;
+    /// * `cell_lists[0] != 0` or `cell_lists[CELL_COUNT] != lists`;
+    /// * `list_start[0] != 0`, `list_start[lists] != n`, or a decreasing
+    ///   `list_start`.
+    ///
+    /// The ids and inner `cell_lists` entries are not looked at: call
+    /// [`IvfIndex::validate`] before relying on them.
     pub fn parse(payload: &'a [u8], expected_n: u64) -> Result<Self> {
         let Some((header, body)) = payload.split_first_chunk::<TIVF_HEADER_LENGTH>() else {
             return Err(Error::format(format!(
