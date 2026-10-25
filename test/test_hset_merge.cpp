@@ -41,7 +41,7 @@
 
 namespace {
 
-constexpr uint32_t BOTH = SFHASH_HSET_TLSH_VECTORS | SFHASH_HSET_TLSH_INDEX;
+constexpr uint32_t INDEX = SFHASH_HSET_TLSH_INDEX;
 // the type of the TVEC chunk that once held the stored embedding; no
 // writer emits it
 constexpr uint32_t TVEC_TYPE = 0x54564543;
@@ -528,17 +528,16 @@ void run_matrix(bool with_records) {
     bool want_idx;
   };
   // bit 1 (the former SFHASH_HSET_TLSH_VECTORS) is reserved and ignored
-  const uint32_t IDX = SFHASH_HSET_TLSH_INDEX;
   const Case cases[] = {
-    { IDX, IDX, INHERIT, true },    // both indexed: index carried through
+    { INDEX, INDEX, INHERIT, true },    // both indexed: index carried through
     { NONE, NONE, INHERIT, false }, // both off
-    { IDX, NONE, INHERIT, false },  // b lacks the index: none
-    { IDX, NONE, IDX, true },       // ... index rebuilt from scratch
-    { IDX, NONE, 3u, true },        // ... the same with bit 1 set
-    { NONE, NONE, IDX, true },      // index computed for the output
-    { IDX, IDX, 3u, true },         // index merged, bit 1 ignored
-    { IDX, IDX, NONE, false },      // index dropped
-    { IDX, IDX, 1u, false },        // ... bit 1 alone writes nothing
+    { INDEX, NONE, INHERIT, false },  // b lacks the index: none
+    { INDEX, NONE, INDEX, true },       // ... index rebuilt from scratch
+    { INDEX, NONE, 3u, true },        // ... the same with bit 1 set
+    { NONE, NONE, INDEX, true },      // index computed for the output
+    { INDEX, INDEX, 3u, true },         // index merged, bit 1 ignored
+    { INDEX, INDEX, NONE, false },      // index dropped
+    { INDEX, INDEX, 1u, false },        // ... bit 1 alone writes nothing
   };
 
   for (const auto& c: cases) {
@@ -667,8 +666,8 @@ TEST_CASE("hset_merge_records") {
 TEST_CASE("hset_merge_algebra") {
   for (const bool with_records: { false, true }) {
     const std::string tag = with_records ? "rec" : "ho";
-    const Loaded a = build_input("test/merge_alg_a_" + tag + ".hset", 0, 6000, with_records, BOTH);
-    const Loaded b = build_input("test/merge_alg_b_" + tag + ".hset", 3000, 9000, with_records, BOTH);
+    const Loaded a = build_input("test/merge_alg_a_" + tag + ".hset", 0, 6000, with_records, INDEX);
+    const Loaded b = build_input("test/merge_alg_b_" + tag + ".hset", 3000, 9000, with_records, INDEX);
 
     // union is commutative
     const Loaded ab = merge(a, b, SFHASH_HSET_OP_UNION, "test/merge_alg_ab.hset", INHERIT);
@@ -707,8 +706,8 @@ TEST_CASE("hset_merge_algebra") {
 
 TEST_CASE("hset_merge_records_differing_fields") {
   // left has md5 + tlsh, right sha1 + tlsh: records widen to md5, tlsh, sha1
-  const Loaded a = build_input("test/merge_df_a.hset", corpus(), 0, 4000, { SFHASH_MD5, SFHASH_TLSH }, true, true, BOTH);
-  const Loaded b = build_input("test/merge_df_b.hset", corpus(), 2000, 6000, { SFHASH_SHA_1, SFHASH_TLSH }, true, true, BOTH);
+  const Loaded a = build_input("test/merge_df_a.hset", corpus(), 0, 4000, { SFHASH_MD5, SFHASH_TLSH }, true, true, INDEX);
+  const Loaded b = build_input("test/merge_df_b.hset", corpus(), 2000, 6000, { SFHASH_SHA_1, SFHASH_TLSH }, true, true, INDEX);
 
   for (const uint32_t op: OPS) {
     const Loaded o = merge(a, b, op, "test/merge_df_out.hset", INHERIT);
@@ -732,8 +731,8 @@ TEST_CASE("hset_merge_records_differing_fields") {
 TEST_CASE("hset_merge_mixed_records_and_hashsets_only") {
   // one side has records, the other does not: the output is hashsets only
   // and rows deduplicate, including the record side's duplicate rows
-  const Loaded a = build_input("test/merge_mx_a.hset", 0, 6000, true, BOTH);
-  const Loaded b = build_input("test/merge_mx_b.hset", 3000, 9000, false, BOTH);
+  const Loaded a = build_input("test/merge_mx_a.hset", 0, 6000, true, INDEX);
+  const Loaded b = build_input("test/merge_mx_b.hset", 3000, 9000, false, INDEX);
 
   for (const uint32_t op: OPS) {
     const Loaded o = merge(a, b, op, "test/merge_mx_out.hset", INHERIT);
@@ -746,8 +745,8 @@ TEST_CASE("hset_merge_mixed_records_and_hashsets_only") {
 
 TEST_CASE("hset_merge_type_only_on_one_side") {
   // hashsets only: left md5 + tlsh, right tlsh only
-  const Loaded a = build_input("test/merge_t1_a.hset", corpus(), 0, 5000, { SFHASH_MD5, SFHASH_TLSH }, false, true, BOTH);
-  const Loaded b = build_input("test/merge_t1_b.hset", corpus(), 2500, 7500, { SFHASH_TLSH }, false, true, BOTH);
+  const Loaded a = build_input("test/merge_t1_a.hset", corpus(), 0, 5000, { SFHASH_MD5, SFHASH_TLSH }, false, true, INDEX);
+  const Loaded b = build_input("test/merge_t1_b.hset", corpus(), 2500, 7500, { SFHASH_TLSH }, false, true, INDEX);
 
   for (const uint32_t op: OPS) {
     const Loaded o = merge(a, b, op, "test/merge_t1_out.hset", INHERIT);
@@ -761,8 +760,8 @@ TEST_CASE("hset_merge_type_only_on_one_side") {
 }
 
 TEST_CASE("hset_merge_errors") {
-  const Loaded a = build_input("test/merge_err_a.hset", 0, 100, true, BOTH);
-  const Loaded b = build_input("test/merge_err_b.hset", 50, 150, true, BOTH);
+  const Loaded a = build_input("test/merge_err_a.hset", 0, 100, true, INDEX);
+  const Loaded b = build_input("test/merge_err_b.hset", 50, 150, true, INDEX);
 
   SFHASH_Error* err = nullptr;
 
@@ -779,7 +778,7 @@ TEST_CASE("hset_merge_errors") {
   err = nullptr;
 
   // records-only against a file with hash sections
-  const Loaded ro = build_input("test/merge_err_ro.hset", corpus(), 0, 100, { SFHASH_MD5, SFHASH_TLSH }, true, false, BOTH);
+  const Loaded ro = build_input("test/merge_err_ro.hset", corpus(), 0, 100, { SFHASH_MD5, SFHASH_TLSH }, true, false, INDEX);
   CHECK(ro.get()->holder.hsets.empty());
   CHECK(sfhash_hashset_merge(a.get(), ro.get(), SFHASH_HSET_OP_UNION, "x", "y", "test/merge_err_out.hset", INHERIT, SFHASH_HSET_COALESCE_DEFAULT, &err) == 0);
   REQUIRE(err);
@@ -787,7 +786,7 @@ TEST_CASE("hset_merge_errors") {
   err = nullptr;
 
   // two records-only files merge to a records-only file
-  const Loaded ro2 = build_input("test/merge_err_ro2.hset", corpus(), 50, 150, { SFHASH_MD5, SFHASH_TLSH }, true, false, BOTH);
+  const Loaded ro2 = build_input("test/merge_err_ro2.hset", corpus(), 50, 150, { SFHASH_MD5, SFHASH_TLSH }, true, false, INDEX);
   const Loaded o = merge(ro, ro2, SFHASH_HSET_OP_UNION, "test/merge_err_out.hset", INHERIT);
   CHECK(o.get()->holder.hsets.empty());
   CHECK(o.get()->holder.rhdr.record_count == 150);
@@ -805,8 +804,8 @@ TEST_CASE("hset_merge_timing") {
   const auto big = make_tlsh_corpus(41, 2 * N - OVERLAP);
   const std::vector<SFHASH_HashAlgorithm> htypes{ SFHASH_TLSH };
 
-  const Loaded a = build_input("test/merge_big_a.hset", big, 0, N, htypes, false, true, BOTH);
-  const Loaded b = build_input("test/merge_big_b.hset", big, N - OVERLAP, big.size(), htypes, false, true, BOTH);
+  const Loaded a = build_input("test/merge_big_a.hset", big, 0, N, htypes, false, true, INDEX);
+  const Loaded b = build_input("test/merge_big_b.hset", big, N - OVERLAP, big.size(), htypes, false, true, INDEX);
 
   const auto t0 = clock::now();
   SFHASH_Error* err = nullptr;
@@ -892,8 +891,8 @@ TEST_CASE("hset_builder_setops_are_merges") {
   // writes: same rows, records and derived structures
   for (const bool with_records: { true, false }) {
     const std::string tag = with_records ? "rec" : "ho";
-    const Loaded a = build_input("test/setop_a_" + tag + ".hset", 0, 6000, with_records, BOTH);
-    const Loaded b = build_input("test/setop_b_" + tag + ".hset", 3000, 9000, with_records, BOTH);
+    const Loaded a = build_input("test/setop_a_" + tag + ".hset", 0, 6000, with_records, INDEX);
+    const Loaded b = build_input("test/setop_b_" + tag + ".hset", 3000, 9000, with_records, INDEX);
 
     for (const auto& [open, op]: SETOPS) {
       const Loaded o = setop(open, a, b, true, true, "test/setop_out_" + tag + ".hset", INHERIT);
@@ -924,8 +923,8 @@ TEST_CASE("hset_builder_setops_are_merges") {
 }
 
 TEST_CASE("hset_builder_setops_write_flags") {
-  const Loaded a = build_input("test/setop_fl_a.hset", 0, 6000, true, BOTH);
-  const Loaded b = build_input("test/setop_fl_b.hset", 3000, 9000, true, BOTH);
+  const Loaded a = build_input("test/setop_fl_a.hset", 0, 6000, true, INDEX);
+  const Loaded b = build_input("test/setop_fl_b.hset", 3000, 9000, true, INDEX);
 
   for (const auto& [open, op]: SETOPS) {
     // hashsets only: the operation is applied to the records, rows follow
@@ -960,7 +959,7 @@ TEST_CASE("hset_builder_setops_write_flags") {
   {
     const Loaded na = build_input("test/setop_fl_na.hset", 0, 3000, true, NONE);
     const Loaded nb = build_input("test/setop_fl_nb.hset", 1000, 4000, true, NONE);
-    const Loaded both = setop(sfhash_hashset_builder_union_open, na, nb, true, true, "test/setop_fl_both.hset", BOTH);
+    const Loaded both = setop(sfhash_hashset_builder_union_open, na, nb, true, true, "test/setop_fl_both.hset", INDEX);
     check_output(both, na, nb, SFHASH_HSET_OP_UNION, true);
     const Loaded none = setop(sfhash_hashset_builder_union_open, na, nb, true, true, "test/setop_fl_none.hset", INHERIT);
     check_output(none, na, nb, SFHASH_HSET_OP_UNION, false);
@@ -992,7 +991,7 @@ TEST_CASE("hset_merge_rebuild_honours_index_kmeans") {
     d.Q = 0x21;
   }
   const Loaded a = build_input("test/merge_method_a.hset", one_cell, 0, 2500, { SFHASH_TLSH }, false, true, SFHASH_HSET_TLSH_INDEX);
-  const Loaded b = build_input("test/merge_method_b.hset", one_cell, 1500, 4000, { SFHASH_TLSH }, false, true, SFHASH_HSET_TLSH_VECTORS);
+  const Loaded b = build_input("test/merge_method_b.hset", one_cell, 1500, 4000, { SFHASH_TLSH }, false, true, NONE);
 
   for (const bool kmeans: { false, true }) {
     const uint32_t opts = SFHASH_HSET_TLSH_INDEX | (kmeans ? uint32_t(SFHASH_HSET_TLSH_INDEX_KMEANS) : 0u);

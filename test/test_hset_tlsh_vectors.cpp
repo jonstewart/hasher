@@ -29,7 +29,7 @@
 
 namespace {
 
-constexpr uint32_t BOTH = SFHASH_HSET_TLSH_VECTORS | SFHASH_HSET_TLSH_INDEX;
+constexpr uint32_t INDEX = SFHASH_HSET_TLSH_INDEX;
 
 const std::vector<TlshDigest>& corpus() {
   static const std::vector<TlshDigest> c = make_tlsh_corpus(21, 5000);
@@ -105,7 +105,7 @@ Built build_text(
     in,
     htypes,
     make_text_converters(htypes),
-    "TLSH vectors test",
+    "TLSH index test",
     "synthetic TLSH corpus",
     outpath,
     "test",
@@ -346,7 +346,7 @@ TEST_CASE("hset_tlsh_vectors_non_tlsh_only") {
     write_hset(
       in, htypes, make_text_converters(htypes),
       "md5 only", "md5 only", "test/md5_only_vec.hset", "test",
-      with_records, true, BOTH
+      with_records, true, INDEX
     );
     const auto buf = read_file("test/md5_only_vec.hset");
     const auto toc = ftoc_of(buf);
@@ -360,7 +360,7 @@ TEST_CASE("hset_tlsh_vectors_non_tlsh_only") {
 }
 
 TEST_CASE("hset_tlsh_knn_index_matches_brute") {
-  const Built b = build(true, "test/tlsh_vec_knn.hset", true, true, BOTH);
+  const Built b = build(true, "test/tlsh_vec_knn.hset", true, true, INDEX);
   const SFHASH_Hashset* hset = b.hset.get();
   const size_t tidx = b.tidx;
   const uint64_t n = sfhash_hashset_count(hset, tidx);
@@ -424,7 +424,7 @@ TEST_CASE("hset_tlsh_knn_index_matches_brute") {
 }
 
 TEST_CASE("hset_tlsh_knn_index_is_exact_beyond_144") {
-  const Built b = build(true, "test/tlsh_vec_knn.hset", true, true, BOTH);
+  const Built b = build(true, "test/tlsh_vec_knn.hset", true, true, INDEX);
   const SFHASH_Hashset* hset = b.hset.get();
   const size_t tidx = b.tidx;
   const uint64_t n = sfhash_hashset_count(hset, tidx);
@@ -445,7 +445,7 @@ TEST_CASE("hset_tlsh_knn_index_is_exact_beyond_144") {
 
 
 TEST_CASE("hset_tlsh_knn_without_index_is_brute") {
-  for (const uint32_t opts: { 0u, uint32_t(SFHASH_HSET_TLSH_VECTORS) }) {
+  for (const uint32_t opts: { 0u, 1u }) { // bit 1 is ignored
     const Built b = build(true, "test/tlsh_vec_noidx.hset", true, true, opts);
     const SFHASH_Hashset* hset = b.hset.get();
     const size_t tidx = b.tidx;

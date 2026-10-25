@@ -215,16 +215,16 @@ SFHASH_HashsetBuildCtx* sfhash_hashset_builder_open(
 );
 
 /*
- * Optional sections of TLSH hashsets: the embedding vectors (TVEC) and the
- * kNN index (TIVF). The default is both.
+ * The optional section of TLSH hashsets: the kNN index (TIVF), written by
+ * default. Bit 1 (once the stored embedding vectors, TVEC, no longer part
+ * of the format) is reserved and ignored.
  */
 enum {
-  SFHASH_HSET_TLSH_VECTORS = 1,
   SFHASH_HSET_TLSH_INDEX = 2,
-  /* sfhash_hashset_merge only: write each optional section iff every input
-   * that has a TLSH hashset has it; the other bits are ignored (an index
-   * is then always carried through the merge, never rebuilt, so
-   * INDEX_KMEANS has nothing to select) */
+  /* sfhash_hashset_merge only: write the index iff every input that has a
+   * TLSH hashset has one; the other bits are ignored (an index is then
+   * always carried through the merge, never rebuilt, so INDEX_KMEANS has
+   * nothing to select) */
   SFHASH_HSET_TLSH_INHERIT = 4,
   /* build the TIVF index with the float k-means clustering instead of the
    * default integer build; the index is equally exact, builds in time
@@ -235,10 +235,10 @@ enum {
 };
 
 /*
- * Select which optional TLSH sections to write; options is a bitwise OR of
- * SFHASH_HSET_TLSH_* values (0 for neither). Only TLSH hashsets are
- * affected, and only when hashsets are written. Call after *_open and
- * before *_write.
+ * Select the optional TLSH sections to write; options is a bitwise OR of
+ * SFHASH_HSET_TLSH_* values (0 for none). Only TLSH hashsets are affected,
+ * and only when hashsets are written. Call after *_open and before
+ * *_write.
  */
 void sfhash_hashset_builder_set_tlsh_options(
   SFHASH_HashsetBuildCtx* bctx,
@@ -271,9 +271,9 @@ void sfhash_hashset_builder_destroy(SFHASH_HashsetBuildCtx* bctx);
  * merge of the inputs exactly as sfhash_hashset_merge computes it (see
  * HASHSET_FORMAT, "Set operations"): records are written when both inputs
  * have record tables and write_records is set, hash sections when the
- * inputs have them and write_hashsets is set. The optional TLSH sections
- * default to both (sfhash_hashset_builder_set_tlsh_options changes that,
- * SFHASH_HSET_TLSH_INHERIT included) and the index coalescing threshold to
+ * inputs have them and write_hashsets is set. The TLSH index is written by
+ * default (sfhash_hashset_builder_set_tlsh_options changes that,
+ * SFHASH_HSET_TLSH_INHERIT included) and the index coalescing threshold is
  * SFHASH_HSET_COALESCE_DEFAULT (sfhash_hashset_builder_set_coalesce_threshold).
  * Nothing can be added to such a context: write fails if
  * sfhash_hashset_builder_add_record or _add_hash was called on it. temp_dir
@@ -353,15 +353,15 @@ enum {
  * l minus r).
  *
  * Every hash section of the output is produced by merging the two inputs'
- * sorted sections; TLSH cell indexes, vectors and kNN indexes are carried
- * through the merge rather than rebuilt (see HASHSET_FORMAT, "Set
+ * sorted sections; TLSH cell indexes and kNN indexes are carried through
+ * the merge rather than rebuilt (see HASHSET_FORMAT, "Set
  * operations"). The output has a record table only when both inputs have
  * one; otherwise it is a hashsets-only file and rows are deduplicated. An
  * input with hash sections cannot be merged with a records-only input.
  *
  * tlsh_options is a bitwise OR of SFHASH_HSET_TLSH_* values selecting the
- * optional TLSH sections, or SFHASH_HSET_TLSH_INHERIT to keep what the
- * inputs have. coalesce_threshold is described above.
+ * optional TLSH index, or SFHASH_HSET_TLSH_INHERIT to write one iff the
+ * inputs have one. coalesce_threshold is described above.
  *
  * Returns the size of the output file, or 0 on error (err set).
  */

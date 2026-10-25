@@ -23,10 +23,7 @@
  * the kNN query time (k = 10, max_distance = 144, 50 fixed queries) with the
  * rows scanned per query on both indexes.
  *
- * Files are hashsets-only with the index and without the TVEC vectors: the
- * vectors are 1 KiB per row of plain I/O (a copy in the merge, an embedding
- * pass in a build) that kNN never reads, and would hide the index cost both
- * ways. Batches are near-duplicates of master rows (digest-space
+ * Files are hashsets-only with the index. Batches are near-duplicates of master rows (digest-space
  * perturbation of the master corpus) plus new families from the corpus
  * generator with a fresh seed. The from-scratch build clusters cells in
  * parallel; the merge is single-threaded.
@@ -360,7 +357,7 @@ TEST_CASE("bench_hset_merge_incremental") {
   }
 
   // summary
-  std::cout << "\nIncremental merge vs from-scratch rebuild (TIVF only, no TVEC; build " << BUILD_NAME << "; k = " << K
+  std::cout << "\nIncremental merge vs from-scratch rebuild (TIVF; build " << BUILD_NAME << "; k = " << K
             << ", max_distance = " << MAX_DISTANCE << ", " << NUM_QUERIES << " queries)\n\n"
             << "| N | batches | T | C | merge total ms | rebuild ms | rows | TIVF merged KiB | TIVF rebuilt KiB | lists merged | lists rebuilt | cells | bound | kNN merged us | kNN rebuilt us | rows/q merged | rows/q rebuilt |\n"
             << "|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|\n";
