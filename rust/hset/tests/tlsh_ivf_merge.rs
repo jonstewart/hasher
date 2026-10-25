@@ -906,6 +906,21 @@ fn a_map_not_increasing_within_a_list_is_an_error() {
 }
 
 #[test]
+fn a_map_sending_two_members_of_a_list_to_one_row_is_an_error() {
+    // not injective: the second member of list A goes where the first
+    // does; no id is dropped, so the id count still matches the rows
+    let (h, _) = small_lists_cell();
+    let mut map = h.identity();
+    map[h.ids[0][1] as usize] = map[h.ids[0][0] as usize];
+    for c in [0, DEFAULT_COALESCE] {
+        assert_rejected(
+            merge_tlsh_ivf(Some((&h.ivf, &map[..])), NONE, &h.rows, c),
+            "not increasing",
+        );
+    }
+}
+
+#[test]
 fn more_output_rows_than_mapped_ids_is_an_error() {
     let (h, _) = small_lists_cell();
     let map = h.identity();
