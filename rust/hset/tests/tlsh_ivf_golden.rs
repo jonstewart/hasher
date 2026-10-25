@@ -82,7 +82,7 @@ fn large_cells() -> Vec<CellSpec> {
 
 /// 12 cells of 150-399 rows: flat only.
 fn small_cells() -> Vec<CellSpec> {
-    let mut g = Mt19937_64::new(0x736d_616c_6c);
+    let mut g = Mt19937_64::new(0x73_6d61_6c6c);
     (0..12u8)
         .map(|c| CellSpec {
             l: 7 + 11 * c,
@@ -107,7 +107,13 @@ fn max_cell_rows(ivf: &TlshIvf) -> u64 {
         .unwrap_or(0)
 }
 
-fn check_golden(rows: &[[u8; 36]], ivf: &TlshIvf, want_rows: usize, want_lists: usize, want_sha: &str) {
+fn check_golden(
+    rows: &[[u8; 36]],
+    ivf: &TlshIvf,
+    want_rows: usize,
+    want_lists: usize,
+    want_sha: &str,
+) {
     let got = sha256_hex(&ivf.to_bytes());
     let info = format!(
         "rows {}, lists {}, ids {}, sha256 {got}",
@@ -190,7 +196,9 @@ fn chunks(file: &[u8]) -> Vec<([u8; 4], &[u8])> {
     };
     let (tag, toc) = chunk_at(40);
     assert_eq!(tag, FTOC, "no FTOC at offset 40");
-    toc.chunks_exact(12)
+    toc.as_chunks::<12>()
+        .0
+        .iter()
         .map(|e| {
             let off = u64::from_le_bytes(e[..8].try_into().unwrap()) as usize;
             let (tag, payload) = chunk_at(off);
@@ -229,10 +237,30 @@ fn rebuilding_cpp_fixtures_reproduces_their_tivf() {
     // (81 rows, duplicates kept; the TLSH-first file has the same rows) and
     // hashsets-only (80 rows)
     let cases = [
-        ("md5_tlsh.hset", 81, 76, "4526562d16fc0251141dd786fc6a810f8bdda64dbd1db43dac06928bc7d901ef"),
-        ("md5_tlsh_knn.hset", 81, 76, "4526562d16fc0251141dd786fc6a810f8bdda64dbd1db43dac06928bc7d901ef"),
-        ("tlsh_md5.hset", 81, 76, "4526562d16fc0251141dd786fc6a810f8bdda64dbd1db43dac06928bc7d901ef"),
-        ("md5_tlsh_ho.hset", 80, 76, "06f4d2ff581774066559d1094f0eda30e3421836615e255069c32026ec1d0d88"),
+        (
+            "md5_tlsh.hset",
+            81,
+            76,
+            "4526562d16fc0251141dd786fc6a810f8bdda64dbd1db43dac06928bc7d901ef",
+        ),
+        (
+            "md5_tlsh_knn.hset",
+            81,
+            76,
+            "4526562d16fc0251141dd786fc6a810f8bdda64dbd1db43dac06928bc7d901ef",
+        ),
+        (
+            "tlsh_md5.hset",
+            81,
+            76,
+            "4526562d16fc0251141dd786fc6a810f8bdda64dbd1db43dac06928bc7d901ef",
+        ),
+        (
+            "md5_tlsh_ho.hset",
+            80,
+            76,
+            "06f4d2ff581774066559d1094f0eda30e3421836615e255069c32026ec1d0d88",
+        ),
     ];
     let mut checked = 0;
     for (name, want_rows, want_lists, want_sha) in cases {
@@ -246,7 +274,10 @@ fn rebuilding_cpp_fixtures_reproduces_their_tivf() {
         let ivf = build_tlsh_ivf(&rows, &IvfBuildOptions::default()).expect("build");
         assert_eq!(rows.len(), want_rows, "{name}");
         assert_eq!(ivf.lists(), want_lists, "{name}");
-        assert!(ivf.to_bytes() == payload, "{name}: rebuilt TIVF differs from C++'s");
+        assert!(
+            ivf.to_bytes() == payload,
+            "{name}: rebuilt TIVF differs from C++'s"
+        );
         checked += 1;
     }
     eprintln!("checked {checked} fixtures in {}", dir.display());
@@ -273,6 +304,9 @@ fn rebuilding_other_fresh_cpp_builds_reproduces_their_tivf() {
         };
         let (rows, payload) = tlsh_section(&file).unwrap_or_else(|| panic!("{name}: no TLSH TIVF"));
         let ivf = build_tlsh_ivf(&rows, &IvfBuildOptions::default()).expect("build");
-        assert!(ivf.to_bytes() == payload, "{name}: rebuilt TIVF differs from C++'s");
+        assert!(
+            ivf.to_bytes() == payload,
+            "{name}: rebuilt TIVF differs from C++'s"
+        );
     }
 }

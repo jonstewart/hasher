@@ -1,4 +1,49 @@
-//! The BISECT builder of TIVF indexes (`build_tlsh_ivf`).
+//! The BISECT builder of TIVF indexes, [`build_tlsh_ivf`]: C++
+//! `build_tlsh_ivf` with `TlshIvfBuild::BISECT` (`src/lib/hashset/
+//! tlsh_ivf.cpp`, `include/hashset/tlsh_ivf.h`; docs/TLSH_EMBEDDING.md
+//! section 3), ported so the payload bytes are identical to C++'s for the
+//! same rows and options.
+//!
+//! # Algorithm
+//!
+//! Each nonempty cell is partitioned on its own, with its own
+//! [`Mt19937_64`] seeded `seed ^ (cell * 0x9E3779B97F4A7C15)`, so cells
+//! can be built in parallel and the result does not depend on the thread
+//! count. Within a cell, integer arithmetic only:
+//!
+//! * A node of more than [`FLAT_MAX`] rows is split in two around two
+//!   far-apart member pivots (the member farthest from a random member,
+//!   and the member farthest from that), members nearer the first pivot
+//!   (ties to it) going first in their order; when either side would hold
+//!   less than 1/8 of the node, the node is instead sorted by (distance to
+//!   the first pivot, row) and cut in half. Halves are recursed into depth
+//!   first, the lower first, which fixes the order of the RNG draws.
+//! * A node of `s <= FLAT_MAX` rows is clustered flat by k-means into at
+//!   most `k = ceil(s / T)` lists (one list, with no draw, when `k <= 1`):
+//!   k-means++ seeding with the body-embedding kernel (stopping early when
+//!   every member sits on a seed's body), then assignment of every member
+//!   to its nearest centroid and up to 10 rounds of recomputing the
+//!   centroids and reassigning, stopping when nothing changes. A centroid
+//!   is the exact `i32` coordinate sum and count of its members' body
+//!   embeddings ([`embed_body_i8`]), distances to it are compared exactly
+//!   ([`nearer`]), ties go to the smaller centroid, and empty groups are
+//!   dropped.
+//! * Each list's ids are sorted and its medoid is its exact 1-center, the
+//!   member whose largest squared body-embedding distance to the others is
+//!   smallest (ties to the smaller row); `radius2` is that distance.
+//!
+//! Every draw is `rng() % n` straight from the engine, as in C++, whose
+//! standard distributions are implementation-defined.
+//!
+//! The output concatenates the cells in cell order; a fresh build does not
+//! coalesce small lists, so [`check_invariant`](super::check_invariant)
+//! need not hold for it.
+//!
+//! # Differences from the C++ library
+//!
+//! * KMEANS (`TlshIvfBuild::KMEANS`, float k-means) is not ported; Rust
+//!   reads and searches KMEANS-built indexes but builds BISECT only.
+//! * Invalid input is an [`Error::Input`] instead of a thrown exception.
 
 use std::num::NonZeroUsize;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -15,18 +60,21 @@ use crate::tlsh::mt64::Mt19937_64;
 /// A raw 36-byte row of a TLSH section.
 type Row = [u8; DIGEST_LENGTH];
 
-/// Options of [`build_tlsh_ivf`].
+/// Options of [`build_tlsh_ivf`] (the C++ default arguments).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct IvfBuildOptions {
-    /// The clustering target `T`: lists hold about this many rows.
+    /// The clustering target `T`: a flat node of `s` rows gets at most
+    /// `ceil(s / T)` lists. Must be positive.
     pub target_list_size: usize,
-    /// Seed of the random draws.
+    /// Seed of the random draws; each cell's engine is seeded from it.
     pub seed: u64,
-    /// Threads to cluster cells on; 0 = available parallelism.
+    /// Threads to build cells on; 0 means
+    /// [`std::thread::available_parallelism`]. Never changes the result.
     pub threads: usize,
 }
 
 impl Default for IvfBuildOptions {
+    /// `T` = [`TARGET_LIST_SIZE`] (32), seed [`DEFAULT_SEED`], threads 0.
     fn default() -> Self {
         Self {
             target_list_size: TARGET_LIST_SIZE,
@@ -65,7 +113,21 @@ struct CellLists {
     ids: Vec<u32>,
 }
 
-/// Build the BISECT index over sorted rows.
+/// Build the BISECT index over the rows of a TLSH section (see the
+/// [module docs](self)). `rows` must be in bytewise order, as an `HDAT`
+/// is; equal rows (a records file's duplicates) are allowed and each is
+/// indexed. The result passes [`IvfIndex::validate`](super::IvfIndex::validate)
+/// against `rows`, every medoid is a member of its list, and `radius2` is
+/// exact.
+///
+/// # Errors
+///
+/// [`Error::Input`] when `target_list_size` is 0, the rows are not sorted,
+/// or there are more than `u32::MAX` rows (TIVF ids are `u32`).
+///
+/// # Panics
+///
+/// Only if a worker thread panics (the panic is resumed on the caller).
 pub fn build_tlsh_ivf(rows: &[Row], opts: &IvfBuildOptions) -> Result<TlshIvf> {
     if opts.target_list_size == 0 {
         return Err(Error::input("target_list_size must be positive"));
@@ -307,11 +369,10 @@ impl<'a> CellBisector<'a> {
         let qa = BodyQuery::new(&TlshDigest(self.rows[a as usize]));
         let qb = BodyQuery::new(&TlshDigest(self.rows[b as usize]));
         let rows = self.rows;
-        let (near_a, near_b): (Vec<u32>, Vec<u32>) =
-            self.perm[lo..hi].iter().partition(|&&id| {
-                let r = &rows[id as usize];
-                qa.emb_body(r) <= qb.emb_body(r)
-            });
+        let (near_a, near_b): (Vec<u32>, Vec<u32>) = self.perm[lo..hi].iter().partition(|&&id| {
+            let r = &rows[id as usize];
+            qa.emb_body(r) <= qb.emb_body(r)
+        });
         let mid = lo + near_a.len();
         self.perm[lo..mid].copy_from_slice(&near_a);
         self.perm[mid..hi].copy_from_slice(&near_b);
@@ -495,8 +556,8 @@ impl<'a> CellBisector<'a> {
             for (c, (sc, &nc)) in self.sum.iter().zip(&self.cnt).enumerate() {
                 let dot = dot(x, sc);
                 let n = i64::from(nc);
-                let big = (n * n * i64::from(self.norm2[i]) - 2 * n * i64::from(dot)
-                    + self.sum2[c]) as u64;
+                let big = (n * n * i64::from(self.norm2[i]) - 2 * n * i64::from(dot) + self.sum2[c])
+                    as u64;
                 if c == 0 || nearer(big, n as u64, best_big, best_n) {
                     best = c as u32;
                     best_big = big;

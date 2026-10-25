@@ -9,8 +9,8 @@ use hset::tlsh::CELL_COUNT;
 use hset::tlsh::ivf::bisect::{IvfBuildOptions, build_tlsh_ivf, nearer};
 use hset::tlsh::ivf::{FLAT_MAX, IvfIndex, TlshIvf};
 use hset::tlsh::knn::{TlshMatch, knn_brute};
-use hset::tlsh::{TlshDigest, body_diff, emb_body_dist2, header_diff};
 use hset::tlsh::mt64::Mt19937_64;
+use hset::tlsh::{TlshDigest, body_diff, emb_body_dist2, header_diff};
 use hset_testkit::tlsh::{
     Perturbation, cell_corpus, corpus, perturb_corpus, random_digest_with_header, sorted_rows,
 };
@@ -221,7 +221,10 @@ fn check_bisect_shape(ivf: &TlshIvf, t: u64) {
         let m = ivf.list_start[el] - ivf.list_start[fl];
         let lists = (el - fl) as u64;
         if m <= f {
-            assert!(lists <= m.div_ceil(t), "cell {c:#06x}: {lists} lists of {m} rows");
+            assert!(
+                lists <= m.div_ceil(t),
+                "cell {c:#06x}: {lists} lists of {m} rows"
+            );
         } else {
             assert!(
                 lists * t * f <= m * f + 8 * m * (t - 1),
@@ -329,8 +332,14 @@ fn families_come_out_as_pure_lists() {
         let mut seen: Vec<usize> = Vec::new();
         for l in 0..nf {
             assert_eq!(ivf.list_len(l), 30);
-            let fams: Vec<usize> = ivf.list_ids(l).map(|i| family_of(&rows[i as usize])).collect();
-            assert!(fams.iter().all(|&f| f == fams[0]), "list {l} mixes families");
+            let fams: Vec<usize> = ivf
+                .list_ids(l)
+                .map(|i| family_of(&rows[i as usize]))
+                .collect();
+            assert!(
+                fams.iter().all(|&f| f == fams[0]),
+                "list {l} mixes families"
+            );
             seen.push(fams[0]);
         }
         seen.sort_unstable();
@@ -378,7 +387,10 @@ fn rows_go_to_the_nearest_mean_not_the_nearest_medoid() {
         assert_eq!(ivf.lists(), 2, "seed {seed}");
         for l in 0..2 {
             let has_t = ivf.list_ids(l).any(|i| rows[i as usize] == t);
-            let copies_of_f = ivf.list_ids(l).filter(|&i| d(&rows[i as usize], &f) == 0).count();
+            let copies_of_f = ivf
+                .list_ids(l)
+                .filter(|&i| d(&rows[i as usize], &f) == 0)
+                .count();
             assert_eq!(ivf.list_len(l), if has_t { 7 } else { 16 }, "seed {seed}");
             assert_eq!(copies_of_f, if has_t { 0 } else { 16 }, "seed {seed}");
         }
@@ -414,7 +426,8 @@ fn the_build_does_not_depend_on_the_thread_count() {
 fn check_medoids_are_members(ivf: &TlshIvf, rows: &[[u8; 36]]) {
     for l in 0..ivf.lists() {
         assert!(
-            ivf.list_ids(l).any(|i| TlshDigest(rows[i as usize]) == ivf.medoids[l]),
+            ivf.list_ids(l)
+                .any(|i| TlshDigest(rows[i as usize]) == ivf.medoids[l]),
             "list {l}: medoid is not a member"
         );
     }
@@ -568,4 +581,3 @@ fn one_cell_of_twenty_thousand_rows_is_split_and_searchable() {
     // the radii prune: fewer rows scored than a scan of every query
     assert!(scanned < 2 * 5 * 6 * rows.len(), "scanned {scanned}");
 }
-
