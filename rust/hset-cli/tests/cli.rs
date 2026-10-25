@@ -618,3 +618,95 @@ fn info_reports_the_tlsh_cell_hint_and_index() {
     // The md5 section has no TLSH line.
     assert_eq!(s.matches("tlsh: ").count(), 1, "{s}");
 }
+
+/// The `info` line of the TLSH section of `f`.
+fn tlsh_info_line(f: &Path) -> String {
+    let o = run(&["info", p(f)]);
+    assert!(o.status.success(), "{}", stderr(&o));
+    stdout(&o)
+        .lines()
+        .find(|l| l.starts_with("      tlsh: "))
+        .unwrap_or_else(|| panic!("no tlsh line in {}", stdout(&o)))
+        .to_string()
+}
+
+const WITH_INDEX: &str = "      tlsh: cell hint yes; index TIVF, 76 lists (259.9 KiB)";
+const NO_INDEX: &str = "      tlsh: cell hint yes; index none";
+
+#[test]
+fn make_no_tlsh_index_writes_the_cell_hint_but_no_tivf() {
+    let dir = tmpdir("tlsh-no-index");
+    let f = dir.join("t.hset");
+    made_tlsh(&f, &["--no-tlsh-index"]);
+    assert_eq!(tlsh_info_line(&f), NO_INDEX);
+    // The rows are the same either way.
+    let with = dir.join("with.hset");
+    made_tlsh(&with, &[]);
+    assert_eq!(
+        stdout(&run(&["dump", p(&f), "-t", "tlsh"])),
+        stdout(&run(&["dump", p(&with), "-t", "tlsh"]))
+    );
+}
+
+#[test]
+fn make_reads_hset_tlsh_options_as_mkhashset_does() {
+    let dir = tmpdir("tlsh-env");
+    let f = dir.join("t.hset");
+    // 2 (INDEX) writes the index; 1 (reserved) and 4 (INHERIT) are ignored.
+    for (value, want) in [
+        ("0", NO_INDEX),
+        ("1", NO_INDEX),
+        ("2", WITH_INDEX),
+        ("3", WITH_INDEX),
+        ("6", WITH_INDEX),
+        ("4", NO_INDEX),
+    ] {
+        let o = make_tlsh(&f, &[], &[("HSET_TLSH_OPTIONS", value)]);
+        assert!(o.status.success(), "{value}: {}", stderr(&o));
+        assert_eq!(tlsh_info_line(&f), want, "HSET_TLSH_OPTIONS={value}");
+    }
+    // The flag wins over the variable, which is then not read at all.
+    for value in ["2", "junk"] {
+        let o = make_tlsh(&f, &["--no-tlsh-index"], &[("HSET_TLSH_OPTIONS", value)]);
+        assert!(o.status.success(), "{value}: {}", stderr(&o));
+        assert_eq!(tlsh_info_line(&f), NO_INDEX, "HSET_TLSH_OPTIONS={value}");
+    }
+}
+
+#[test]
+fn make_rejects_bad_hset_tlsh_options() {
+    let dir = tmpdir("tlsh-env-bad");
+    let f = dir.join("t.hset");
+    // Not a nonnegative integer (ruling 4; mkhashset's lexical_cast<uint32_t>
+    // wraps "-1" around instead), the k-means bit, and unknown bits.
+    for value in [
+        "-1",
+        "abc",
+        "",
+        " 2",
+        "2 ",
+        "0x2",
+        "4294967296",
+        "8",
+        "10",
+        "16",
+    ] {
+        let o = make_tlsh(&f, &[], &[("HSET_TLSH_OPTIONS", value)]);
+        assert_eq!(o.status.code(), Some(2), "HSET_TLSH_OPTIONS={value:?}");
+        assert!(
+            stderr(&o).contains("HSET_TLSH_OPTIONS"),
+            "{value:?}: {}",
+            stderr(&o)
+        );
+    }
+    // Read even when no column is TLSH, as mkhashset reads it.
+    let input = dir.join("md5.txt");
+    std::fs::write(&input, format!("{MD5_A}\n")).unwrap();
+    let o = bin()
+        .args(["make", "-t", "md5", "-o", p(&f), p(&input)])
+        .env("HSET_TLSH_OPTIONS", "-1")
+        .output()
+        .unwrap();
+    assert_eq!(o.status.code(), Some(2), "{}", stderr(&o));
+    assert!(stderr(&o).contains("HSET_TLSH_OPTIONS"), "{}", stderr(&o));
+}

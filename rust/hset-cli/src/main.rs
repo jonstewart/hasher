@@ -145,13 +145,56 @@ impl OutputArgs {
 
 #[derive(Args)]
 struct MakeArgs {
-    /// Hash types in column order, e.g. `md5,sha1` or `sha1,size`
+    /// Hash types in column order, e.g. `md5,sha1`, `sha1,size` or
+    /// `md5,tlsh`. A TLSH column takes `T1` and 70 hex digits (or the
+    /// digits alone); `TNULL` or an empty column means no digest
     #[arg(short = 't', long, required = true, value_delimiter = ',')]
     types: Vec<HashType>,
     #[command(flatten)]
     out: OutputArgs,
+    /// Write no TIVF kNN index for the TLSH section (it still gets its
+    /// cell hint). Without this flag, HSET_TLSH_OPTIONS is read as
+    /// mkhashset reads it: a nonnegative integer of option bits, 2 to write
+    /// the index (the default when unset), 0 for none; 1 and 4 are
+    /// ignored, and 8 (k-means build) or any other bit is an error
+    #[arg(long)]
+    no_tlsh_index: bool,
     /// Input text files (default: stdin; `-` is stdin)
     inputs: Vec<PathBuf>,
+}
+
+/// The environment variable `mkhashset` reads its TLSH option bits from.
+const TLSH_OPTIONS_ENV: &str = "HSET_TLSH_OPTIONS";
+
+/// `opts` with the TLSH index choice of `make`: none with
+/// `--no-tlsh-index` (the environment is then not read), else the bits of
+/// `HSET_TLSH_OPTIONS` when it is set ([`BuildOptions::tlsh_options`]),
+/// else the default (the index). A value that is not a nonnegative
+/// decimal `u32` is an error (ruling 4; mkhashset's
+/// `lexical_cast<uint32_t>` accepts `-1` as 4294967295).
+fn make_tlsh_options(
+    opts: BuildOptions,
+    no_tlsh_index: bool,
+    env: Option<std::ffi::OsString>,
+) -> CliResult<BuildOptions> {
+    if no_tlsh_index {
+        return Ok(opts.tlsh_index(false));
+    }
+    let Some(value) = env else {
+        return Ok(opts);
+    };
+    let bits = value
+        .to_str()
+        .filter(|v| v.bytes().all(|b| b.is_ascii_digit()))
+        .and_then(|v| v.parse::<u32>().ok())
+        .ok_or_else(|| {
+            format!(
+                "{TLSH_OPTIONS_ENV} is not a nonnegative integer: '{}'",
+                value.to_string_lossy()
+            )
+        })?;
+    opts.tlsh_options(bits)
+        .map_err(|e| format!("{TLSH_OPTIONS_ENV}: {e}"))
 }
 
 #[derive(Args)]
@@ -340,6 +383,11 @@ fn summarize(bytes: &[u8], path: &Path) -> CliResult<()> {
 }
 
 fn cmd_make(a: MakeArgs) -> CliResult<()> {
+    let opts = make_tlsh_options(
+        a.out.options(None, None),
+        a.no_tlsh_index,
+        std::env::var_os(TLSH_OPTIONS_ENV),
+    )?;
     let mut b = Builder::new(&a.types).map_err(|e| e.to_string())?;
     let inputs: Vec<PathBuf> = if a.inputs.is_empty() {
         vec![PathBuf::from("-")]
@@ -354,9 +402,7 @@ fn cmd_make(a: MakeArgs) -> CliResult<()> {
                 .map_err(|e| format!("{}:{}: {e}", input.display(), lineno + 1))?;
         }
     }
-    let bytes = b
-        .build(&a.out.options(None, None))
-        .map_err(|e| e.to_string())?;
+    let bytes = b.build(&opts).map_err(|e| e.to_string())?;
     write_output(&a.out.output, &bytes)?;
     summarize(&bytes, &a.out.output)
 }
