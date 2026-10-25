@@ -22,3 +22,30 @@ fn set_union_emits_each_distinct_row_once_left_copy_first() {
     assert_eq!(m.lmap, [0, 1, D, 3, 4]);
     assert_eq!(m.rmap, [D, 2, D, D, 5]);
 }
+
+#[test]
+fn set_intersect_emits_rows_on_both_sides_as_left_copies() {
+    let m = sets(SetOp::Intersect, &L5, &R5);
+    assert_eq!(m.n, 2);
+    assert_eq!(m.lmap, [D, 0, D, D, 1]);
+    assert_eq!(m.rmap, [D; 5]);
+}
+
+#[test]
+fn set_difference_emits_left_rows_absent_on_the_right() {
+    let m = sets(SetOp::Subtract, &L5, &R5);
+    assert_eq!(m.n, 2);
+    assert_eq!(m.lmap, [0, D, D, 1, D]);
+    assert_eq!(m.rmap, [D; 5]);
+}
+
+#[test]
+fn set_merges_with_an_empty_side() {
+    assert_eq!(sets(SetOp::Union, &L5, &[]).n, 4);
+    assert_eq!(sets(SetOp::Intersect, &L5, &[]).n, 0);
+    assert_eq!(sets(SetOp::Subtract, &[], &R5).n, 0);
+    let m = sets(SetOp::Union, &[], &R5);
+    assert_eq!(m.n, 4);
+    assert_eq!(m.rmap, [0, 1, 2, D, 3]);
+    assert!(m.lmap.is_empty());
+}

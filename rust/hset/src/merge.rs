@@ -6,7 +6,9 @@
 //! The derived structures of a section (its `RIDX` record index, a TLSH
 //! `TIVF` index) are carried through the merge by those maps.
 
-use crate::error::Result;
+use std::cmp::Ordering;
+
+use crate::error::{Error, Result};
 use crate::ops::SetOp;
 
 /// A row that the merge does not emit (the same value as the TLSH index's
@@ -59,48 +61,114 @@ pub struct RowMerge {
 /// Merges two sorted runs of `len`-byte rows (`left` and `right` hold the
 /// rows back to back). Output row `k` is the input row mapped to `k`.
 pub fn merge_rows(left: &[u8], right: &[u8], len: usize, mode: RowMode<'_>) -> Result<RowMerge> {
-    let _ = mode;
-    let row = |b: &[u8], i: usize| -> Vec<u8> { b[i * len..(i + 1) * len].to_vec() };
-    let (ln, rn) = (left.len() / len, right.len() / len);
+    let op = match mode {
+        RowMode::Set(op) => op,
+        RowMode::Records { .. } => SetOp::Union,
+    };
+    let (l, r) = (Rows::new(left, len), Rows::new(right, len));
     let mut m = RowMerge {
         n: 0,
-        lmap: vec![DROPPED; ln],
-        rmap: vec![DROPPED; rn],
+        lmap: vec![DROPPED; l.n],
+        rmap: vec![DROPPED; r.n],
     };
-    let skip_run = |b: &[u8], n: usize, k: &mut usize| {
-        let v = row(b, *k);
-        *k += 1;
-        while *k < n && row(b, *k) == v {
-            *k += 1;
+    merge_sets(op, l, r, &mut m)?;
+    Ok(m)
+}
+
+/// Fixed-length rows stored back to back.
+#[derive(Clone, Copy)]
+struct Rows<'a> {
+    data: &'a [u8],
+    len: usize,
+    n: usize,
+}
+
+impl<'a> Rows<'a> {
+    fn new(data: &'a [u8], len: usize) -> Self {
+        Rows {
+            data,
+            len,
+            n: data.len() / len,
         }
-    };
+    }
+
+    fn get(&self, i: usize) -> &'a [u8] {
+        &self.data[i * self.len..(i + 1) * self.len]
+    }
+
+    /// The index after the run of rows equal to row `k`.
+    fn skip_run(&self, k: usize) -> usize {
+        let v = self.get(k);
+        let mut k = k + 1;
+        while k < self.n && self.get(k) == v {
+            k += 1;
+        }
+        k
+    }
+}
+
+/// Order of the next left row against the next right row, an exhausted side
+/// sorting last.
+fn next_order(l: &Rows<'_>, i: usize, r: &Rows<'_>, j: usize) -> Ordering {
+    if i < l.n && j < r.n {
+        l.get(i).cmp(r.get(j))
+    } else if i < l.n {
+        Ordering::Less
+    } else {
+        Ordering::Greater
+    }
+}
+
+/// An input row of one side.
+#[derive(Clone, Copy)]
+enum Side {
+    Left(usize),
+    Right(usize),
+}
+
+/// Maps `row` to the next output row.
+fn emit(m: &mut RowMerge, row: Side) -> Result<()> {
+    // C++ refuses once the count reaches MERGE_DROPPED: the last row index
+    // is DROPPED - 2
+    let k = u32::try_from(m.n)
+        .ok()
+        .filter(|&k| k < DROPPED - 1)
+        .ok_or_else(|| Error::input("too many rows in merged hashset"))?;
+    match row {
+        Side::Left(i) => m.lmap[i] = k,
+        Side::Right(j) => m.rmap[j] = k,
+    }
+    m.n += 1;
+    Ok(())
+}
+
+fn merge_sets(op: SetOp, l: Rows<'_>, r: Rows<'_>, m: &mut RowMerge) -> Result<()> {
+    let emit_left_only = op != SetOp::Intersect;
+    let emit_right_only = op == SetOp::Union;
+    let emit_both = op != SetOp::Subtract;
     let (mut i, mut j) = (0, 0);
-    while i < ln || j < rn {
-        let c = if i < ln && j < rn {
-            row(left, i).cmp(&row(right, j))
-        } else if i < ln {
-            std::cmp::Ordering::Less
-        } else {
-            std::cmp::Ordering::Greater
-        };
-        match c {
-            std::cmp::Ordering::Less => {
-                m.lmap[i] = m.n as u32;
-                m.n += 1;
-                skip_run(left, ln, &mut i);
+    while i < l.n || j < r.n {
+        match next_order(&l, i, &r, j) {
+            Ordering::Less => {
+                if emit_left_only {
+                    emit(m, Side::Left(i))?;
+                }
+                i = l.skip_run(i);
             }
-            std::cmp::Ordering::Greater => {
-                m.rmap[j] = m.n as u32;
-                m.n += 1;
-                skip_run(right, rn, &mut j);
+            Ordering::Greater => {
+                if emit_right_only {
+                    emit(m, Side::Right(j))?;
+                }
+                j = r.skip_run(j);
             }
-            std::cmp::Ordering::Equal => {
-                m.lmap[i] = m.n as u32;
-                m.n += 1;
-                skip_run(left, ln, &mut i);
-                skip_run(right, rn, &mut j);
+            Ordering::Equal => {
+                if emit_both {
+                    emit(m, Side::Left(i))?;
+                }
+                i = l.skip_run(i);
+                j = r.skip_run(j);
             }
         }
     }
-    Ok(m)
+    Ok(())
 }
