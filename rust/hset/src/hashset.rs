@@ -1,17 +1,131 @@
 //! A loaded `.hset`: decoded structure plus lookup strategies.
+//!
+//! # TLSH similarity search
+//!
+//! A TLSH section (36-byte canonical digests, [`HashType::Tlsh`]) answers
+//! k-nearest-neighbour queries by TLSH distance as well as exact lookups
+//! (C `sfhash_hashset_tlsh_knn*`, `src/lib/hashset/tlsh_search.cpp`):
+//!
+//! * [`Hashset::tlsh_rows`]: the section's sorted rows; match indexes
+//!   are positions in them.
+//! * [`Hashset::tlsh_index`]: its `TIVF` index, validated on first use,
+//!   for searching ([`crate::tlsh::knn_ivf`]) or merging
+//!   ([`crate::tlsh::merge_tlsh_ivf`]).
+//! * [`Hashset::tlsh_knn_strategies`], [`Hashset::tlsh_knn`] (the index
+//!   when there is one, else brute force) and [`Hashset::tlsh_knn_with`]
+//!   (a chosen [`KnnStrategy`], optionally counting [`KnnStats`]).
+//!
+//! Every strategy returns the same matches: at most k rows within the
+//! distance bound, ordered by (distance, row index).
+//!
+//! The `TIVF` header is checked by [`Hashset::load`], so a file with a bad
+//! version, dims, row count, length or list offsets does not load. The
+//! rest of the index (ids, cells, radii) is validated in O(n) on first
+//! use and the outcome kept: an invalid index makes index searches an
+//! [`Error::Format`] and [`Hashset::verify`] report it, while brute force
+//! still works (controller ruling 5).
+//!
+//! ## Differences from the C API
+//!
+//! * A section that is not TLSH, or does not exist, is an
+//!   [`Error::Input`]; C returns 0 matches (or strategies).
+//! * Asking for the index of a file without one is an [`Error::Input`];
+//!   C returns 0 matches.
+//! * C trusts a loaded index; Rust validates it before searching it.
 
 use std::ops::Range;
+use std::sync::OnceLock;
 
-use crate::error::Result;
+use crate::error::{Error, Result};
 use crate::format::{self, FieldDescriptor, HsetFile, RecordHeader, Section};
 use crate::hash_type::HashType;
 use crate::lookup::{self, Lookup, SearchConfig};
+use crate::tlsh::{
+    DIGEST_LENGTH, IvfIndex, KnnStats, TivfView, TlshDigest, TlshMatch, ValidIvf, knn_brute,
+    knn_ivf,
+};
+
+/// A kNN search strategy over a TLSH section (C `SFHASH_TLSH_KNN_*`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum KnnStrategy {
+    /// Every row's distance ([`crate::tlsh::knn_brute`]); always available.
+    Brute,
+    /// The section's `TIVF` index ([`crate::tlsh::knn_ivf`]); available when
+    /// the file has one.
+    Index,
+}
+
+/// The kNN strategies a TLSH section supports
+/// ([`Hashset::tlsh_knn_strategies`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub struct KnnStrategies {
+    /// [`KnnStrategy::Brute`]: true for every TLSH section.
+    pub brute: bool,
+    /// [`KnnStrategy::Index`]: the section has a `TIVF` index.
+    pub index: bool,
+}
+
+impl KnnStrategies {
+    /// Whether `strategy` is among these.
+    pub fn contains(&self, strategy: KnnStrategy) -> bool {
+        match strategy {
+            KnnStrategy::Brute => self.brute,
+            KnnStrategy::Index => self.index,
+        }
+    }
+}
 
 /// A decoded hash set file ready for queries. Borrows the file bytes.
 pub struct Hashset<'a> {
     raw: &'a [u8],
     file: HsetFile<'a>,
     lookups: Vec<Box<dyn Lookup + 'a>>,
+    /// Per section: its kNN part if it is a TLSH section of 36-byte rows.
+    tlsh: Vec<Option<TlshPart<'a>>>,
+}
+
+/// What a TLSH section holds for kNN search.
+#[derive(Debug)]
+struct TlshPart<'a> {
+    /// The sorted rows (`HDAT`).
+    rows: &'a [[u8; DIGEST_LENGTH]],
+    /// The `TIVF` index, its header checked at load.
+    tivf: Option<TivfView<'a>>,
+    /// The outcome of validating `tivf` against `rows`, on first use; the
+    /// error as text, since [`Error`] is not `Clone`.
+    valid: OnceLock<std::result::Result<ValidIvf<'a, TivfView<'a>>, String>>,
+}
+
+impl<'a> TlshPart<'a> {
+    /// The kNN part of `s`, if it is a TLSH section of 36-byte rows. A
+    /// `TIVF` (which the decoder allows only on a TLSH section) is parsed
+    /// here, so a bad header fails the load.
+    fn of(s: &Section<'a>) -> Result<Option<Self>> {
+        if s.header.htype != HashType::Tlsh || s.hash_length() != DIGEST_LENGTH {
+            if s.tivf.is_some() {
+                return Err(Error::Format(format!(
+                    "TIVF index in hash set '{}' of {}-byte hashes, not 36-byte TLSH digests",
+                    s.header.name,
+                    s.hash_length()
+                )));
+            }
+            return Ok(None);
+        }
+        // the decoder checked that HDAT is hash_count rows
+        let (rows, _) = s.data.as_chunks::<DIGEST_LENGTH>();
+        let tivf = s
+            .tivf
+            .map(|payload| {
+                TivfView::parse(payload, rows.len() as u64)
+                    .map_err(|e| Error::Format(format!("hash set '{}': {e}", s.header.name)))
+            })
+            .transpose()?;
+        Ok(Some(TlshPart {
+            rows,
+            tivf,
+            valid: OnceLock::new(),
+        }))
+    }
 }
 
 impl std::fmt::Debug for Hashset<'_> {
@@ -42,10 +156,16 @@ impl<'a> Hashset<'a> {
                 cfg,
             )?);
         }
+        let tlsh = file
+            .sections
+            .iter()
+            .map(TlshPart::of)
+            .collect::<Result<_>>()?;
         Ok(Hashset {
             raw: buf,
             file,
             lookups,
+            tlsh,
         })
     }
 
@@ -179,6 +299,171 @@ impl<'a> Hashset<'a> {
                 (f, v)
             })
             .collect()
+    }
+
+    /// The part of section `idx` that kNN works on, or an input error
+    /// naming why there is none.
+    fn tlsh_part(&self, idx: usize) -> Result<&TlshPart<'a>> {
+        match self.tlsh.get(idx) {
+            None => Err(Error::input(format!(
+                "no hash set {idx}: the file has {}",
+                self.tlsh.len()
+            ))),
+            Some(None) => {
+                let s = &self.file.sections[idx];
+                Err(Error::input(format!(
+                    "hash set {idx} ('{}', {}, {}-byte hashes) is not a TLSH hash set",
+                    s.header.name,
+                    s.header.htype,
+                    s.hash_length()
+                )))
+            }
+            Some(Some(p)) => Ok(p),
+        }
+    }
+
+    /// The rows of TLSH section `idx`: its sorted 36-byte canonical
+    /// digests (`HDAT`), duplicates included in a records file. Row
+    /// indexes in a [`TlshMatch`] and in the `TIVF` index are positions in
+    /// this slice, and [`Section::record_index`] maps them to records.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Input`] when `idx` is not a section, or not a TLSH
+    /// section of 36-byte hashes (C `sfhash_hashset_tlsh_*` return 0
+    /// there).
+    pub fn tlsh_rows(&self, idx: usize) -> Result<&'a [[u8; DIGEST_LENGTH]]> {
+        Ok(self.tlsh_part(idx)?.rows)
+    }
+
+    /// The `TIVF` index of TLSH section `idx`, validated against its rows
+    /// ([`IvfIndex::validate`]), or `None` when the file has none.
+    ///
+    /// The header was checked when the file was loaded (a bad version,
+    /// dims, row count, length or list offsets fail [`Hashset::load`]);
+    /// the full O(n) validation runs on the first call for the section
+    /// (from here, an index search, or [`verify`](Self::verify)) and its
+    /// outcome is kept, so later calls are free and an invalid index is
+    /// reported every time (controller ruling 5). The returned
+    /// [`ValidIvf`] is `Copy`, borrows the file, and is what
+    /// [`crate::tlsh::knn_ivf`] and [`crate::tlsh::merge_tlsh_ivf`] take.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Input`] as for [`tlsh_rows`](Self::tlsh_rows);
+    /// [`Error::Format`] when the index is not valid for the rows (ids out
+    /// of range, repeated or missing, not ascending in a list, outside
+    /// their list's cell, beyond their list's radius, an empty list, ...).
+    pub fn tlsh_index(&self, idx: usize) -> Result<Option<ValidIvf<'a, TivfView<'a>>>> {
+        let part = self.tlsh_part(idx)?;
+        let Some(view) = part.tivf else {
+            return Ok(None);
+        };
+        let valid = part
+            .valid
+            .get_or_init(|| view.validate(part.rows).map_err(|e| e.to_string()));
+        match valid {
+            Ok(v) => Ok(Some(*v)),
+            Err(e) => Err(Error::Format(format!(
+                "TIVF index of hash set {idx} ('{}'): {e}",
+                self.file.sections[idx].header.name
+            ))),
+        }
+    }
+
+    /// The kNN strategies TLSH section `idx` supports (C
+    /// `sfhash_hashset_tlsh_knn_strategies`): brute force always, the
+    /// index when the file has a `TIVF` for the section. Whether that
+    /// index is valid is not checked here (see
+    /// [`tlsh_index`](Self::tlsh_index)).
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Input`] as for [`tlsh_rows`](Self::tlsh_rows) (C returns
+    /// 0, no strategies).
+    pub fn tlsh_knn_strategies(&self, idx: usize) -> Result<KnnStrategies> {
+        let part = self.tlsh_part(idx)?;
+        Ok(KnnStrategies {
+            brute: true,
+            index: part.tivf.is_some(),
+        })
+    }
+
+    /// The `k` nearest rows of TLSH section `idx` to `q` within
+    /// `max_distance` (inclusive), nearest first, ties by ascending row
+    /// index (C `sfhash_hashset_tlsh_knn`). TLSH distance as
+    /// [`crate::tlsh::diff`], with the length term when
+    /// `include_length`. Searches with the index when the file has one,
+    /// else by brute force; both return the same list.
+    ///
+    /// Empty when `k == 0` or `q` is null. Row indexes are into
+    /// [`tlsh_rows`](Self::tlsh_rows).
+    ///
+    /// # Errors
+    ///
+    /// As [`tlsh_knn_with`](Self::tlsh_knn_with) with the strategy chosen:
+    /// in particular an invalid index is an [`Error::Format`] here rather
+    /// than a silent fallback to brute force; ask for
+    /// [`KnnStrategy::Brute`] to search such a file.
+    pub fn tlsh_knn(
+        &self,
+        idx: usize,
+        q: &TlshDigest,
+        k: usize,
+        max_distance: u32,
+        include_length: bool,
+    ) -> Result<Vec<TlshMatch>> {
+        let strategy = if self.tlsh_knn_strategies(idx)?.index {
+            KnnStrategy::Index
+        } else {
+            KnnStrategy::Brute
+        };
+        self.tlsh_knn_with(idx, q, k, max_distance, include_length, strategy, None)
+    }
+
+    /// [`tlsh_knn`](Self::tlsh_knn) with an explicit strategy (C
+    /// `sfhash_hashset_tlsh_knn_with`). [`KnnStrategy::Index`] adds its
+    /// work to `stats` when given ([`crate::tlsh::knn_ivf`]: nonempty
+    /// cells visited, lists bounded, rows scanned); brute force leaves
+    /// `stats` unchanged.
+    ///
+    /// Empty when `k == 0` or `q` is null, once the section and strategy
+    /// have been checked (and, for the index, validated).
+    ///
+    /// # Errors
+    ///
+    /// * [`Error::Input`] when `idx` is not a TLSH section (as for
+    ///   [`tlsh_rows`](Self::tlsh_rows)) or the strategy is
+    ///   [`KnnStrategy::Index`] and the file has no index for it (C
+    ///   returns 0 matches for both).
+    /// * [`Error::Format`] for [`KnnStrategy::Index`] when the index is
+    ///   invalid ([`tlsh_index`](Self::tlsh_index)); brute force still
+    ///   works on such a file.
+    // the C API's parameters, one for one
+    #[allow(clippy::too_many_arguments)]
+    pub fn tlsh_knn_with(
+        &self,
+        idx: usize,
+        q: &TlshDigest,
+        k: usize,
+        max_distance: u32,
+        include_length: bool,
+        strategy: KnnStrategy,
+        stats: Option<&mut KnnStats>,
+    ) -> Result<Vec<TlshMatch>> {
+        let rows = self.tlsh_rows(idx)?;
+        match strategy {
+            KnnStrategy::Brute => Ok(knn_brute(rows, q, k, max_distance, include_length)),
+            KnnStrategy::Index => {
+                let Some(ivf) = self.tlsh_index(idx)? else {
+                    return Err(Error::input(format!(
+                        "hash set {idx} ('{}') has no TIVF index to search; use brute force",
+                        self.file.sections[idx].header.name
+                    )));
+                };
+                Ok(knn_ivf(&ivf, q, k, max_distance, include_length, stats))
+            }
+        }
     }
 
     /// Check structural invariants: digest, sortedness, hint soundness.
