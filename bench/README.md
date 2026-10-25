@@ -358,7 +358,7 @@ python3 -I bench/vs_report/vs_report.py \
 # --synthetic        banner and caveat for a pipeline check
 # --threads 4 --memory 8GB (DuckDB), --reuse-db (re-render from an existing --db)
 # optional inputs:
-#   --build-costs F    JSON: mkhashset builds with HSET_TLSH_OPTIONS 0 / 1 / 2
+#   --build-costs F    JSON: mkhashset builds with HSET_TLSH_OPTIONS 0 and 2
 #   --judgements F     JSON {"q1": html, "q2": html}, the author's judgements
 #   --corpus F         JSON: corpus counts for Methods
 #   --knn-extra DIR    another vs_knn_eval run over the same queries at another k and/or
@@ -370,9 +370,16 @@ The optional inputs add to the report and change nothing without them; the
 judgement and build-time placeholders stay marked `[TO FINISH]` then.
 `--build-costs` is `{"description", "input_digests", "rows", "variants":
 [{"name", "options", "wall_s", "user_s", "maxrss_kb", "bytes"}, ...],
-"records_build": {"tool", "wall_s"}}`; TVEC and TIVF are the variants with
-options 1 and 2 minus the one with 0, and the break-even uses the TIVF wall
-time unless `--build-seconds` is given. `--corpus` is `{"name", "zips",
+"records_build": {"tool", "wall_s"}}`; TIVF is the variant with options 2
+minus the one with 0, and the break-even uses the TIVF wall time unless
+`--build-seconds` is given. Measurements from before the `TVEC` chunk was
+removed (such as the VirusShare run's) also have a variant with options 1,
+which wrote the vectors; the report shows it as TVEC when it is at least
+1 KiB per row larger than the 0 build. A build today writes nothing for
+bit 1, so there is no TVEC variant to measure. Likewise the report describes
+the embed method's rows as the hset's `TVEC` rows for a run whose `run.json`
+has `has_vectors` (vs_knn_eval before the removal) and as embeddings
+computed in memory otherwise. `--corpus` is `{"name", "zips",
 "entries", "records", "lost_zip", "lost_cause", "tnull", "distinct_tlsh",
 "duplicate_sha256", "notes": [html, ...]}` and is checked against the hset's
 TLSH rows and the lookup's SHA-256 count. `--hset` runs

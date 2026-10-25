@@ -382,6 +382,11 @@ class Report:
         t_sp = table(['set', 'k', 'max distance', 'A vs B', 'ratio of means', 'ratio of medians', 'paired geomean',
                       'paired median', 'paired p10', 'paired p90', 'A faster'], srows, num_from=4)
         tov = run.get('timer_overhead_ns', {})
+        # where the embed method's row embeddings came from: the hset's TVEC
+        # chunk in runs from before its removal (run.json has_vectors), an
+        # in-memory matrix computed before the timed passes since
+        emb_rows = ('<code>TVEC</code> row of the hset' if run.get('hset', {}).get('has_vectors')
+                    else 'row\'s embedding, computed in memory before the timed passes')
         extra = ''
         if len(cfgs) > 1:
             extra = (f'<p>Rows with a max distance come from separate runs over the same queries, brute and index '
@@ -391,7 +396,7 @@ class Report:
         self.add('knn-latency', 'kNN latency', f"""
 <p>{fint(L[(qsets[0], 'brute')]['n'])} queries per set and method, each timed alone with
 <code>steady_clock</code> around the kNN call only (for embed: embedding the query, scanning every
-<code>TVEC</code> row and the top-k heap). Timer overhead {fint(tov.get('median'))} ns median, not subtracted.
+{emb_rows} and the top-k heap). Timer overhead {fint(tov.get('median'))} ns median, not subtracted.
 p90 / p99 / p99.9 are nearest-rank; the median interpolates; stddev is the sample stddev; ns/row is the mean
 divided by the {fint(n_rows)} rows.</p>{extra}
 {t_lat}{fig_ecdf}{fig_box}{fig_thr}
@@ -1004,7 +1009,8 @@ for a few seconds, counting the gaps where the CPU was taken away.</p>{t2}""")
                 f'than k results' + (' (none of them returns any)' if none_all else '') + '.')
 
     def build_cost_rows(self):
-        """--build-costs: the variants, and TVEC / TIVF as differences from the TLSH-only build."""
+        """--build-costs: the variants, and TIVF (and, in builds measured before the TVEC chunk was
+        removed, TVEC) as differences from the TLSH-only build."""
         b = self.build_costs
         if not b or not b.get('variants'):
             return None
@@ -1017,7 +1023,9 @@ for a few seconds, counting the gaps where the CPU was taken away.</p>{t2}""")
         for v in V:
             d = {'wall': v['wall_s'] - base['wall_s'], 'user': v['user_s'] - base['user_s'],
                  'bytes': v['bytes'] - base['bytes']}
-            if v.get('options') == 1:
+            if v.get('options') == 1 and d['bytes'] >= 1024 * b.get('rows', 0):
+                # HSET_TLSH_OPTIONS 1 wrote the TVEC vectors (1,056 bytes per row) before the
+                # chunk was removed; a build since writes nothing for it
                 out['tvec'] = d
             elif v.get('options') == 2:
                 out['tivf'] = d
@@ -1116,9 +1124,17 @@ brute by the means, {faster(ib['paired_geomean'])} by the per-query geometric me
                 tiles.append((f'embed speed vs brute, {q}', fx(eb['ratio_of_means']), 'ratio of means; &lt; 1× is slower'))
             hset = self.run['hset']
             tvec = n_rows * 264 * 4
+            if hset.get('has_vectors'):
+                # a run from before the TVEC chunk was removed from the format
+                emb = (f'the TVEC vectors alone are {fint(n_rows)} × 264 float32 = {tvec / 2**30:.2f} GiB '
+                       f'({fpct(tvec / hset["size_bytes"])} of the file; the chunk has since been removed from '
+                       f'the format, and the embeddings are computed when needed)')
+            else:
+                emb = (f'it stores no embeddings: the {fint(n_rows)} × 264 float32 = {tvec / 2**30:.2f} GiB '
+                       f'that the embed method scans are computed in memory before the timed passes'
+                       + (f' (in {hset["embed_seconds"]:,.1f} s)' if hset.get('embed_seconds') else ''))
             cost = (f'<p><b>Construction cost.</b> The hset is {hset["size_bytes"] / 2**30:.2f} GiB for '
-                    f'{fint(hset["tlsh_rows"])} TLSH rows; the TVEC vectors alone are {fint(n_rows)} × 264 float32 = '
-                    f'{tvec / 2**30:.2f} GiB ({fpct(tvec / hset["size_bytes"])} of the file), and TIVF has '
+                    f'{fint(hset["tlsh_rows"])} TLSH rows; {emb}, and TIVF has '
                     f'{fint(hset.get("ivf_lists"))} lists. ')
             bc = self.build_cost_rows()
             tivf_s = self.args.build_seconds or (bc['tivf']['wall'] if bc and bc.get('tivf') else None)
@@ -1129,8 +1145,8 @@ brute by the means, {faster(ib['paired_geomean'])} by the per-query geometric me
                                  f'({bc["tivf"]["user"]:,.0f} extra CPU-seconds, multithreaded) and '
                                  f'{bc["tivf"]["bytes"] / 1e6:,.1f} MB')
                 if bc.get('tvec'):
-                    parts.append(f'adding TVEC costs {bc["tvec"]["wall"]:,.0f} s and '
-                                 f'{bc["tvec"]["bytes"] / 1e9:,.2f} GB')
+                    parts.append(f'adding TVEC (since removed from the format) cost {bc["tvec"]["wall"]:,.0f} s '
+                                 f'and {bc["tvec"]["bytes"] / 1e9:,.2f} GB')
                 cost += (f'Measured separately (table below), over a TLSH-only build of '
                          f'{bc["base"]["wall"]:,.0f} s, ' + '; '.join(parts) + '. ')
                 rec = (self.build_costs or {}).get('records_build')
@@ -1401,7 +1417,7 @@ def main():
     ap.add_argument('--synthetic', action='store_true', help='mark the report as built from synthetic data')
     ap.add_argument('--build-seconds', type=float,
                     help='extra build time of the TIVF index, for the break-even (default: from --build-costs)')
-    ap.add_argument('--build-costs', help='JSON: mkhashset builds with and without TVEC / TIVF (see README)')
+    ap.add_argument('--build-costs', help='JSON: mkhashset builds with and without TIVF (see README)')
     ap.add_argument('--judgements', help='JSON {"q1": html, "q2": html}: the author\'s judgements')
     ap.add_argument('--corpus', help='JSON: corpus counts for the Methods section')
     ap.add_argument('--knn-extra', action='append', default=[], metavar='DIR',
