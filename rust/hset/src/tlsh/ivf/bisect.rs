@@ -5,6 +5,7 @@ use crate::error::{Error, Result};
 use crate::tlsh::CELL_COUNT;
 use crate::tlsh::digest::{DIGEST_LENGTH, TlshDigest};
 use crate::tlsh::distance::BodyQuery;
+use crate::tlsh::embed::{EMBED_BODY_DIMS, embed_body_i8};
 use crate::tlsh::mt64::Mt19937_64;
 
 /// A raw 36-byte row of a TLSH section.
@@ -78,8 +79,12 @@ pub fn build_tlsh_ivf(rows: &[Row], opts: &IvfBuildOptions) -> Result<TlshIvf> {
         .iter()
         .map(|&c| {
             let mut rng = Mt19937_64::new(opts.seed ^ (c as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15));
-            let _ = &mut rng;
-            bisect_cell(&rows[cells[c]..cells[c + 1]], cells[c] as u32)
+            bisect_cell(
+                &rows[cells[c]..cells[c + 1]],
+                cells[c] as u32,
+                opts.target_list_size,
+                &mut rng,
+            )
         })
         .collect();
 
@@ -127,17 +132,271 @@ fn cell_bounds(rows: &[Row]) -> Result<Vec<usize>> {
     Ok(cells)
 }
 
-/// The lists of one cell's rows; ids written are local indexes plus
-/// `base`.
-fn bisect_cell(rows: &[Row], base: u32) -> CellLists {
-    let ids: Vec<u32> = (0..rows.len() as u32).collect();
-    let (med, r2) = one_center(rows, &ids);
-    CellLists {
-        medoids: vec![TlshDigest(rows[med as usize])],
-        radius2: vec![r2],
-        sizes: vec![ids.len() as u32],
-        ids: ids.iter().map(|&id| base + id).collect(),
+/// The flat k-means of a node stops after this many update and
+/// reassignment rounds if assignments still change (C++
+/// `BISECT_KMEANS_MAX_ITERATIONS`). A quality and build-cost knob only.
+const KMEANS_MAX_ITERATIONS: usize = 10;
+
+/// The partition of one cell's rows into lists (C++ `CellBisector`). `perm`
+/// holds the cell's local row indexes; a node is a range `lo..hi` of
+/// `perm`, rearranged in place, so the lists are contiguous ranges of
+/// `perm` in depth-first order. Integer arithmetic only.
+struct CellBisector<'a> {
+    rows: &'a [Row],
+    perm: Vec<u32>,
+    target: usize,
+    rng: &'a mut Mt19937_64,
+    /// Scratch of `cluster`: the node's members (local row indexes).
+    node: Vec<u32>,
+    /// Seeds, as positions in `node`.
+    seeds: Vec<u32>,
+    /// Each member's squared distance to the nearest seed so far.
+    best: Vec<u32>,
+    /// Each member's centroid. Kept across nodes, as in C++; only the
+    /// ignored "changed" result of the first assignment can see stale
+    /// entries.
+    of: Vec<u32>,
+    /// Positions in `node` grouped by list, list `l` at
+    /// `members[start[l]..start[l + 1]]`.
+    members: Vec<u32>,
+    start: Vec<usize>,
+    /// The members' body embeddings and their squared norms.
+    emb: Vec<[i8; EMBED_BODY_DIMS]>,
+    norm2: Vec<u32>,
+    /// Per centroid: coordinate sum `S`, member count `n`, `||S||^2`.
+    sum: Vec<[i32; EMBED_BODY_DIMS]>,
+    cnt: Vec<u32>,
+    sum2: Vec<i64>,
+}
+
+impl<'a> CellBisector<'a> {
+    fn new(rows: &'a [Row], target: usize, rng: &'a mut Mt19937_64) -> Self {
+        Self {
+            rows,
+            perm: (0..rows.len() as u32).collect(),
+            target,
+            rng,
+            node: Vec::new(),
+            seeds: Vec::new(),
+            best: Vec::new(),
+            of: Vec::new(),
+            members: Vec::new(),
+            start: Vec::new(),
+            emb: Vec::new(),
+            norm2: Vec::new(),
+            sum: Vec::new(),
+            cnt: Vec::new(),
+            sum2: Vec::new(),
+        }
     }
+
+    /// The lists as `lo..hi` ranges of `perm`, in depth-first order.
+    fn leaves(&mut self) -> Vec<(usize, usize)> {
+        let mut out = Vec::new();
+        self.split(0, self.perm.len(), &mut out);
+        out
+    }
+
+    fn split(&mut self, lo: usize, hi: usize, out: &mut Vec<(usize, usize)>) {
+        self.cluster(lo, hi, out);
+    }
+
+    /// A draw in `0..n` straight from the engine (`rng() % n`): the C++
+    /// standard distributions are implementation-defined, the engine is
+    /// not.
+    fn draw(&mut self, n: usize) -> usize {
+        (self.rng.next_u64() % n as u64) as usize
+    }
+
+    /// The flat clustering of node `lo..hi` into at most `ceil(s / T)`
+    /// lists by k-means over exact integer centroids: k-means++ seeding,
+    /// every member assigned to its nearest centroid (ties to the smaller
+    /// centroid index), then rounds of recomputing the centroids and
+    /// reassigning until no assignment changes. The node's range of `perm`
+    /// is rearranged so each nonempty list is contiguous, in centroid
+    /// order; empty lists are dropped.
+    fn cluster(&mut self, lo: usize, hi: usize, out: &mut Vec<(usize, usize)>) {
+        let s = hi - lo;
+        let k = s.div_ceil(self.target);
+        if k <= 1 {
+            out.push((lo, hi));
+            return;
+        }
+        self.node.clear();
+        self.node.extend_from_slice(&self.perm[lo..hi]);
+        self.embed_node();
+        self.seed_rows(k);
+        self.seed_centroids();
+        self.assign_nearest();
+        for _ in 0..KMEANS_MAX_ITERATIONS {
+            self.update_centroids();
+            if !self.assign_nearest() {
+                break;
+            }
+        }
+
+        self.group_by_list();
+        for l in 0..self.cnt.len() {
+            if self.start[l] != self.start[l + 1] {
+                out.push((lo + self.start[l], lo + self.start[l + 1]));
+            }
+        }
+        for i in 0..s {
+            self.perm[lo + i] = self.node[self.members[i] as usize];
+        }
+    }
+
+    /// `members` = the positions in `node` grouped by list, ascending
+    /// within a list; list `l` is `members[start[l]..start[l + 1]]`.
+    fn group_by_list(&mut self) {
+        self.start.clear();
+        self.start.resize(self.cnt.len() + 1, 0);
+        for &l in &self.of {
+            self.start[l as usize + 1] += 1;
+        }
+        for l in 1..self.start.len() {
+            self.start[l] += self.start[l - 1];
+        }
+        self.members.resize(self.node.len(), 0);
+        let mut at: Vec<usize> = self.start[..self.start.len() - 1].to_vec();
+        for (i, &l) in self.of.iter().enumerate() {
+            self.members[at[l as usize]] = i as u32;
+            at[l as usize] += 1;
+        }
+    }
+
+    /// k-means++ seeding over `node`: the first seed a random member,
+    /// each next one a member drawn with probability proportional to its
+    /// squared distance to the nearest seed so far (`best`). When every
+    /// member coincides with a seed's body there are fewer than `k`
+    /// distinct bodies and seeding stops early.
+    fn seed_rows(&mut self, k: usize) {
+        let s = self.node.len();
+        let first = self.draw(s) as u32;
+        self.seeds.clear();
+        self.seeds.push(first);
+        self.best.resize(s, 0);
+        let q = BodyQuery::new(&TlshDigest(self.rows[self.node[first as usize] as usize]));
+        for (b, &id) in self.best.iter_mut().zip(&self.node) {
+            *b = q.emb_body(&self.rows[id as usize]);
+        }
+        while self.seeds.len() < k {
+            let sum: u64 = self.best.iter().map(|&b| u64::from(b)).sum();
+            if sum == 0 {
+                break;
+            }
+            // the first member at which the prefix sum of best exceeds r;
+            // a member with best 0 (a seed, among others) is never chosen
+            let mut r = self.rng.next_u64() % sum;
+            let mut next = 0;
+            while r >= u64::from(self.best[next]) {
+                r -= u64::from(self.best[next]);
+                next += 1;
+            }
+            self.seeds.push(next as u32);
+            let q = BodyQuery::new(&TlshDigest(self.rows[self.node[next] as usize]));
+            for (b, &id) in self.best.iter_mut().zip(&self.node) {
+                *b = (*b).min(q.emb_body(&self.rows[id as usize]));
+            }
+        }
+    }
+
+    /// `emb` and `norm2` of the node's members.
+    fn embed_node(&mut self) {
+        let s = self.node.len();
+        self.emb.resize(s, [0; EMBED_BODY_DIMS]);
+        self.norm2.resize(s, 0);
+        for i in 0..s {
+            self.norm2[i] = embed_body_i8(&self.rows[self.node[i] as usize], &mut self.emb[i]);
+        }
+    }
+
+    /// Centroid `c` is the seed row `seeds[c]` alone: `(x, 1, ||x||^2)`.
+    fn seed_centroids(&mut self) {
+        self.sum.clear();
+        self.cnt.clear();
+        self.sum2.clear();
+        for &p in &self.seeds {
+            self.sum.push(self.emb[p as usize].map(i32::from));
+            self.cnt.push(1);
+            self.sum2.push(i64::from(self.norm2[p as usize]));
+        }
+    }
+
+    /// Recompute every centroid's `(S, n, ||S||^2)` from its members, in
+    /// integers, so independent of order. A centroid with no members keeps
+    /// its previous values: it may win members back in the next
+    /// assignment, and is dropped at the end if still empty.
+    fn update_centroids(&mut self) {
+        let k = self.cnt.len();
+        let mut sum = vec![[0i32; EMBED_BODY_DIMS]; k];
+        let mut cnt = vec![0u32; k];
+        for (x, &c) in self.emb.iter().zip(&self.of) {
+            let s = &mut sum[c as usize];
+            for (sj, &xj) in s.iter_mut().zip(x) {
+                *sj += i32::from(xj);
+            }
+            cnt[c as usize] += 1;
+        }
+        for c in 0..k {
+            if cnt[c] == 0 {
+                continue;
+            }
+            self.sum[c] = sum[c];
+            self.cnt[c] = cnt[c];
+            self.sum2[c] = sum[c].iter().map(|&v| i64::from(v) * i64::from(v)).sum();
+        }
+    }
+
+    /// `of[i]` = the centroid nearest member `i`, ties to the smaller
+    /// index; returns whether any assignment changed. For centroid
+    /// `(S, n)`, `N = ||n x - S||^2 = n^2 ||x||^2 - 2n (x . S) + ||S||^2`,
+    /// compared exactly by [`nearer`].
+    fn assign_nearest(&mut self) -> bool {
+        let s = self.node.len();
+        self.of.resize(s, u32::MAX);
+        let mut changed = false;
+        for i in 0..s {
+            let x = &self.emb[i];
+            let (mut best, mut best_big, mut best_n) = (0u32, 0u64, 0u64);
+            for (c, (sc, &nc)) in self.sum.iter().zip(&self.cnt).enumerate() {
+                let dot: i32 = x.iter().zip(sc).map(|(&xj, &sj)| i32::from(xj) * sj).sum();
+                let n = i64::from(nc);
+                let big = (n * n * i64::from(self.norm2[i]) - 2 * n * i64::from(dot)
+                    + self.sum2[c]) as u64;
+                if c == 0 || nearer(big, n as u64, best_big, best_n) {
+                    best = c as u32;
+                    best_big = big;
+                    best_n = n as u64;
+                }
+            }
+            changed |= self.of[i] != best;
+            self.of[i] = best;
+        }
+        changed
+    }
+}
+
+/// The lists of one cell's rows by coarse bisection and flat integer
+/// k-means (C++ `bisect_cell`), each with its exact 1-center; ids written
+/// are local indexes plus `base`.
+fn bisect_cell(rows: &[Row], base: u32, target: usize, rng: &mut Mt19937_64) -> CellLists {
+    let mut bis = CellBisector::new(rows, target, rng);
+    let leaves = bis.leaves();
+    let mut out = CellLists {
+        ids: Vec::with_capacity(rows.len()),
+        ..CellLists::default()
+    };
+    for (lo, hi) in leaves {
+        let mut ids = bis.perm[lo..hi].to_vec();
+        ids.sort_unstable();
+        let (med, r2) = one_center(rows, &ids);
+        out.medoids.push(TlshDigest(rows[med as usize]));
+        out.radius2.push(r2);
+        out.sizes.push(ids.len() as u32);
+        out.ids.extend(ids.iter().map(|&id| base + id));
+    }
+    out
 }
 
 /// The exact 1-center of the rows `ids` (local indexes into `rows`,
