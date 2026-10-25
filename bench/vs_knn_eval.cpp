@@ -755,10 +755,22 @@ int main(int argc, char** argv) {
               << " lists), load " << load_s << " s\n";
 
     // the rows' embeddings, for the embed method and the deep ranking:
-    // untimed, before the timed passes
+    // untimed, before the timed passes; they are held in memory beside the
+    // mapped hset, so the two together should fit in MemAvailable
+    const bool wants_emb =
+      std::find(methods.begin(), methods.end(), "embed") != methods.end() || (opt.analysis && opt.deep_k);
+    if (wants_emb) {
+      const uint64_t emb_bytes = n * DIMS * sizeof(float);
+      const uint64_t avail = mem_avail0_kb * 1024;
+      std::cerr << "row embeddings will take " << emb_bytes / 1048576.0 << " MiB; with the hset "
+                << 100.0 * (file_size + emb_bytes) / avail << "% of available\n";
+      if (file_size <= avail && file_size + emb_bytes > avail) {
+        std::cerr << "WARNING: hset and row embeddings are larger than MemAvailable; timings will include I/O\n";
+      }
+    }
     EmbeddingMatrix emb;
     double embed_s = 0;
-    if (std::find(methods.begin(), methods.end(), "embed") != methods.end() || (opt.analysis && opt.deep_k)) {
+    if (wants_emb) {
       const auto et0 = Clock::now();
       emb.compute(rows, n, opt.threads);
       embed_s = secs_since(et0);
