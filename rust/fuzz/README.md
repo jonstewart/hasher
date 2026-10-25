@@ -14,7 +14,7 @@ outside the workspace (`exclude = ["fuzz"]`), so it builds into
 | `hex` | raw bytes | `check_hex`, then `check_hex_rows` with width and separator taken from the first bytes |
 | `text_input` | `&str` | `check_text_input`: `Builder::add_text` accepts exactly what the line oracle does |
 | `tlsh_hex` | raw bytes | `TlshDigest::from_hex` accepts exactly `TNULL` and 70 hex digits (optional `T1`) and round-trips through `to_hex`; `from_bytes` enforces the reserved byte; `diff` is symmetric, `Some` iff neither digest is null and equals the kit's `ref_diff` |
-| `bisect` | `BisectCase` (row specs, build options, queries) | `build_tlsh_ivf` over sorted rows (up to 256, or one cell just past `FLAT_MAX` when `big` is `0xB1`) succeeds and validates, medoids are members, `radius2` is exact, a flat cell has at most `ceil(s / T)` lists, threads do not change the index, the payload round-trips, `knn_ivf` equals `knn_brute`; unsorted rows are refused |
+| `bisect` | `BisectCase` (row specs, build options, queries) | `build_tlsh_ivf` over sorted rows (up to 256, or one cell just past `FLAT_MAX` when `big` is `0xB1`, with `T` of at least 64) succeeds and validates, medoids are members, `radius2` is exact, a flat cell has at most `ceil(s / T)` lists, threads do not change a small case's index, the payload round-trips, `knn_ivf` equals `knn_brute`; unsorted rows are refused |
 | `tivf` | `TivfCase` (row specs, a raw or a built-then-mutated payload, coalescing threshold, queries) | `TivfView::parse`, `validate` and `merge_tlsh_ivf` never panic; a parsed view copies back to its payload; an unmutated, well-formed index validates; on a valid index `knn_ivf` equals `knn_brute` and the identity merge validates, holds `check_invariant` and searches the same |
 
 ## Two corpora
@@ -43,12 +43,15 @@ format version so mutations reach past the file header.
 
 A TIVF payload is at least 262 KiB (65,537 `cell_lists` entries) and a
 `0x7400` cell-index hint 512 KiB, so neither fits in a 64 KiB input:
-`decode_bytes` sees the TLSH tags and header only through the dictionary,
-and `tivf` and `bisect` build their indexes from structured inputs
-instead. Every index build, validation, merge and search walks the 65,536
-cells, which under libFuzzer's comparison tracing makes these two targets
-slow: about 80 runs a second for `tivf`, and 30 to 100 for `bisect`
-depending on how many large (`FLAT_MAX`) cases the corpus holds.
+`decode_bytes` sees TLSH sections through its seeds and the dictionary,
+but never a valid hint or index; `tivf` and `bisect` build their indexes
+from structured inputs instead. Every index build, validation, merge
+and search walks the 65,536 cells, which under libFuzzer's comparison
+tracing makes these two targets slow: about 80 runs a second for `tivf`,
+and 10 to 100 for `bisect` depending on how many large (`FLAT_MAX`)
+cases the corpus holds (each takes up to a second; a scratch corpus of a
+few hundred of them takes most of a 60-second `fuzz-ci` slot just to
+load).
 
 `cargo fuzz` builds with debug assertions on, so the crate's
 `debug_assert!`s are checked as well as the kit's oracles.
