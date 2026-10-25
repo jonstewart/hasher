@@ -88,6 +88,31 @@ fn record_rows_follow_their_records_and_left_precedes_right_on_ties() {
     assert_eq!(m.n, 4);
     assert_eq!(m.lmap, [0, D, 1, 3]);
     assert_eq!(m.rmap, [2, D]);
+    // HDAT and RIDX of the output: l0 rec 0 -> 0, l2 rec 2 -> 2, r0 rec 0 -> 1,
+    // l3 rec 3 -> 3
+    assert_eq!(
+        m.gather_rows(&L4, &R2, 2).unwrap(),
+        [0, 1, 0, 3, 0, 3, 0, 5]
+    );
+    assert_eq!(m.gather_ridx(lo, ro).unwrap(), ridx(&[0, 2, 1, 3]));
+}
+
+#[test]
+fn gather_rows_of_a_set_union_is_the_sorted_distinct_rows() {
+    let m = sets(SetOp::Union, &L5, &R5);
+    assert_eq!(
+        m.gather_rows(&L5, &R5, 2).unwrap(),
+        [0, 1, 0, 3, 0, 4, 0, 5, 0, 9, 1, 0]
+    );
+    // the inputs must be the merged ones
+    assert!(matches!(
+        m.gather_rows(&L5, &R5[2..], 2),
+        Err(Error::Input(_))
+    ));
+    assert!(matches!(
+        m.gather_rows(&L5[2..], &R5, 2),
+        Err(Error::Input(_))
+    ));
 }
 
 #[test]

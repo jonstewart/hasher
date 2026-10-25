@@ -58,6 +58,84 @@ pub struct RowMerge {
     pub rmap: Vec<u32>,
 }
 
+impl RowMerge {
+    /// The output rows (an `HDAT` payload): every emitted input row of the
+    /// merged `left` and `right` at its output position.
+    pub fn gather_rows(&self, left: &[u8], right: &[u8], len: usize) -> Result<Vec<u8>> {
+        let (l, r) = (
+            Rows::new(left, len, "left")?,
+            Rows::new(right, len, "right")?,
+        );
+        let mut out = vec![0u8; self.out_len(len)?];
+        self.scatter(l.n, r.n, |from_left, i, k| {
+            let src = if from_left { l.get(i) } else { r.get(i) };
+            out[k * len..(k + 1) * len].copy_from_slice(src);
+            Ok(())
+        })?;
+        Ok(out)
+    }
+
+    /// The output record index (an `RIDX` payload): for every output row, the
+    /// output record of the record owning its input row.
+    pub fn gather_ridx(&self, left: RowOwners<'_>, right: RowOwners<'_>) -> Result<Vec<u8>> {
+        let lrecs = left.output_records(self.lmap.len(), "left")?;
+        let rrecs = right.output_records(self.rmap.len(), "right")?;
+        let mut out = vec![0u8; self.out_len(8)?];
+        self.scatter(lrecs.len(), rrecs.len(), |from_left, i, k| {
+            let rec = if from_left { lrecs[i] } else { rrecs[i] };
+            if rec == RECORD_DROPPED {
+                return Err(Error::input(format!(
+                    "output row {k} comes from a dropped record"
+                )));
+            }
+            out[k * 8..k * 8 + 8].copy_from_slice(&rec.to_le_bytes());
+            Ok(())
+        })?;
+        Ok(out)
+    }
+
+    /// Bytes of `n` output rows of `len` bytes.
+    fn out_len(&self, len: usize) -> Result<usize> {
+        usize::try_from(self.n)
+            .ok()
+            .and_then(|n| n.checked_mul(len))
+            .ok_or_else(|| Error::input("merged rows do not fit in memory"))
+    }
+
+    /// Calls `put(from_left, input row, output row)` for every emitted row, after
+    /// checking that the sides have `ln` and `rn` rows.
+    fn scatter(
+        &self,
+        ln: usize,
+        rn: usize,
+        mut put: impl FnMut(bool, usize, usize) -> Result<()>,
+    ) -> Result<()> {
+        if ln != self.lmap.len() || rn != self.rmap.len() {
+            return Err(Error::input(format!(
+                "the merge has {} left and {} right rows, not {ln} and {rn}",
+                self.lmap.len(),
+                self.rmap.len()
+            )));
+        }
+        let sides = [(&self.lmap, true), (&self.rmap, false)];
+        for (map, from_left) in sides {
+            for (i, &k) in map.iter().enumerate() {
+                if k == DROPPED {
+                    continue;
+                }
+                if u64::from(k) >= self.n {
+                    return Err(Error::input(format!(
+                        "output row {k} is past the {} merged rows",
+                        self.n
+                    )));
+                }
+                put(from_left, i, k as usize)?;
+            }
+        }
+        Ok(())
+    }
+}
+
 /// Merges two sorted runs of `len`-byte rows (`left` and `right` hold the
 /// rows back to back). Output row `k` is the input row mapped to `k`.
 pub fn merge_rows(left: &[u8], right: &[u8], len: usize, mode: RowMode<'_>) -> Result<RowMerge> {
@@ -88,6 +166,12 @@ pub fn merge_rows(left: &[u8], right: &[u8], len: usize, mode: RowMode<'_>) -> R
 impl RowOwners<'_> {
     /// Whether each of the side's `n` rows belongs to an emitted record.
     fn kept(&self, n: usize, side: &str) -> Result<Vec<bool>> {
+        let recs = self.output_records(n, side)?;
+        Ok(recs.into_iter().map(|r| r != RECORD_DROPPED).collect())
+    }
+
+    /// The output record of each of the side's `n` rows, or [`RECORD_DROPPED`].
+    fn output_records(&self, n: usize, side: &str) -> Result<Vec<u64>> {
         if self.ridx.len() / 8 != n || self.ridx.len() % 8 != 0 {
             return Err(Error::input(format!(
                 "the {side} record index has {} bytes for {n} rows",
@@ -101,8 +185,7 @@ impl RowOwners<'_> {
                 let rec = u64::from_le_bytes(b.try_into().expect("8-byte chunk"));
                 usize::try_from(rec)
                     .ok()
-                    .and_then(|rec| self.recmap.get(rec))
-                    .map(|&to| to != RECORD_DROPPED)
+                    .and_then(|rec| self.recmap.get(rec).copied())
                     .ok_or_else(|| {
                         Error::format(format!(
                             "{side} row {k} names record {rec}, but there are {} records",
