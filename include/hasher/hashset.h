@@ -171,20 +171,6 @@ size_t sfhash_hashset_tlsh_knn_with(
   SFHASH_TlshMatch* out
 );
 
-/*
- * Pointer to the n x dims float32 row-major embedding matrix (TVEC section)
- * of a TLSH hashset, or NULL if the file has no vectors. *dims receives
- * SFHASH_TLSH_EMBEDDING_DIMS (0 when NULL is returned); n is
- * sfhash_hashset_count. Row r is sfhash_tlsh_embed of
- * sfhash_hashset_hash(hset, tidx, r). The data starts on a 4096-byte
- * boundary of the file.
- */
-const float* sfhash_hashset_tlsh_vectors(
-  const SFHASH_Hashset* hset,
-  size_t tidx,
-  size_t* dims
-);
-
 struct SFHASH_HashsetRecordRange {
   size_t beg;
   size_t end;

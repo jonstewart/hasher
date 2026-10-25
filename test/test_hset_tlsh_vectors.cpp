@@ -289,93 +289,8 @@ void check_index(const Built& b, uint32_t tlsh_options) {
 
 } // namespace
 
-TEST_CASE("tvec_lengths_and_alignment") {
-  CHECK(length_tvec_data(0) == 32);
-  CHECK(length_tvec_data(1) == 32 + 264 * 4);
-  CHECK(length_tvec_data(5000) == 32 + 5000 * 264 * 4);
-  CHECK(length_tvec(7) == 12 + 32 + 7 * 264 * 4);
-
-  for (const uint64_t pos: { 0u, 1u, 43u, 44u, 45u, 4051u, 4052u, 4053u, 8191u, 8192u, 123457u }) {
-    const size_t pad = length_tvec_alignment_padding(pos);
-    CHECK(pad < 4096);
-    CHECK((pos + pad + 12 + 32) % 4096 == 0);
-  }
-
+TEST_CASE("tivf_length") {
   CHECK(length_tivf(3, 100) == 12 + length_tivf_data(3, 100));
-}
-
-TEST_CASE("tvec_write_parse_round_trip") {
-  const auto& c = corpus();
-  const TlshDigest* beg = c.data();
-  const TlshDigest* end = beg + 17;
-
-  std::vector<char> buf(length_tvec(17) + 3, 0x7F);
-  // write at an odd offset so nothing relies on buffer alignment
-  REQUIRE(write_tvec(beg, end, buf.data() + 3) == length_tvec(17));
-
-  const uint8_t* cbeg = reinterpret_cast<const uint8_t*>(buf.data() + 3);
-  const uint8_t* cur = cbeg;
-  const Chunk ch = decode_chunk(cbeg, cur, cbeg + length_tvec(17));
-  CHECK(ch.type == Chunk::TVEC);
-  CHECK(static_cast<size_t>(ch.dend - ch.dbeg) == length_tvec_data(17));
-
-  // header fields
-  const uint8_t* h = ch.dbeg;
-  uint16_t version;
-  std::memcpy(&version, h, 2);
-  CHECK(version == 1);
-  CHECK(h[2] == 0); // variant
-  CHECK(h[3] == 0); // flags
-  uint32_t dims;
-  std::memcpy(&dims, h + 4, 4);
-  CHECK(dims == 264);
-  uint64_t n;
-  std::memcpy(&n, h + 8, 8);
-  CHECK(n == 17);
-  uint32_t dtype;
-  std::memcpy(&dtype, h + 16, 4);
-  CHECK(dtype == 1);
-
-  const ConstTlshVectors tv = parse_tvec(ch);
-  CHECK(tv.dims == 264);
-  CHECK(tv.n == 17);
-  REQUIRE(tv.data == reinterpret_cast<const float*>(ch.dbeg + 32));
-  for (size_t r = 0; r < 17; ++r) {
-    float exp[TLSH_EMBED_DIMS];
-    tlsh_embed(beg[r], exp);
-    CHECK(std::memcmp(exp, ch.dbeg + 32 + r * TLSH_EMBED_DIMS * 4, sizeof(exp)) == 0);
-  }
-
-  // corruptions are rejected
-  std::vector<uint8_t> data(ch.dbeg, ch.dend);
-  const auto chunk_of = [&data]() {
-    return Chunk{ Chunk::TVEC, data.data(), data.data() + data.size() };
-  };
-  CHECK_NOTHROW(parse_tvec(chunk_of()));
-
-  data[0] = 2; // version
-  CHECK_THROWS(parse_tvec(chunk_of()));
-  data[0] = 1;
-
-  data[2] = 1; // variant
-  CHECK_THROWS(parse_tvec(chunk_of()));
-  data[2] = 0;
-
-  data[4] = 0x07; // dims = 263
-  CHECK_THROWS(parse_tvec(chunk_of()));
-  data[4] = 0x08;
-
-  data[16] = 2; // dtype
-  CHECK_THROWS(parse_tvec(chunk_of()));
-  data[16] = 1;
-
-  data[8] = 16; // n disagrees with the length
-  CHECK_THROWS(parse_tvec(chunk_of()));
-  data[8] = 17;
-
-  CHECK_NOTHROW(parse_tvec(chunk_of()));
-  CHECK_THROWS(parse_tvec(Chunk{ Chunk::TVEC, data.data(), data.data() + data.size() - 1 }));
-  CHECK_THROWS(parse_tvec(Chunk{ Chunk::TVEC, data.data(), data.data() + 31 }));
 }
 
 TEST_CASE("hset_tlsh_options") {
@@ -419,7 +334,8 @@ TEST_CASE("hset_tlsh_options_bit_1_is_ignored") {
 }
 
 TEST_CASE("hset_tlsh_vectors_non_tlsh_only") {
-  // a file without a TLSH field never has TVEC/TIVF, whatever the options
+  // a file without a TLSH field never has a TIVF (nor a TVEC), whatever the
+  // options
   const std::vector<SFHASH_HashAlgorithm> htypes{ SFHASH_MD5 };
   std::ostringstream text;
   for (size_t i = 0; i < 100; ++i) {
@@ -434,7 +350,7 @@ TEST_CASE("hset_tlsh_vectors_non_tlsh_only") {
     );
     const auto buf = read_file("test/md5_only_vec.hset");
     const auto toc = ftoc_of(buf);
-    CHECK(count_type(toc, Chunk::TVEC) == 0);
+    CHECK(count_type(toc, TVEC_TYPE) == 0);
     CHECK(count_type(toc, Chunk::TIVF) == 0);
     const auto hset = load(buf);
     const int midx = sfhash_hashset_index_for_type(hset.get(), SFHASH_MD5);
@@ -608,6 +524,97 @@ TEST_CASE("hset_tlsh_index_decode_rejects_corruption") {
     buf[entry + 3] = 0x0a;
     buf[b.toc.entries[hi].first + 3] = 0x0a;
     CHECK(fails(buf));
+  }
+}
+
+namespace {
+
+// b's file with a well-formed TVEC chunk added to its TLSH section, as the
+// writers before its removal laid it out: the 32-byte header (version 1,
+// variant 0, 264 dims, n rows, dtype 1 = float32) and the embedding of
+// every HDAT row, its data on a 4096-byte boundary. The chunk is appended
+// at the end of the file and its FTOC entry inserted after the section's
+// HDAT [RIDX]; the FTOC grows into the room of the FHDR, which is moved to
+// the end of the file too.
+std::vector<char> with_tvec_chunk(const Built& b) {
+  std::vector<char> buf = b.buf;
+  const uint64_t n = sfhash_hashset_count(b.hset.get(), b.tidx);
+  const TlshDigest* rows = rows_of(b.hset.get(), b.tidx);
+
+  // the TVEC goes after the TLSH section's HINT HDAT [RIDX]
+  size_t at = find_type(b.toc, Chunk::HHDR | 15) + 1; // SFHASH_TLSH == 1 << 15
+  while (at < b.toc.entries.size() &&
+         (b.toc.entries[at].second == Chunk::HINT ||
+          b.toc.entries[at].second == Chunk::HDAT ||
+          b.toc.entries[at].second == Chunk::RIDX)) {
+    ++at;
+  }
+
+  // move the FHDR to the end of the file
+  const size_t ftoc = 8 + 32;
+  uint64_t entries[2];
+  {
+    const uint64_t fhdr = b.toc.entries[1].first;
+    REQUIRE(b.toc.entries[1].second == Chunk::FHDR);
+    uint64_t fhdr_len;
+    std::memcpy(&fhdr_len, buf.data() + fhdr + 4, 8);
+    entries[0] = buf.size();
+    buf.insert(buf.end(), b.buf.begin() + fhdr, b.buf.begin() + fhdr + 12 + fhdr_len);
+    std::memcpy(buf.data() + ftoc + 12 + 12, &entries[0], 8);
+    entries[1] = fhdr + 12 + fhdr_len; // the end of the room for the FTOC
+  }
+
+  // the chunk, its data page aligned
+  buf.resize(buf.size() + (4096 - (buf.size() + 12 + 32) % 4096) % 4096, 0);
+  const uint64_t off = buf.size();
+  const uint64_t len = 32 + n * 264 * 4;
+  buf.resize(off + 12 + len, 0);
+  char* c = buf.data() + off;
+  std::memcpy(c, "TVEC", 4);
+  std::memcpy(c + 4, &len, 8);
+  const uint16_t version = 1;
+  const uint32_t dims = 264, dtype = 1;
+  std::memcpy(c + 12, &version, 2);    // variant, flags 0
+  std::memcpy(c + 12 + 4, &dims, 4);
+  std::memcpy(c + 12 + 8, &n, 8);
+  std::memcpy(c + 12 + 16, &dtype, 4); // reserved 0
+  for (uint64_t r = 0; r < n; ++r) {
+    tlsh_embed(rows[r], reinterpret_cast<float*>(c + 12 + 32 + r * 264 * 4));
+  }
+
+  // the FTOC entry
+  uint64_t flen;
+  std::memcpy(&flen, buf.data() + ftoc + 4, 8);
+  REQUIRE(flen == b.toc.entries.size() * 12);
+  REQUIRE(ftoc + 12 + flen + 12 <= entries[1]);
+  char* e = buf.data() + ftoc + 12 + at * 12;
+  std::memmove(e + 12, e, (b.toc.entries.size() - at) * 12);
+  std::memcpy(e, &off, 8);
+  std::memcpy(e + 8, "TVEC", 4);
+  flen += 12;
+  std::memcpy(buf.data() + ftoc + 4, &flen, 8);
+  return buf;
+}
+
+} // namespace
+
+TEST_CASE("hset_with_a_tvec_chunk_is_rejected") {
+  // TVEC is not an allowed chunk: a reader rejects a file that has one,
+  // with or without records and a TIVF index after it
+  for (const bool records: { true, false }) {
+    for (const uint32_t opts: { 0u, uint32_t(SFHASH_HSET_TLSH_INDEX) }) {
+      const Built b = build(true, "test/tlsh_vec_tvec.hset", records, true, opts);
+      const std::vector<char> buf = with_tvec_chunk(b);
+      SFHASH_Error* err = nullptr;
+      HsetPtr hset(
+        sfhash_load_hashset(buf.data(), buf.data() + buf.size(), &err),
+        sfhash_destroy_hashset
+      );
+      CHECK(!hset);
+      REQUIRE(err);
+      CHECK(std::string(err->message).find("TVEC") != std::string::npos);
+      sfhash_free_error(err);
+    }
   }
 }
 

@@ -128,19 +128,6 @@ uint32_t knn_strategies(const HashsetTuple& hs) {
 
 } // namespace
 
-const float* sfhash_hashset_tlsh_vectors(
-  const SFHASH_Hashset* hset,
-  size_t tidx,
-  size_t* dims)
-{
-  const HashsetTuple* hs = tlsh_hashset(hset, tidx);
-  const ConstTlshVectors* tv = hs ? &std::get<ConstTlshVectors>(*hs) : nullptr;
-  if (dims) {
-    *dims = tv && tv->data ? tv->dims : 0;
-  }
-  return tv ? tv->data : nullptr;
-}
-
 uint32_t sfhash_hashset_tlsh_knn_strategies(
   const SFHASH_Hashset* hset,
   size_t tidx)

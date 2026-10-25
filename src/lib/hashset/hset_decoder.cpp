@@ -264,7 +264,6 @@ State::Type handle_hhdr(const Chunk& ch, Holder& h) {
     ConstHashsetData(),
     nullptr,
     ConstRecordIndex(),
-    ConstTlshVectors(),
     TlshIvfView()
   );
 
@@ -315,26 +314,6 @@ State::Type handle_ridx(const Chunk& ch, Holder& h) {
 
   ridx = parse_ridx(ch);
   return State::RIDX;
-}
-
-State::Type handle_tvec(const Chunk& ch, Holder& h) {
-  auto& hset = h.hsets.back();
-  const auto& hhdr = std::get<HashsetHeader>(hset);
-  auto& tvec = std::get<ConstTlshVectors>(hset);
-
-  THROW_IF(
-    hhdr.hash_type != SFHASH_TLSH,
-    "TVEC chunk in a " << hhdr.hash_name << " hashset"
-  );
-
-  tvec = parse_tvec(ch);
-
-  THROW_IF(
-    tvec.n != hhdr.hash_count,
-    "TVEC has " << tvec.n << " rows, expected " << hhdr.hash_count
-  );
-
-  return State::TVEC;
 }
 
 State::Type handle_tivf(const Chunk& ch, Holder& h) {

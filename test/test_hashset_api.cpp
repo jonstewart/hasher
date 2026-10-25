@@ -133,7 +133,6 @@ TEST_CASE("hashset_index_for_type") {
     ConstHashsetData{},
     std::unique_ptr<LookupStrategy>(),
     ConstRecordIndex{},
-    ConstTlshVectors{},
     TlshIvfView{}
   );
 
@@ -143,7 +142,6 @@ TEST_CASE("hashset_index_for_type") {
     ConstHashsetData{},
     std::unique_ptr<LookupStrategy>(),
     ConstRecordIndex{},
-    ConstTlshVectors{},
     TlshIvfView{}
   );
 
@@ -153,7 +151,6 @@ TEST_CASE("hashset_index_for_type") {
     ConstHashsetData{},
     std::unique_ptr<LookupStrategy>(),
     ConstRecordIndex{},
-    ConstTlshVectors{},
     TlshIvfView{}
   );
 
@@ -213,7 +210,6 @@ TEST_CASE("hashset_lookup") {
     ConstHashsetData{ md5s.begin(),  md5s.end() },
     std::unique_ptr<LookupStrategy>(new BasicLookupStrategy<16>(md5s.begin(), md5s.end())),
     ConstRecordIndex{},
-    ConstTlshVectors{},
     TlshIvfView{}
   );
 
@@ -223,7 +219,6 @@ TEST_CASE("hashset_lookup") {
     ConstHashsetData{ sha1s.begin(), sha1s.end() },
     std::unique_ptr<LookupStrategy>(new BasicLookupStrategy<20>(sha1s.begin(), sha1s.end())),
     ConstRecordIndex{},
-    ConstTlshVectors{},
     TlshIvfView{}
   );
 
@@ -295,7 +290,6 @@ TEST_CASE("hashset_lookup_bulk") {
     ConstHashsetData{ sha1s.begin(), sha1s.end() },
     std::unique_ptr<LookupStrategy>(new BasicLookupStrategy<20>(sha1s.begin(), sha1s.end())),
     ConstRecordIndex{},
-    ConstTlshVectors{},
     TlshIvfView{}
   );
 
@@ -485,7 +479,6 @@ TEST_CASE("hashset_record_lookup") {
     ConstHashsetData{ md5s.begin(), md5s.end() },
     std::unique_ptr<LookupStrategy>(),
     ConstRecordIndex{ md5s_r.begin(), md5s_r.end() },
-    ConstTlshVectors{},
     TlshIvfView{}
   );
 
@@ -495,7 +488,6 @@ TEST_CASE("hashset_record_lookup") {
     ConstHashsetData{ sha1s.begin(), sha1s.end() },
     std::unique_ptr<LookupStrategy>(),
     ConstRecordIndex{ sha1s_r.begin(), sha1s_r.end() },
-    ConstTlshVectors{},
     TlshIvfView{}
   );
 
@@ -505,7 +497,6 @@ TEST_CASE("hashset_record_lookup") {
     ConstHashsetData{ sizes.begin(), sizes.end() },
     std::unique_ptr<LookupStrategy>(),
     ConstRecordIndex{ sizes_r.begin(), sizes_r.end() },
-    ConstTlshVectors{},
     TlshIvfView{}
   );
 

@@ -14,8 +14,8 @@
 
 struct Holder {
   FileHeader fhdr;
-  // one entry per hashset section; the TLSH vectors and index are empty
-  // unless the section has TVEC/TIVF chunks (TLSH hashsets only)
+  // one entry per hashset section; the TLSH index is empty unless the
+  // section has a TIVF chunk (TLSH hashsets only)
   std::vector<
     std::tuple<
       HashsetHeader,
@@ -23,7 +23,6 @@ struct Holder {
       ConstHashsetData,
       std::unique_ptr<LookupStrategy>,
       ConstRecordIndex,
-      ConstTlshVectors,
       TlshIvfView
     >
   > hsets;
@@ -46,7 +45,6 @@ struct State {
     HINT,
     HDAT,
     RIDX,
-    TVEC,
     DONE
   };
 };
@@ -148,8 +146,6 @@ State::Type handle_hdat(const Chunk& ch, Holder& h);
 
 State::Type handle_ridx(const Chunk& ch, Holder& h);
 
-State::Type handle_tvec(const Chunk& ch, Holder& h);
-
 State::Type handle_tivf(const Chunk& ch, Holder& h);
 
 State::Type handle_rdat(const Chunk& ch, Holder& h);
@@ -242,7 +238,9 @@ Holder decode_chunks(ChunkIterator ch, ChunkIterator ch_end) {
         }
         break;
 
-      // HDAT [RIDX] [TVEC] [TIVF], then the next section
+      // HDAT [RIDX] [TIVF], then the next section; anything else (TVEC,
+      // the stored embedding of old files, among others) is rejected by
+      // the section break
       case State::HDAT:
         if (ch->type == Chunk::RIDX) {
           state = handle_ridx(*ch++, h);
@@ -251,13 +249,6 @@ Holder decode_chunks(ChunkIterator ch, ChunkIterator ch_end) {
         [[fallthrough]];
 
       case State::RIDX:
-        if (ch->type == Chunk::TVEC) {
-          state = handle_tvec(*ch++, h);
-          break;
-        }
-        [[fallthrough]];
-
-      case State::TVEC:
         if (ch->type == Chunk::TIVF) {
           state = handle_tivf(*ch++, h);
         }
