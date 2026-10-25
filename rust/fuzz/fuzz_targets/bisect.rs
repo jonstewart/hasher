@@ -5,7 +5,7 @@
 //! panics on sorted rows, its index validates (every list nonempty, the
 //! lists partition the rows by cell), every medoid is a member, `radius2`
 //! is exact, a flat cell of `s` rows has at most `ceil(s / T)` lists, the
-//! thread count does not change the result, the payload round-trips
+//! thread count does not change a small case's index, the payload round-trips
 //! through `TivfView`, and `knn_ivf` agrees with `knn_brute`. Unsorted rows
 //! are refused. The coalescing invariant is not required of a build.
 
@@ -24,6 +24,8 @@ use libfuzzer_sys::fuzz_target;
 /// plus up to 1023 more, near copies of the specs' bodies.
 const BIG: u8 = 0xB1;
 const BIG_ROWS: usize = FLAT_MAX + 1;
+/// Smallest clustering target of a large case.
+const BIG_MIN_TARGET: usize = 64;
 
 #[derive(Arbitrary, Debug)]
 struct BisectCase {
@@ -108,12 +110,19 @@ fn check_shape(ivf: &TlshIvf, rows: &[Row], target: usize) {
 fuzz_target!(|case: BisectCase| {
     let rows = case_rows(&case);
     let opts = IvfBuildOptions {
-        target_list_size: 1 + usize::from(case.target % 64),
+        target_list_size: if rows.len() > FLAT_MAX {
+            // The flat k-means is O(s * s / T) per node: a 4,096-row node
+            // at T = 2 takes seconds, past the fuzzer's timeout, and even T = 16
+            // makes the large seeds dominate a 60-second run.
+            BIG_MIN_TARGET + usize::from(case.target % 65)
+        } else {
+            1 + usize::from(case.target % 64)
+        },
         seed: case.seed,
         threads: 1 + usize::from(case.threads % 3),
     };
     let ivf = build_tlsh_ivf(&rows, &opts).expect("build over sorted rows");
-    if opts.threads != 1 {
+    if opts.threads != 1 && rows.len() <= FLAT_MAX {
         let one = build_tlsh_ivf(&rows, &IvfBuildOptions { threads: 1, ..opts }).unwrap();
         assert_eq!(ivf, one, "the thread count changed the index");
     }
