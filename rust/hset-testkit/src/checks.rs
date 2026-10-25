@@ -17,9 +17,10 @@
 //! [`check_lookup`] is the lookup property: every strategy (hint kind,
 //! search config, hash length) answers like the linear-scan [`NaiveSet`].
 //!
-//! [`check_set_op`] is the set-algebra property: `ops::apply` answers like
-//! [`set_op_model`] over [`Doc::op_rows`] in the [`canonical_layout`], or
-//! fails with the documented input error.
+//! [`check_set_op`] is the set-algebra property: `merge::merge` writes the
+//! file [`set_op_expected`] models from the C++ merge semantics, or fails
+//! with the refusal it names; [`set_op_content`] reads an output back for
+//! the algebraic laws.
 //!
 //! [`check_hex`] and [`check_hex_rows`] are the hex-codec properties: every
 //! [`simd_levels`] level agrees with [`hex_oracle`] and rejects a bad
@@ -31,17 +32,17 @@
 use std::collections::BTreeSet;
 use std::panic::{AssertUnwindSafe, catch_unwind, resume_unwind};
 
-use hset::format::{FieldDescriptor, decode};
+use hset::format::decode;
 use hset::lookup::{HintSpec, Lookup, build_hint, hint_from_parts, make_lookup_with};
-use hset::ops::{SetOp, apply};
-use hset::{Builder, Error, HashType, Hashset};
+use hset::merge::merge;
+use hset::{Builder, Error, HashType, Hashset, SetOp};
 
 use hset::builder::parse_value;
 use hset::hex;
 
 use crate::corrupt::Corruption;
-use crate::doc::{Doc, Opts};
-use crate::oracle::{NaiveSet, hex_oracle, set_op_model};
+use crate::doc::{Doc, Opts, set_op_expected};
+use crate::oracle::{NaiveSet, hex_oracle};
 use crate::strategies::{LookupCase, UNSUPPORTED_LENGTH, queries};
 
 /// Build `doc`, decode and check it against `doc.expected()`, load and
@@ -342,104 +343,88 @@ fn check_query(lk: &dyn Lookup, naive: &NaiveSet, q: &[u8]) {
     }
 }
 
-/// `doc`'s field descriptors sorted by `(htype, length)`: the layout
-/// `ops::apply` gives its result (names are `doc`'s and play no part in
-/// the rows).
-pub fn canonical_layout(doc: &Doc) -> Vec<FieldDescriptor> {
-    let mut layout = doc.descriptors();
-    layout.sort_by_key(|d| (d.htype, d.length));
-    layout
+/// A record as its present fields, `(type, value)` in ascending type
+/// order: the same record whatever the field order or the absent fields of
+/// the file that holds it.
+pub type OpRecord = Vec<(HashType, Vec<u8>)>;
+
+/// What a set operation's output holds, independently of its field order
+/// and section names: its records (when it has a record table) and the
+/// distinct `(type, value)` rows of its sections.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OpContent {
+    pub records: Option<BTreeSet<OpRecord>>,
+    pub values: BTreeSet<(HashType, Vec<u8>)>,
 }
 
-/// Build both docs, decode, `ops::apply`. Returns the result rows in the
-/// canonical layout (fields ascending by `(htype, length)`) or `None` when
-/// `apply` returned an error.
-pub fn apply_rows(op: SetOp, a: &Doc, b: &Doc) -> Option<BTreeSet<Vec<u8>>> {
-    apply_result(op, a, b).ok()
-}
-
-/// [`apply_rows`] keeping `apply`'s error. The result is built with
-/// [`Opts::default_for_tests`] (records on, so it always has records),
-/// decoded, checked to carry the canonical layout of `a`, and read back as
-/// record rows. A hashes-only operand still compares like for like: `apply`
-/// wraps its hashes as `[1] ++ hash` one-field records, the form
-/// [`Doc::op_rows`] gives a hashes-only document.
-fn apply_result(op: SetOp, a: &Doc, b: &Doc) -> hset::Result<BTreeSet<Vec<u8>>> {
+/// Build both docs, load them and [`merge`] them with `out`'s merge options
+/// ([`Opts::merge_options`]); the output's bytes or `merge`'s error.
+fn merged(op: SetOp, a: &Doc, b: &Doc, out: &Opts) -> hset::Result<Vec<u8>> {
     let (ab, bb) = (a.build().expect("build a"), b.build().expect("build b"));
-    let fa = decode(&ab).expect("decode a");
-    let fb = decode(&bb).expect("decode b");
-    let builder = apply(op, &fa, &fb)?;
-    let out = builder
-        .build(&Opts::default_for_tests().build_options())
-        .expect("build result");
-    let file = decode(&out).expect("decode result");
-    let shape = |fs: &[FieldDescriptor]| -> Vec<(HashType, u64)> {
-        fs.iter().map(|f| (f.htype, f.length)).collect()
-    };
-    let layout = canonical_layout(a);
-    let rhdr = file
-        .rhdr
-        .as_ref()
-        .expect("a result built with records has records");
-    assert_eq!(
-        shape(&rhdr.fields),
-        shape(&layout),
-        "result fields are not the canonical layout"
-    );
-    Ok((0..file.record_count())
-        .map(|i| file.record(i).expect("result record").to_vec())
-        .collect())
+    let ha = Hashset::load(&ab).expect("load a");
+    let hb = Hashset::load(&bb).expect("load b");
+    merge(op, &ha, &hb, &out.merge_options())
 }
 
-/// Whether `ops::apply` can take `doc` as an operand: it has records, or
-/// it is hashes-only with a single field.
-fn expressible(doc: &Doc) -> bool {
-    doc.opts.with_records || doc.fields.len() == 1
-}
-
-/// `apply_rows` == `set_op_model` over `op_rows` in the canonical layout, or
-/// the documented error: error iff type sets differ, or an operand has
-/// `!with_records && fields.len() != 1`. The error is `Error::Input`; its
-/// Display contains "no records" / "set operations need records" for a
-/// records-less operand (checked first), else "mismatch".
-pub fn check_set_op(op: SetOp, a: &Doc, b: &Doc) {
-    let types = |d: &Doc| -> BTreeSet<(HashType, u64)> {
-        d.descriptors()
-            .iter()
-            .map(|f| (f.htype, f.length))
+/// Merge `a` and `b` writing everything ([`Opts::default_for_tests`]) and
+/// read the output back as [`OpContent`]; `None` when `merge` refuses.
+pub fn set_op_content(op: SetOp, a: &Doc, b: &Doc) -> Option<OpContent> {
+    let out = merged(op, a, b, &Opts::default_for_tests()).ok()?;
+    let hs = Hashset::load(&out).expect("load result");
+    let records = hs.record_header().map(|_| {
+        hs.records()
+            .map(|r| {
+                let mut rec: OpRecord = hs
+                    .record_fields(r)
+                    .into_iter()
+                    .filter_map(|(f, v)| Some((f.htype, v?.to_vec())))
+                    .collect();
+                rec.sort();
+                rec
+            })
             .collect()
-    };
-    let records_less = !expressible(a) || !expressible(b);
-    let mismatch = types(a) != types(b);
-    match apply_result(op, a, b) {
-        Ok(got) => {
-            assert!(
-                !records_less && !mismatch,
-                "{op:?} succeeded but should fail (records-less {records_less}, \
-                 mismatch {mismatch})\na: {a:?}\nb: {b:?}"
-            );
-            let layout = canonical_layout(a);
-            let want = set_op_model(op, &a.op_rows(&layout), &b.op_rows(&layout));
-            assert_eq!(
-                got, want,
-                "{op:?} differs from the model\na: {a:?}\nb: {b:?}"
-            );
-        }
-        Err(e) => {
-            assert!(
-                records_less || mismatch,
-                "{op:?} failed unexpectedly: {e}\na: {a:?}\nb: {b:?}"
-            );
-            assert!(matches!(e, Error::Input(_)), "{op:?} error kind: {e:?}");
-            let msg = e.to_string();
-            if records_less {
-                assert!(
-                    msg.contains("no records") || msg.contains("set operations need records"),
-                    "records-less error: {msg}"
-                );
-            } else {
-                assert!(msg.contains("mismatch"), "mismatch error: {msg}");
+    });
+    let values = hs
+        .sections()
+        .iter()
+        .flat_map(|s| (0..s.len()).map(|i| (s.header.htype, s.hash(i).to_vec())))
+        .collect();
+    Some(OpContent { records, values })
+}
+
+/// The set-algebra property of [`merge`]: for every write-flag choice
+/// (both, records only, hash sections only, over `a`'s other options), the
+/// output decodes to [`set_op_expected`]'s file and loads and verifies, or
+/// `merge` fails with an `Error::Input` naming the model's refusal.
+pub fn check_set_op(op: SetOp, a: &Doc, b: &Doc) {
+    for (with_records, with_hashsets) in [(true, true), (true, false), (false, true)] {
+        let out = Opts {
+            with_records,
+            with_hashsets,
+            ..a.opts.clone()
+        };
+        let ctx = || format!("{op:?} writing {out:?}\na: {a:?}\nb: {b:?}");
+        match (merged(op, a, b, &out), set_op_expected(op, a, b, &out)) {
+            (Ok(bytes), Ok(want)) => {
+                let file = decode(&bytes).unwrap_or_else(|e| panic!("decode: {e}\n{}", ctx()));
+                if let Err(p) = catch_unwind(AssertUnwindSafe(|| want.assert_matches(&file))) {
+                    let msg = p.downcast_ref::<String>().cloned().unwrap_or_default();
+                    panic!("{msg}\n{}", ctx());
+                }
+                let hs = Hashset::load(&bytes).unwrap_or_else(|e| panic!("load: {e}\n{}", ctx()));
+                let report = hs.verify();
+                assert!(report.is_ok(), "verify: {:?}\n{}", report.problems, ctx());
             }
+            (Err(e), Err(refusal)) => {
+                assert!(matches!(e, Error::Input(_)), "error kind {e:?}\n{}", ctx());
+                assert!(
+                    e.to_string().contains(refusal),
+                    "error {e}, expected {refusal}\n{}",
+                    ctx()
+                );
+            }
+            (Ok(_), Err(refusal)) => panic!("merged, expected {refusal}\n{}", ctx()),
+            (Err(e), Ok(_)) => panic!("failed unexpectedly: {e}\n{}", ctx()),
         }
     }
 }

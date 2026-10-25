@@ -1,77 +1,105 @@
-//! Set operations (`hset::ops::apply`) against the `BTreeSet` model, plus
-//! the algebraic laws and the error contract.
+//! Set operations (`hset::merge::merge`) against the testkit's model of
+//! the C++ merge semantics, plus the algebraic laws.
+//!
+//! The laws compare [`OpContent`]: records as their present fields (so a
+//! union's field order, left's then right's extras, plays no part) when the
+//! output has records, else the distinct `(type, value)` section rows.
 
-use hset::format::decode;
-use hset::ops::{SetOp, apply};
-use hset::{BuildOptions, Hashset};
-use hset_testkit::checks::{apply_rows, check_set_op};
-use hset_testkit::doc::Opts;
-use hset_testkit::oracle::set_op_model;
+use std::collections::BTreeSet;
+
+use hset::SetOp;
+use hset_testkit::checks::{OpContent, check_set_op, set_op_content};
 use hset_testkit::strategies::{doc_pair, doc_pair_mismatched, set_op};
 use proptest::prelude::*;
 
+/// `a − b` of the record sets when both outputs have records, else of the
+/// section rows.
+fn difference(a: &OpContent, b: &OpContent) -> OpContent {
+    OpContent {
+        records: match (&a.records, &b.records) {
+            (Some(x), Some(y)) => Some(x.difference(y).cloned().collect()),
+            _ => None,
+        },
+        values: a.values.difference(&b.values).cloned().collect(),
+    }
+}
+
+fn subset<T: Ord>(a: &BTreeSet<T>, b: &BTreeSet<T>) -> bool {
+    a.is_subset(b)
+}
+
 proptest! {
     #[test]
-    fn apply_matches_model((a, b) in doc_pair(), op in set_op()) {
+    fn merge_matches_model((a, b) in doc_pair(), op in set_op()) {
         check_set_op(op, &a, &b);
     }
 
+    /// Documents of different field types merge as the model says: widened
+    /// to left's fields then right's extras with records on both sides,
+    /// section by section otherwise, refused only when exactly one side
+    /// has hash sections.
     #[test]
-    fn union_commutes((a, b) in doc_pair()) {
-        prop_assert_eq!(apply_rows(SetOp::Union, &a, &b), apply_rows(SetOp::Union, &b, &a));
+    fn differently_typed_documents_merge_as_modelled(
+        (a, b) in doc_pair_mismatched(),
+        op in set_op(),
+    ) {
+        check_set_op(op, &a, &b);
+        let merged = set_op_content(op, &a, &b);
+        prop_assert_eq!(merged.is_some(), a.opts.with_hashsets == b.opts.with_hashsets);
     }
 
-    /// Self-union is the operand's own rows, so `a ∩ b` lies within both.
     #[test]
-    fn intersection_within_both((a, b) in doc_pair()) {
-        let i = apply_rows(SetOp::Intersect, &a, &b);
-        let ra = apply_rows(SetOp::Union, &a, &a);
-        let rb = apply_rows(SetOp::Union, &b, &b);
+    fn union_commutes((a, b) in prop_oneof![doc_pair(), doc_pair_mismatched()]) {
+        prop_assert_eq!(
+            set_op_content(SetOp::Union, &a, &b),
+            set_op_content(SetOp::Union, &b, &a)
+        );
+    }
+
+    /// Self-union is the operand's own content, so `a ∩ b` lies within
+    /// both.
+    #[test]
+    fn intersection_within_both((a, b) in prop_oneof![doc_pair(), doc_pair_mismatched()]) {
+        let i = set_op_content(SetOp::Intersect, &a, &b);
+        let ra = set_op_content(SetOp::Union, &a, &a);
+        let rb = set_op_content(SetOp::Union, &b, &b);
         if let (Some(i), Some(ra), Some(rb)) = (i, ra, rb) {
-            prop_assert!(i.is_subset(&ra), "{i:?} not within {ra:?}");
-            prop_assert!(i.is_subset(&rb), "{i:?} not within {rb:?}");
+            prop_assert!(subset(&i.values, &ra.values), "{i:?} not within {ra:?}");
+            prop_assert!(subset(&i.values, &rb.values), "{i:?} not within {rb:?}");
+            if let (Some(ir), Some(ar), Some(br)) = (&i.records, &ra.records, &rb.records) {
+                prop_assert!(subset(ir, ar) && subset(ir, br), "{i:?}");
+            }
         }
     }
 
+    /// A record difference shares no record with the right side; a
+    /// section difference (no records on some side) no row.
     #[test]
-    fn difference_disjoint_from_right((a, b) in doc_pair()) {
-        let d = apply_rows(SetOp::Subtract, &a, &b);
-        let rb = apply_rows(SetOp::Union, &b, &b);
+    fn difference_disjoint_from_right((a, b) in prop_oneof![doc_pair(), doc_pair_mismatched()]) {
+        let d = set_op_content(SetOp::Subtract, &a, &b);
+        let rb = set_op_content(SetOp::Union, &b, &b);
         if let (Some(d), Some(rb)) = (d, rb) {
-            prop_assert!(d.is_disjoint(&rb), "{d:?} meets {rb:?}");
+            match (&d.records, &rb.records) {
+                (Some(dr), Some(br)) => prop_assert!(dr.is_disjoint(br), "{d:?} meets {rb:?}"),
+                _ => prop_assert!(d.values.is_disjoint(&rb.values), "{d:?} meets {rb:?}"),
+            }
         }
     }
 
     /// `(A ∪ B) − B == A − B`.
     #[test]
-    fn union_minus_right_is_difference((a, b) in doc_pair()) {
-        let u = apply_rows(SetOp::Union, &a, &b);
-        let rb = apply_rows(SetOp::Union, &b, &b);
-        let d = apply_rows(SetOp::Subtract, &a, &b);
+    fn union_minus_right_is_difference(
+        (a, b) in prop_oneof![doc_pair(), doc_pair_mismatched()],
+    ) {
+        let u = set_op_content(SetOp::Union, &a, &b);
+        let rb = set_op_content(SetOp::Union, &b, &b);
+        let d = set_op_content(SetOp::Subtract, &a, &b);
         if let (Some(u), Some(rb), Some(d)) = (u, rb, d) {
-            prop_assert_eq!(set_op_model(SetOp::Subtract, &u, &rb), d);
+            let got = difference(&u, &rb);
+            match d.records {
+                Some(_) => prop_assert_eq!(got.records, d.records),
+                None => prop_assert_eq!(got.values, d.values),
+            }
         }
-    }
-
-    #[test]
-    fn result_builds_and_decodes((a, b) in doc_pair(), op in set_op()) {
-        let (ab, bb) = (a.build().unwrap(), b.build().unwrap());
-        let (fa, fb) = (decode(&ab).unwrap(), decode(&bb).unwrap());
-        if let Ok(builder) = apply(op, &fa, &fb) {
-            let opts: BuildOptions = Opts::default_for_tests().build_options();
-            let out = builder.build(&opts).unwrap();
-            let hs = Hashset::load(&out).unwrap();
-            let report = hs.verify();
-            prop_assert!(report.is_ok(), "verify: {:?}", report.problems);
-        }
-    }
-
-    /// No result for differing type sets; `check_set_op` asserts the
-    /// error is `Error::Input` mentioning the mismatch (or, when an operand
-    /// is records-less with several fields, the missing records).
-    #[test]
-    fn mismatched_types_error((a, b) in doc_pair_mismatched()) {
-        prop_assert!(apply_rows(SetOp::Union, &a, &b).is_none());
-        check_set_op(SetOp::Union, &a, &b);
     }
 }

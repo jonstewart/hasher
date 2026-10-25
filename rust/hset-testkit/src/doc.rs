@@ -205,52 +205,10 @@ impl Doc {
         }
     }
 
-    /// Rows relaid to `layout` (fields matched by type, zeros when the
-    /// document lacks the field): the deduplicated records when the
-    /// document has records, else the present values of its single field
-    /// as `[1] ++ value` rows.
-    pub fn op_rows(&self, layout: &[FieldDescriptor]) -> BTreeSet<Vec<u8>> {
-        let records: Vec<Vec<Option<Vec<u8>>>> = if self.opts.with_records {
-            self.records.clone()
-        } else {
-            assert_eq!(
-                self.fields.len(),
-                1,
-                "a hashes-only document has a single field"
-            );
-            self.records
-                .iter()
-                .filter(|r| r[0].is_some())
-                .cloned()
-                .collect()
-        };
-        records
-            .iter()
-            .map(|r| {
-                let mut row = Vec::new();
-                for d in layout {
-                    let v = self
-                        .fields
-                        .iter()
-                        .position(|f| f.htype == d.htype)
-                        .and_then(|i| r[i].as_ref());
-                    match v {
-                        Some(v) => {
-                            row.push(1);
-                            row.extend_from_slice(v);
-                        }
-                        None => row.resize(row.len() + d.stride(), 0),
-                    }
-                }
-                row
-            })
-            .collect()
-    }
-
     /// The distinct records in the order the built file stores them (sorted
     /// by their layout row): record `k` of the file is element `k`.
     fn distinct_records(&self) -> Vec<&[Option<Vec<u8>>]> {
-        let mut recs: Vec<(Vec<u8>, &[Option<Vec<u8>>])> = self
+        let mut recs: Vec<_> = self
             .records
             .iter()
             .map(|r| (layout_row(&self.fields, r), r.as_slice()))
@@ -699,49 +657,6 @@ pub(crate) mod tests {
             let bytes = doc.build().unwrap();
             doc.expected().assert_matches(&decode(&bytes).unwrap());
         }
-    }
-
-    #[test]
-    fn op_rows_relayout_and_wrap() {
-        let doc = two_field_doc();
-        let size_d = Field::canonical(HashType::Size).descriptor();
-        let md5_d = Field::canonical(HashType::Md5).descriptor();
-        let rows = doc.op_rows(&[size_d, md5_d]);
-        assert_eq!(rows.len(), 4);
-        let relaid = |m: Option<[u8; 16]>, s: Option<u64>| {
-            let r = row(m, s);
-            [&r[17..], &r[..17]].concat()
-        };
-        let want: BTreeSet<Vec<u8>> = [
-            relaid(None, None),
-            relaid(None, Some(7)),
-            relaid(Some(MD5), Some(10)),
-            relaid(Some(MD5), Some(20)),
-        ]
-        .into_iter()
-        .collect();
-        assert!(rows.iter().all(|r| r.len() == 9 + 17));
-        assert_eq!(rows, want);
-
-        let a = vec![0xaa; 20];
-        let b = vec![0x01; 20];
-        let mut opts = Opts::default_for_tests();
-        opts.with_records = false;
-        let one = Doc {
-            fields: vec![Field::canonical(HashType::Sha1)],
-            records: vec![
-                vec![Some(a.clone())],
-                vec![None],
-                vec![Some(b.clone())],
-                vec![Some(a.clone())],
-            ],
-            opts,
-        };
-        let layout = one.descriptors();
-        let want: BTreeSet<Vec<u8>> = [[&[1][..], &a].concat(), [&[1][..], &b].concat()]
-            .into_iter()
-            .collect();
-        assert_eq!(one.op_rows(&layout), want);
     }
 
     #[test]
