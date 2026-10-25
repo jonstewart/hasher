@@ -82,6 +82,26 @@ fn parse_hhdr(ch: &Chunk<'_>) -> Result<HashsetHeader> {
     })
 }
 
+/// Why `table` is not a valid `0x7400` cell index for the section
+/// `header`, if it is not; shared by the decoder and the encoder.
+pub(super) fn check_cell_hint(
+    header: &HashsetHeader,
+    table: &[u8],
+) -> std::result::Result<(), String> {
+    if header.htype != HashType::Tlsh || header.hash_length != DIGEST_LENGTH as u64 {
+        return Err(format!(
+            "TLSH cell index hint on the {} hash set '{}' of hash length {}",
+            header.htype, header.name, header.hash_length
+        ));
+    }
+    let n = usize::try_from(header.hash_count).map_err(|_| "hash count overflows usize")?;
+    match CellIndex::parse(table, n) {
+        Err(Error::Format(m)) => Err(m),
+        Err(e) => Err(e.to_string()),
+        Ok(_) => Ok(()),
+    }
+}
+
 /// Decode a HINT chunk of the section `header`. Block and hull tables of
 /// the wrong size decode as [`Hint::Unknown`]; a TLSH cell index must be
 /// valid, and only on a TLSH section (C++ checks the length and offsets
@@ -92,15 +112,7 @@ fn parse_hint<'a>(ch: &Chunk<'a>, header: &HashsetHeader) -> Result<Hint<'a>> {
     let tag = c.be_u16()?;
     let rest = c.bytes(c.remaining())?;
     if tag == HINT_TLSH_CELLS {
-        if header.htype != HashType::Tlsh || header.hash_length != DIGEST_LENGTH as u64 {
-            return Err(Error::format(format!(
-                "TLSH cell index hint on the {} hash set '{}' of hash length {}",
-                header.htype, header.name, header.hash_length
-            )));
-        }
-        let n = usize::try_from(header.hash_count)
-            .map_err(|_| Error::format("hash count overflows usize"))?;
-        CellIndex::parse(rest, n)?;
+        check_cell_hint(header, rest).map_err(Error::Format)?;
         return Ok(Hint::TlshCells { table: rest });
     }
     let family = (tag >> 8) as u8;

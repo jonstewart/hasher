@@ -86,6 +86,22 @@ pub fn encode(doc: &Document<'_>) -> Result<Vec<u8>> {
                 h.htype
             )));
         }
+        // Refuse what the decoder would reject.
+        if h.tivf.is_some() && h.htype != HashType::Tlsh {
+            return Err(Error::input(format!(
+                "the {} hash set cannot have a TIVF index; only TLSH sections can",
+                h.htype
+            )));
+        }
+        if let Some((HINT_TLSH_CELLS, table)) = h.hint {
+            let header = HashsetHeader {
+                htype: h.htype,
+                name: h.name.to_string(),
+                hash_length: h.hash_length as u64,
+                hash_count: (h.data.len() / h.hash_length) as u64,
+            };
+            super::decode::check_cell_hint(&header, table).map_err(Error::Input)?;
+        }
     }
 
     let chunk_count = 1 // FTOC
@@ -417,5 +433,44 @@ mod tests {
         use chunk::*;
         assert_eq!(tags(&f), [FTOC, FHDR, HHDR | 15, HINT, HDAT, TIVF, FEND]);
         assert_eq!(f.toc[5].0, f.toc[4].0 + 12 + rows.len() as u64);
+    }
+
+    fn input_err(doc: &Document<'_>) -> String {
+        match encode(doc) {
+            Err(e @ Error::Input(_)) => e.to_string(),
+            other => panic!("expected an input error, got {:?}", other.map(|b| b.len())),
+        }
+    }
+
+    #[test]
+    fn tivf_outside_a_tlsh_section_is_refused() {
+        let mut doc = tlsh_doc(&[0; 16], &[], None, Some(b"x"));
+        doc.hashsets[0].htype = HashType::Md5;
+        doc.hashsets[0].hash_length = 16;
+        doc.hashsets[0].hint = None;
+        let e = input_err(&doc);
+        assert!(e.contains("MD5 hash set cannot have a TIVF index"), "{e}");
+    }
+
+    #[test]
+    fn a_cell_hint_outside_a_36_byte_tlsh_section_is_refused() {
+        let rows = [0u8; 32];
+        let table = tlsh_cell_table(&[0; 36 * 2]);
+        let mut doc = tlsh_doc(&rows, &table, None, None);
+        doc.hashsets[0].htype = HashType::Md5;
+        doc.hashsets[0].hash_length = 16;
+        let e = input_err(&doc);
+        assert!(
+            e.contains("TLSH cell index hint on the MD5 hash set"),
+            "{e}"
+        );
+    }
+
+    #[test]
+    fn a_cell_hint_that_does_not_index_the_rows_is_refused() {
+        let rows = tlsh_rows();
+        let table = tlsh_cell_table(&rows[..36 * 4]);
+        let e = input_err(&tlsh_doc(&rows, &table, None, None));
+        assert!(e.contains("last offset is 4, expected 5"), "{e}");
     }
 }
