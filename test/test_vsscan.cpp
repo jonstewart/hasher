@@ -290,9 +290,6 @@ TEST_CASE("vsscan_scan_and_build_fixture") {
     // empty.bin, tiny.txt and the 100 x's have no TLSH
     CHECK(sfhash_hashset_count(h.get(), tlsh) == 3);
     CHECK(sfhash_hashset_tlsh_knn_strategies(h.get(), tlsh) == (SFHASH_TLSH_KNN_BRUTE | SFHASH_TLSH_KNN_INDEX));
-    size_t dims = 0;
-    CHECK(sfhash_hashset_tlsh_vectors(h.get(), tlsh, &dims) != nullptr);
-    CHECK(dims == SFHASH_TLSH_EMBEDDING_DIMS);
 
     uint8_t d[32];
     REQUIRE(sfhash_unhex(d, "8060aa0ac20a3e5db2b67325c98a0122f2d09a612574458225dcb9a086f87cc3", 64));

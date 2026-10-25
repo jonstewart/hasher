@@ -8,20 +8,21 @@ hsetop difference NAME DESC LEFT.hset RIGHT.hset OUT.hset   (LEFT minus RIGHT)
 
 NAME and DESC become the output's name and description. The inputs are
 memory-mapped read-only. Every hash section of the output is the merge of
-the inputs' sorted sections; a TLSH section's cell index, vectors (TVEC)
-and kNN index (TIVF) are carried through the merge rather than rebuilt. The
+the inputs' sorted sections; a TLSH section's cell index and kNN index
+(TIVF) are carried through the merge rather than rebuilt. The
 output has a record table only when both inputs do; otherwise it is a
 hashsets-only file. See HASHSET_FORMAT, "Set operations".
 
-By default each optional TLSH section is written iff both inputs have it.
-Set HSET_TLSH_OPTIONS to a bitwise OR of SFHASH_HSET_TLSH_VECTORS (1) and
-SFHASH_HSET_TLSH_INDEX (2) to choose explicitly (0 writes neither); a
-section an input lacks is then computed for the output. An index computed
-that way is built by integer clustering, whose bytes are the same on every
-platform, unless SFHASH_HSET_TLSH_INDEX_KMEANS (8) is added to select the
-float k-means (equally exact, quadratic in the largest header cell, bytes
-dependent on compiler and platform). By default, and whenever both inputs
-have an index, the index is merged and the bit has no effect.
+By default the TLSH index is written iff both inputs have it. Set
+HSET_TLSH_OPTIONS to a bitwise OR of SFHASH_HSET_TLSH_* bits to choose
+explicitly: SFHASH_HSET_TLSH_INDEX (2) writes the index, computing it for
+the output when an input lacks one, and 0 writes none (bit 1 is reserved
+and ignored). An index computed that way is built by integer clustering,
+whose bytes are the same on every platform, unless
+SFHASH_HSET_TLSH_INDEX_KMEANS (8) is added to select the float k-means
+(equally exact, quadratic in the largest header cell, bytes dependent on
+compiler and platform). By default, and whenever both inputs have an
+index, the index is merged and the bit has no effect.
 
 A merged TIVF index coalesces small lists per header cell so that repeated
 incremental merges stay within one list per cell of a from-scratch build

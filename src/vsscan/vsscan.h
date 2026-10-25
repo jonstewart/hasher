@@ -53,7 +53,7 @@ struct BuildOptions {
   std::vector<std::filesystem::path> inputs; // TSV files or scan output directories
   std::string name = "VirusShare";
   std::string desc = "VirusShare samples scanned by vsscan";
-  uint32_t tlsh_options = 3;                 // SFHASH_HSET_TLSH_VECTORS | SFHASH_HSET_TLSH_INDEX
+  uint32_t tlsh_options = 2;                 // SFHASH_HSET_TLSH_INDEX
   std::filesystem::path temp_dir = ".";
 };
 

@@ -15,7 +15,7 @@
  * operations". The two inputs are loaded hashsets; every output section is
  * produced by a two-pointer merge of the inputs' sorted sections, driven by
  * per-row maps (old row -> new row, or MERGE_DROPPED) that the derived
- * structures (RIDX, TVEC, TIVF) are carried through.
+ * structures (RIDX, TIVF) are carried through.
  */
 
 enum class MergeOp {

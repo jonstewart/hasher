@@ -3,8 +3,8 @@
 // The record of a sample holds md5, sha1, sha256, tlsh and size (the order
 // mkhashset needs: it reads a size column to the end of the line), the fields
 // the hset record format can store (fixed-length hash types); the hset gets
-// a hash section for each, and the TLSH section its TVEC vectors and TIVF
-// index (by default). ssdeep, entropy, zip and member name stay in the TSVs.
+// a hash section for each, and the TLSH section its TIVF index (by
+// default). ssdeep, entropy, zip and member name stay in the TSVs.
 
 #include "vsscan.h"
 #include "vsscan_record.h"

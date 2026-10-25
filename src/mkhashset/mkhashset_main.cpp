@@ -22,19 +22,18 @@ empty column) marks a file with no TLSH digest:
 for i in $(find -type f) ; do echo $(md5sum $i | cut -f1 -d' ') $(tlsh -f $i | cut -f1) ; done >md5_tlsh.txt
 mkhashset 'Some test hashes' 'md5 and tlsh' md5 tlsh true true md5_tlsh.txt md5_tlsh.hset
 
-TLSH hashsets get the embedding vectors (TVEC) and the kNN index (TIVF) by
-default. Set HSET_TLSH_OPTIONS to a bitwise OR of SFHASH_HSET_TLSH_VECTORS (1)
-and SFHASH_HSET_TLSH_INDEX (2) to choose; 0 writes neither:
+TLSH hashsets get the kNN index (TIVF) by default. Set HSET_TLSH_OPTIONS to
+a bitwise OR of SFHASH_HSET_TLSH_* bits to choose: SFHASH_HSET_TLSH_INDEX (2)
+writes the index, 0 writes none (bit 1 is reserved and ignored):
 
 HSET_TLSH_OPTIONS=0 mkhashset 'Some test hashes' 'md5 and tlsh' md5 tlsh true true md5_tlsh.txt md5_tlsh.hset
 
 The TIVF index is built by integer clustering by default, whose bytes are the
 same on every platform. Add SFHASH_HSET_TLSH_INDEX_KMEANS (8) to build it with
 the float k-means instead: equally exact, but quadratic in the largest header
-cell, and its bytes depend on compiler and platform. Both sections, k-means
-index:
+cell, and its bytes depend on compiler and platform. A k-means index:
 
-HSET_TLSH_OPTIONS=11 mkhashset 'Some test hashes' 'md5 and tlsh' md5 tlsh true true md5_tlsh.txt md5_tlsh.hset
+HSET_TLSH_OPTIONS=10 mkhashset 'Some test hashes' 'md5 and tlsh' md5 tlsh true true md5_tlsh.txt md5_tlsh.hset
 
 */
 
@@ -86,8 +85,8 @@ int main(int argc, char** argv) {
     const std::filesystem::path tmpdir = ".";
     std::ifstream in(infile);
 
-    // optional TLSH sections, both by default
-    uint32_t tlsh_options = SFHASH_HSET_TLSH_VECTORS | SFHASH_HSET_TLSH_INDEX;
+    // the optional TLSH index, written by default
+    uint32_t tlsh_options = SFHASH_HSET_TLSH_INDEX;
     if (const char* opts = std::getenv("HSET_TLSH_OPTIONS")) {
       try {
         tlsh_options = boost::lexical_cast<uint32_t>(opts);

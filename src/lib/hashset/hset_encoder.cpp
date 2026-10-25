@@ -86,18 +86,14 @@ size_t write_to(char* out, const void* buf, size_t len) {
   return len;
 }
 
-bool wants_tvec(const RecordFieldDescriptor& field, uint32_t tlsh_options) {
-  return field.type == SFHASH_TLSH && (tlsh_options & SFHASH_HSET_TLSH_VECTORS);
-}
-
 bool wants_tivf(const RecordFieldDescriptor& field, uint32_t tlsh_options) {
   return field.type == SFHASH_TLSH && (tlsh_options & SFHASH_HSET_TLSH_INDEX);
 }
 
 // The FTOC is sized when the builder is opened, before the TLSH options can
-// be set, so room is reserved for both optional TLSH chunks of every TLSH
-// field; the FTOC chunk is simply shorter than its reservation when they
-// are not written.
+// be set, so room is reserved for the optional TIVF chunk of every TLSH
+// field; the FTOC chunk is simply shorter than its reservation when it is
+// not written.
 size_t count_chunks(const std::vector<RecordFieldDescriptor>& fields) {
   size_t chunk_count = 5 + 3 * fields.size();
 
@@ -106,7 +102,7 @@ size_t count_chunks(const std::vector<RecordFieldDescriptor>& fields) {
       ++chunk_count;
     }
     if (hi.type == SFHASH_TLSH) {
-      chunk_count += 2; // TVEC, TIVF
+      ++chunk_count; // TIVF
     }
   }
 
@@ -121,7 +117,7 @@ size_t count_chunks_hashsets_only(const std::vector<RecordFieldDescriptor>& fiel
       ++chunk_count;
     }
     if (hi.type == SFHASH_TLSH) {
-      chunk_count += 2; // TVEC, TIVF
+      ++chunk_count; // TIVF
     }
   }
 
@@ -129,9 +125,9 @@ size_t count_chunks_hashsets_only(const std::vector<RecordFieldDescriptor>& fiel
 }
 
 /*
- * Lays out the optional TVEC and TIVF chunks of a field following its
+ * Lays out the optional TIVF chunk of a field following its
  * HDAT/RIDX at off, recording them in ftoc and off2hbidx when those are
- * given. Returns the offset following them. Non-TLSH fields have none.
+ * given. Returns the offset following it. Non-TLSH fields have none.
  */
 uint64_t layout_tlsh_chunks(
   uint64_t off,
@@ -143,16 +139,6 @@ uint64_t layout_tlsh_chunks(
   TableOfContents* ftoc,
   std::map<uint64_t, size_t>* off2hbidx)
 {
-  if (wants_tvec(field, tlsh_options)) {
-    // the float data must start on a page boundary
-    off += length_tvec_alignment_padding(off);
-    if (ftoc) {
-      ftoc->entries.emplace_back(off, Chunk::Type::TVEC);
-      (*off2hbidx)[off] = hbidx;
-    }
-    off += length_tvec(hash_count);
-  }
-
   if (wants_tivf(field, tlsh_options)) {
     THROW_IF(
       ivf.n != hash_count,
@@ -425,16 +411,6 @@ void write_chunks(
           std::get<4>(hb[i])
         };
         write_ridx(ridx, out);
-      }
-      break;
-
-    case Chunk::Type::TVEC:
-      {
-        // embeddings of the sorted rows
-        const size_t i = off2hbidx.at(choff);
-        const auto* tbeg = reinterpret_cast<const TlshDigest*>(std::get<1>(hb[i])->rec.data());
-        const auto* tend = reinterpret_cast<const TlshDigest*>(std::get<2>(hb[i])->rec.data());
-        write_tvec(tbeg, tend, out);
       }
       break;
 
@@ -1013,7 +989,7 @@ uint64_t hashset_builder_write(SFHASH_HashsetBuildCtx* bctx) {
 
         off += length_ridx(hash_counts[hbidx]);
 
-        // TVEC, TIVF
+        // TIVF
         off = layout_tlsh_chunks(
           off, field, hash_counts[hbidx], bctx->tlsh_ivfs[hbidx],
           bctx->tlsh_options, hbidx, &ftoc, &off2hbidx
@@ -1157,7 +1133,7 @@ uint64_t hashset_builder_write(SFHASH_HashsetBuildCtx* bctx) {
 
       off += length_hdat(hhdr.hash_count, hhdr.hash_length);
 
-      // TVEC, TIVF
+      // TIVF
       off = layout_tlsh_chunks(
         off, field, hhdr.hash_count, bctx->tlsh_ivfs[i],
         bctx->tlsh_options, i, &ftoc, &off2hbidx

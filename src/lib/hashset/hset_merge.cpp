@@ -20,7 +20,6 @@
 #include "hashset/hset_encoder_chunks.h"
 #include "hashset/tlsh_cells.h"
 #include "tlsh_digest.h"
-#include "tlsh_embedding.h"
 
 namespace bip = boost::interprocess;
 
@@ -348,10 +347,6 @@ const uint64_t* ridx_of(const HashsetTuple* s) {
   return s ? static_cast<const uint64_t*>(std::get<ConstRecordIndex>(*s).beg) : nullptr;
 }
 
-bool has_tvec(const HashsetTuple* s) {
-  return s && !std::get<ConstTlshVectors>(*s).empty();
-}
-
 bool has_tivf(const HashsetTuple* s) {
   return s && !std::get<TlshIvfView>(*s).empty();
 }
@@ -363,7 +358,6 @@ struct OutSection {
   const HashsetTuple* rs = nullptr;
   uint64_t n = 0;
   std::vector<uint32_t> lmap, rmap;
-  bool tvec = false;
   bool tivf = false;
   TlshIvf ivf;
   uint64_t hint_off = 0; // chunk offsets, filled in by the layout
@@ -486,12 +480,10 @@ uint64_t write_merged_hset(
 
       if (f.type == SFHASH_TLSH) {
         if (tlsh_options & SFHASH_HSET_TLSH_INHERIT) {
-          // what every present side has
-          s.tvec = (!s.ls || has_tvec(s.ls)) && (!s.rs || has_tvec(s.rs));
+          // an index iff every present side has one
           s.tivf = (!s.ls || has_tivf(s.ls)) && (!s.rs || has_tivf(s.rs));
         }
         else {
-          s.tvec = (tlsh_options & SFHASH_HSET_TLSH_VECTORS) != 0;
           s.tivf = (tlsh_options & SFHASH_HSET_TLSH_INDEX) != 0;
         }
 
@@ -539,7 +531,7 @@ uint64_t write_merged_hset(
 
   size_t chunk_count = 3 + (with_records ? 2 : 0); // FTOC, FHDR, [RHDR, RDAT], FEND
   for (const auto& s: secs) {
-    chunk_count += 2 + (s.field.type != SFHASH_SIZE) + with_records + s.tvec + s.tivf;
+    chunk_count += 2 + (s.field.type != SFHASH_SIZE) + with_records + s.tivf;
   }
 
   TableOfContents ftoc;
@@ -585,13 +577,6 @@ uint64_t write_merged_hset(
       ftoc.entries.emplace_back(off, Chunk::Type::RIDX);
       off2sec.emplace_back(off, i);
       off += length_ridx(s.n);
-    }
-
-    if (s.tvec) {
-      off += length_tvec_alignment_padding(off);
-      ftoc.entries.emplace_back(off, Chunk::Type::TVEC);
-      off2sec.emplace_back(off, i);
-      off += length_tvec(s.n);
     }
 
     if (s.tivf) {
@@ -693,35 +678,6 @@ uint64_t write_merged_hset(
               return s.n * sizeof(uint64_t);
             },
             out, "RIDX"
-          );
-        }
-        break;
-
-      case Chunk::Type::TVEC:
-        {
-          const OutSection& s = secs[section_at(choff)];
-          write_chunk(
-            [&](char* o) -> size_t {
-              char* data = o + write_tvec_header(s.n, o);
-              constexpr size_t ROW = TLSH_EMBED_DIMS * sizeof(float);
-              for_each_kept_row(s, [&](const HashsetTuple* side, uint64_t i, uint32_t k) {
-                const auto& tv = std::get<ConstTlshVectors>(*side);
-                if (tv.data) {
-                  // carry the stored vector through
-                  std::memcpy(data + k * ROW, tv.data + i * TLSH_EMBED_DIMS, ROW);
-                }
-                else {
-                  // this side has no vectors: embed its row
-                  float row[TLSH_EMBED_DIMS];
-                  TlshDigest d;
-                  std::memcpy(&d, rows_of(side) + i * sizeof(TlshDigest), sizeof(d));
-                  tlsh_embed(d, row);
-                  std::memcpy(data + k * ROW, row, ROW);
-                }
-              });
-              return TVEC_HEADER_LENGTH + s.n * ROW;
-            },
-            out, "TVEC"
           );
         }
         break;

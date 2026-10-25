@@ -64,8 +64,9 @@ R"(Usage:
 
       --name S               hset name (default "VirusShare")
       --desc S               hset description
-      --tlsh-options N       SFHASH_HSET_TLSH_* bits (default 3: TVEC and
-                             TIVF); HSET_TLSH_OPTIONS also sets it
+      --tlsh-options N       SFHASH_HSET_TLSH_* bits (default 2: the TIVF
+                             index; 0 for none); HSET_TLSH_OPTIONS also
+                             sets it
       --temp DIR             builder temp directory (default ".")
 
   vsscan hash FILE...

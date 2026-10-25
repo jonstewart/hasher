@@ -94,7 +94,7 @@ class TestTlshHashset(unittest.TestCase):
                 f.write(f'{hashlib.md5(hx.encode()).hexdigest()} {hx}\n')
 
         subprocess.run(
-            [MKHASHSET, 'tlsh test', 'md5 and tlsh with vectors and index',
+            [MKHASHSET, 'tlsh test', 'md5 and tlsh with an index',
              'md5', 'tlsh', 'true', 'true', txt, cls.hset_path],
             check=True, cwd=cls.tmpdir.name, capture_output=True
         )
@@ -123,7 +123,7 @@ class TestTlshHashset(unittest.TestCase):
         self.assertEqual(hasher.TLSH, hsvectors.hhdr_hash_type(tlsh_hhdr))
         self.assertEqual('HHDR(tlsh)', hsvectors.chunk_name(tlsh_hhdr))
         i = types.index(tlsh_hhdr)
-        self.assertEqual(['HINT', 'HDAT', 'RIDX', 'TVEC', 'TIVF', 'FEND'], types[i + 1:])
+        self.assertEqual(['HINT', 'HDAT', 'RIDX', 'TIVF', 'FEND'], types[i + 1:])
 
         # chunk headers agree with the FTOC
         with open(self.hset_path, 'rb') as f:
@@ -139,13 +139,7 @@ class TestTlshHashset(unittest.TestCase):
         sec = secs[0]
         self.assertEqual(len(self.rows) * 36, sec.hdat.length)
         self.assertEqual(len(self.rows) * 8, sec.ridx.length)
-        self.assertIsNotNone(sec.tvec)
         self.assertIsNotNone(sec.tivf)
-
-        tv = hsvectors.tvec_header(self.hset_path)
-        self.assertEqual((1, 0, 0, 264, len(self.rows), 1), tv[:6])
-        self.assertEqual(0, tv.data_offset % 4096)
-        self.assertEqual(sec.tvec.offset + 12 + 32, tv.data_offset)
 
         iv = hsvectors.tivf_header(self.hset_path)
         self.assertEqual(3, iv.version)
@@ -164,12 +158,6 @@ class TestTlshHashset(unittest.TestCase):
         self.assertEqual(self.rows, digests)
         for r, d in enumerate(digests):
             self.assertEqual(d, self.hset.hash(self.tidx, r))
-
-        vectors = hsvectors.tlsh_vector_rows(self.hset_path)
-        self.assertEqual(len(digests), len(vectors))
-        for d, v in zip(digests, vectors):
-            self.assertEqual(264, len(v))
-            self.assertEqual(hasher.tlsh_embed(d), list(v))
 
         ridx = hsvectors.tlsh_record_index_rows(self.hset_path)
         self.assertEqual(len(digests), len(ridx))
@@ -203,32 +191,24 @@ class TestTlshHashset(unittest.TestCase):
 
     @unittest.skipIf(np is None, 'numpy not installed')
     def test_numpy_loaders(self):
-        X = hsvectors.load_tlsh_vectors(self.hset_path)
         D = hsvectors.load_tlsh_digests(self.hset_path)
         R = hsvectors.load_tlsh_record_index(self.hset_path)
         n = len(self.rows)
-        self.assertEqual((n, 264), X.shape)
-        self.assertEqual(np.float32, X.dtype)
-        self.assertFalse(X.flags.writeable)
         self.assertEqual((n, 36), D.shape)
+        self.assertFalse(D.flags.writeable)
         self.assertEqual((n,), R.shape)
         self.assertEqual(np.uint64, R.dtype)
 
         for r in range(n):
-            d = bytes(D[r])
-            self.assertEqual(self.rows[r], d)
-            self.assertEqual(hasher.tlsh_embed(d), X[r].tolist())
+            self.assertEqual(self.rows[r], bytes(D[r]))
 
-        # the same from a buffer, and the vectors the C library hands out
+        # the same from a buffer
         with open(self.hset_path, 'rb') as f:
             buf = f.read()
-        self.assertTrue(np.array_equal(X, hsvectors.load_tlsh_vectors(buf)))
-        V = self.hset.tlsh_vectors(self.tidx)
-        self.assertEqual((n, 264), V.shape)
-        self.assertTrue(np.array_equal(X, V))
-        self.assertFalse(V.flags.writeable)
+        self.assertTrue(np.array_equal(D, hsvectors.load_tlsh_digests(buf)))
 
         # the embedding is a lower bound on the TLSH distance within 144
+        X = np.array([hasher.tlsh_embed(bytes(d)) for d in D], dtype=np.float32)
         q = X[0]
         d2 = ((X - q) ** 2).sum(axis=1)
         for r in range(n):

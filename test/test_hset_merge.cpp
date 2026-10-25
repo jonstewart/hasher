@@ -42,6 +42,9 @@
 namespace {
 
 constexpr uint32_t BOTH = SFHASH_HSET_TLSH_VECTORS | SFHASH_HSET_TLSH_INDEX;
+// the type of the TVEC chunk that once held the stored embedding; no
+// writer emits it
+constexpr uint32_t TVEC_TYPE = 0x54564543;
 constexpr uint32_t NONE = 0;
 constexpr uint32_t INHERIT = SFHASH_HSET_TLSH_INHERIT;
 
@@ -337,7 +340,7 @@ bool has_index(const Loaded& x) {
   return tidx < 0 || !std::get<TlshIvfView>(x.get()->holder.hsets[tidx]).empty();
 }
 
-void check_tlsh_section(const Loaded& o, size_t tidx, bool want_vec, bool want_idx, bool merged_index) {
+void check_tlsh_section(const Loaded& o, size_t tidx, bool want_idx, bool merged_index) {
   const SFHASH_Hashset* hset = o.get();
   const auto& hs = hset->holder.hsets[tidx];
   const uint64_t n = std::get<HashsetHeader>(hs).hash_count;
@@ -356,24 +359,8 @@ void check_tlsh_section(const Loaded& o, size_t tidx, bool want_vec, bool want_i
     }
   }
 
-  // vectors
-  const auto& tv = std::get<ConstTlshVectors>(hs);
-  CHECK(count_type(o.toc, Chunk::TVEC) == (want_vec ? 1u : 0u));
-  if (want_vec) {
-    REQUIRE(tv.data);
-    CHECK(tv.n == n);
-    CHECK(tv.dims == TLSH_EMBED_DIMS);
-    const ptrdiff_t off = reinterpret_cast<const char*>(tv.data) - o.buf.data();
-    CHECK(off % 4096 == 0);
-    float exp[TLSH_EMBED_DIMS];
-    for (uint64_t r = 0; r < n; ++r) {
-      tlsh_embed(rows[r], exp);
-      REQUIRE(std::memcmp(exp, tv.data + r * TLSH_EMBED_DIMS, sizeof(exp)) == 0);
-    }
-  }
-  else {
-    CHECK(!tv.data);
-  }
+  // never the stored embedding
+  CHECK(count_type(o.toc, TVEC_TYPE) == 0);
 
   // index
   const auto& ivf = std::get<TlshIvfView>(hs);
@@ -447,7 +434,7 @@ void check_tlsh_section(const Loaded& o, size_t tidx, bool want_vec, bool want_i
   }
 }
 
-void check_output(const Loaded& o, const Loaded& l, const Loaded& r, uint32_t op, bool want_vec, bool want_idx) {
+void check_output(const Loaded& o, const Loaded& l, const Loaded& r, uint32_t op, bool want_idx) {
   const SFHASH_Hashset* hset = o.get();
   const Holder& h = hset->holder;
   const Expected e = expected_output(l, r, op);
@@ -518,10 +505,10 @@ void check_output(const Loaded& o, const Loaded& l, const Loaded& r, uint32_t op
   // TLSH derived structures
   const int tidx = sfhash_hashset_index_for_type(hset, SFHASH_TLSH);
   if (tidx >= 0) {
-    check_tlsh_section(o, tidx, want_vec, want_idx, has_index(l) && has_index(r));
+    check_tlsh_section(o, tidx, want_idx, has_index(l) && has_index(r));
   }
   else {
-    CHECK(count_type(o.toc, Chunk::TVEC) == 0);
+    CHECK(count_type(o.toc, TVEC_TYPE) == 0);
     CHECK(count_type(o.toc, Chunk::TIVF) == 0);
   }
 }
@@ -538,17 +525,20 @@ void run_matrix(bool with_records) {
 
   struct Case {
     uint32_t aopts, bopts, merge_opts;
-    bool want_vec, want_idx;
+    bool want_idx;
   };
+  // bit 1 (the former SFHASH_HSET_TLSH_VECTORS) is reserved and ignored
+  const uint32_t IDX = SFHASH_HSET_TLSH_INDEX;
   const Case cases[] = {
-    { BOTH, BOTH, INHERIT, true, true },                            // both on, carried through
-    { NONE, NONE, INHERIT, false, false },                          // both off
-    { BOTH, SFHASH_HSET_TLSH_INDEX, INHERIT, false, true },         // b lacks vectors: index merged, no vectors
-    { BOTH, SFHASH_HSET_TLSH_INDEX, BOTH, true, true },             // ... vectors embedded for b
-    { BOTH, SFHASH_HSET_TLSH_VECTORS, INHERIT, true, false },       // b lacks index: vectors carried, no index
-    { BOTH, SFHASH_HSET_TLSH_VECTORS, BOTH, true, true },           // ... index rebuilt from scratch
-    { NONE, NONE, BOTH, true, true },                               // everything computed for the output
-    { BOTH, BOTH, NONE, false, false },                             // everything dropped
+    { IDX, IDX, INHERIT, true },    // both indexed: index carried through
+    { NONE, NONE, INHERIT, false }, // both off
+    { IDX, NONE, INHERIT, false },  // b lacks the index: none
+    { IDX, NONE, IDX, true },       // ... index rebuilt from scratch
+    { IDX, NONE, 3u, true },        // ... the same with bit 1 set
+    { NONE, NONE, IDX, true },      // index computed for the output
+    { IDX, IDX, 3u, true },         // index merged, bit 1 ignored
+    { IDX, IDX, NONE, false },      // index dropped
+    { IDX, IDX, 1u, false },        // ... bit 1 alone writes nothing
   };
 
   for (const auto& c: cases) {
@@ -556,7 +546,7 @@ void run_matrix(bool with_records) {
     const Loaded lb = b(c.bopts);
     for (const uint32_t op: OPS) {
       const Loaded o = merge(la, lb, op, "test/merge_out_" + tag + ".hset", c.merge_opts);
-      check_output(o, la, lb, op, c.want_vec, c.want_idx);
+      check_output(o, la, lb, op, c.want_idx);
     }
   }
 }
@@ -687,7 +677,7 @@ TEST_CASE("hset_merge_algebra") {
       CHECK(rows_of(ab.get(), t) == rows_of(ba.get(), t));
     }
     CHECK(ab.get()->holder.rhdr.record_count == ba.get()->holder.rhdr.record_count);
-    check_output(ba, b, a, SFHASH_HSET_OP_UNION, true, true);
+    check_output(ba, b, a, SFHASH_HSET_OP_UNION, true);
 
     // a - a is empty
     const Loaded aa = merge(a, a, SFHASH_HSET_OP_DIFFERENCE, "test/merge_alg_a-a.hset", INHERIT);
@@ -696,14 +686,14 @@ TEST_CASE("hset_merge_algebra") {
       CHECK(sfhash_hashset_count(aa.get(), i) == 0);
     }
     CHECK(aa.get()->holder.rhdr.record_count == 0);
-    check_output(aa, a, a, SFHASH_HSET_OP_DIFFERENCE, true, true);
+    check_output(aa, a, a, SFHASH_HSET_OP_DIFFERENCE, true);
 
     // a & a is a
     const Loaded ai = merge(a, a, SFHASH_HSET_OP_INTERSECT, "test/merge_alg_a&a.hset", INHERIT);
     for (const auto t: { SFHASH_MD5, SFHASH_TLSH }) {
       CHECK(rows_of(ai.get(), t) == rows_of(a.get(), t));
     }
-    check_output(ai, a, a, SFHASH_HSET_OP_INTERSECT, true, true);
+    check_output(ai, a, a, SFHASH_HSET_OP_INTERSECT, true);
 
     // (a | b) - b == a - b
     const Loaded ab_b = merge(ab, b, SFHASH_HSET_OP_DIFFERENCE, "test/merge_alg_ab-b.hset", INHERIT);
@@ -711,7 +701,7 @@ TEST_CASE("hset_merge_algebra") {
     for (const auto t: { SFHASH_MD5, SFHASH_TLSH }) {
       CHECK(rows_of(ab_b.get(), t) == rows_of(a_b.get(), t));
     }
-    check_output(ab_b, ab, b, SFHASH_HSET_OP_DIFFERENCE, true, true);
+    check_output(ab_b, ab, b, SFHASH_HSET_OP_DIFFERENCE, true);
   }
 }
 
@@ -726,7 +716,7 @@ TEST_CASE("hset_merge_records_differing_fields") {
     CHECK(o.get()->holder.rhdr.fields[0].type == SFHASH_MD5);
     CHECK(o.get()->holder.rhdr.fields[1].type == SFHASH_TLSH);
     CHECK(o.get()->holder.rhdr.fields[2].type == SFHASH_SHA_1);
-    check_output(o, a, b, op, true, true);
+    check_output(o, a, b, op, true);
     if (op == SFHASH_HSET_OP_UNION) {
       // no record of one side can equal a record of the other
       CHECK(o.get()->holder.rhdr.record_count == 4000 + 4000);
@@ -736,7 +726,7 @@ TEST_CASE("hset_merge_records_differing_fields") {
   // the reverse order widens the other way and must re-sort the right side
   const Loaded o = merge(b, a, SFHASH_HSET_OP_UNION, "test/merge_df_out2.hset", INHERIT);
   CHECK(o.get()->holder.rhdr.fields[0].type == SFHASH_SHA_1);
-  check_output(o, b, a, SFHASH_HSET_OP_UNION, true, true);
+  check_output(o, b, a, SFHASH_HSET_OP_UNION, true);
 }
 
 TEST_CASE("hset_merge_mixed_records_and_hashsets_only") {
@@ -748,9 +738,9 @@ TEST_CASE("hset_merge_mixed_records_and_hashsets_only") {
   for (const uint32_t op: OPS) {
     const Loaded o = merge(a, b, op, "test/merge_mx_out.hset", INHERIT);
     CHECK(o.get()->holder.rhdr.fields.empty());
-    check_output(o, a, b, op, true, true);
+    check_output(o, a, b, op, true);
     const Loaded p = merge(b, a, op, "test/merge_mx_out2.hset", INHERIT);
-    check_output(p, b, a, op, true, true);
+    check_output(p, b, a, op, true);
   }
 }
 
@@ -766,7 +756,7 @@ TEST_CASE("hset_merge_type_only_on_one_side") {
     REQUIRE(midx >= 0);
     // union and difference copy the left md5 section, intersection empties it
     CHECK(sfhash_hashset_count(o.get(), midx) == (op == SFHASH_HSET_OP_INTERSECT ? 0u : 5000u));
-    check_output(o, a, b, op, true, true);
+    check_output(o, a, b, op, true);
   }
 }
 
@@ -801,7 +791,7 @@ TEST_CASE("hset_merge_errors") {
   const Loaded o = merge(ro, ro2, SFHASH_HSET_OP_UNION, "test/merge_err_out.hset", INHERIT);
   CHECK(o.get()->holder.hsets.empty());
   CHECK(o.get()->holder.rhdr.record_count == 150);
-  check_output(o, ro, ro2, SFHASH_HSET_OP_UNION, false, false);
+  check_output(o, ro, ro2, SFHASH_HSET_OP_UNION, false);
 }
 
 TEST_CASE("hset_merge_timing") {
@@ -830,8 +820,8 @@ TEST_CASE("hset_merge_timing") {
   }
   REQUIRE(size > 0);
 
-  // from scratch: the same rows through the builder (sort, dedup, embed,
-  // k-means), fed as binary digests so no text parsing is timed
+  // from scratch: the same rows through the builder (sort, dedup,
+  // clustering), fed as binary digests so no text parsing is timed
   const auto t2 = clock::now();
   {
     auto bctx = make_unique_del(
@@ -850,38 +840,14 @@ TEST_CASE("hset_merge_timing") {
   const Loaded o = load_file("test/merge_big_out.hset");
   const Loaded rebuilt = load_file("test/merge_big_rebuilt.hset");
   CHECK(rows_of(o.get(), SFHASH_TLSH) == rows_of(rebuilt.get(), SFHASH_TLSH));
-  CHECK(count_type(o.toc, Chunk::TVEC) == 1);
+  CHECK(count_type(o.toc, TVEC_TYPE) == 0);
   CHECK(count_type(o.toc, Chunk::TIVF) == 1);
-
-  // the same without the vectors, whose 1 KiB per row dominates the output
-  const auto t4 = clock::now();
-  REQUIRE(sfhash_hashset_merge(
-    a.get(), b.get(), SFHASH_HSET_OP_UNION, "big", "big union",
-    "test/merge_big_out_idx.hset", SFHASH_HSET_TLSH_INDEX, SFHASH_HSET_COALESCE_DEFAULT, &err
-  ) > 0);
-  const auto t5 = clock::now();
-  REQUIRE(!err);
-  {
-    auto bctx = make_unique_del(
-      sfhash_hashset_builder_open("big", "big union", htypes.data(), htypes.size(), false, true, "test/merge_big_rebuilt_idx.hset", "test", &err),
-      sfhash_hashset_builder_destroy
-    );
-    REQUIRE(!err);
-    sfhash_hashset_builder_set_tlsh_options(bctx.get(), SFHASH_HSET_TLSH_INDEX);
-    for (const auto& d: big) {
-      sfhash_hashset_builder_add_hash(bctx.get(), &d, sizeof(d));
-    }
-    REQUIRE(sfhash_hashset_builder_write(bctx.get(), &err) > 0);
-    REQUIRE(!err);
-  }
-  const auto t6 = clock::now();
 
   std::cout << "hset_merge_timing: union of " << sfhash_hashset_count(a.get(), 0) << " + "
             << sfhash_hashset_count(b.get(), 0) << " TLSH rows -> " << sfhash_hashset_count(o.get(), 0)
-            << " rows\n  with TVEC + TIVF: merge " << std::fixed << std::setprecision(1) << ms(t1 - t0)
+            << " rows\n  with TIVF: merge " << std::fixed << std::setprecision(1) << ms(t1 - t0)
             << " ms, from-scratch build " << ms(t3 - t2) << " ms (" << o.buf.size() / (1024 * 1024) << " MiB file)"
-            << "\n  TIVF only:        merge " << ms(t5 - t4)
-            << " ms, from-scratch build " << ms(t6 - t5) << " ms" << std::endl;
+            << std::endl;
 }
 
 namespace {
@@ -931,7 +897,7 @@ TEST_CASE("hset_builder_setops_are_merges") {
 
     for (const auto& [open, op]: SETOPS) {
       const Loaded o = setop(open, a, b, true, true, "test/setop_out_" + tag + ".hset", INHERIT);
-      check_output(o, a, b, op, true, true);
+      check_output(o, a, b, op, true);
 
       const Loaded m = merge(a, b, op, "test/setop_merge_" + tag + ".hset", INHERIT);
       for (const auto t: { SFHASH_MD5, SFHASH_TLSH }) {
@@ -975,7 +941,7 @@ TEST_CASE("hset_builder_setops_write_flags") {
       }
       const int tidx = sfhash_hashset_index_for_type(o.get(), SFHASH_TLSH);
       REQUIRE(tidx >= 0);
-      check_tlsh_section(o, tidx, true, true, true);
+      check_tlsh_section(o, tidx, true, true);
     }
 
     // records only
@@ -995,9 +961,9 @@ TEST_CASE("hset_builder_setops_write_flags") {
     const Loaded na = build_input("test/setop_fl_na.hset", 0, 3000, true, NONE);
     const Loaded nb = build_input("test/setop_fl_nb.hset", 1000, 4000, true, NONE);
     const Loaded both = setop(sfhash_hashset_builder_union_open, na, nb, true, true, "test/setop_fl_both.hset", BOTH);
-    check_output(both, na, nb, SFHASH_HSET_OP_UNION, true, true);
+    check_output(both, na, nb, SFHASH_HSET_OP_UNION, true);
     const Loaded none = setop(sfhash_hashset_builder_union_open, na, nb, true, true, "test/setop_fl_none.hset", INHERIT);
-    check_output(none, na, nb, SFHASH_HSET_OP_UNION, false, false);
+    check_output(none, na, nb, SFHASH_HSET_OP_UNION, false);
   }
 
   // adding to a set-operation context is an error at write
@@ -1032,7 +998,7 @@ TEST_CASE("hset_merge_rebuild_honours_index_kmeans") {
     const uint32_t opts = SFHASH_HSET_TLSH_INDEX | (kmeans ? uint32_t(SFHASH_HSET_TLSH_INDEX_KMEANS) : 0u);
     const Loaded o = merge(a, b, SFHASH_HSET_OP_UNION, "test/merge_method_out.hset", opts);
     // rows, radii and kNN by index == brute force
-    check_output(o, a, b, SFHASH_HSET_OP_UNION, false, true);
+    check_output(o, a, b, SFHASH_HSET_OP_UNION, true);
     const int tidx = sfhash_hashset_index_for_type(o.get(), SFHASH_TLSH);
     REQUIRE(tidx >= 0);
     const auto& hs = o.get()->holder.hsets[tidx];

@@ -78,7 +78,7 @@ struct SFHASH_HashsetBuildCtx {
   size_t field_pos;
 
   // which optional TLSH sections to write, SFHASH_HSET_TLSH_* bits
-  uint32_t tlsh_options = SFHASH_HSET_TLSH_VECTORS | SFHASH_HSET_TLSH_INDEX;
+  uint32_t tlsh_options = SFHASH_HSET_TLSH_INDEX;
 
   // one per field: the TIVF index of a TLSH field that gets one, built from
   // the sorted rows before the layout is computed; empty otherwise
@@ -125,7 +125,7 @@ void write_hset(
   const std::filesystem::path& tmpdir,
   bool with_records,
   bool with_hashsets,
-  uint32_t tlsh_options = SFHASH_HSET_TLSH_VECTORS | SFHASH_HSET_TLSH_INDEX
+  uint32_t tlsh_options = SFHASH_HSET_TLSH_INDEX
 );
 
 std::vector<

@@ -205,23 +205,26 @@ Chunk chunk_at(const std::vector<char>& buf, const TableOfContents& toc, size_t 
   return decode_chunk(beg, cur, beg + buf.size());
 }
 
-void check_vectors_and_index(const Built& b, uint32_t tlsh_options) {
+// the type of the TVEC chunk that once held the stored embedding; no
+// writer emits it and readers reject it
+constexpr uint32_t TVEC_TYPE = 0x54564543;
+
+void check_index(const Built& b, uint32_t tlsh_options) {
   const SFHASH_Hashset* hset = b.hset.get();
   const size_t tidx = b.tidx;
   const auto& hs = hset->holder.hsets[tidx];
   const auto& hhdr = std::get<HashsetHeader>(hs);
   const uint64_t n = hhdr.hash_count;
   REQUIRE(n > 0);
-  const TlshDigest* rows = rows_of(hset, tidx);
 
-  const bool want_vec = tlsh_options & SFHASH_HSET_TLSH_VECTORS;
+  // bit 1 (the former SFHASH_HSET_TLSH_VECTORS) is ignored
   const bool want_idx = tlsh_options & SFHASH_HSET_TLSH_INDEX;
 
   // chunk presence
-  CHECK(count_type(b.toc, Chunk::TVEC) == (want_vec ? 1u : 0u));
+  CHECK(count_type(b.toc, TVEC_TYPE) == 0);
   CHECK(count_type(b.toc, Chunk::TIVF) == (want_idx ? 1u : 0u));
 
-  // chunk order: HDAT [RIDX] [TVEC] [TIVF] then HHnn or FEND
+  // chunk order: HDAT [RIDX] [TIVF] then HHnn or FEND
   {
     // the HDAT of the TLSH set is the last HDAT, as TLSH is the last field
     size_t i = find_type(b.toc, Chunk::HDAT);
@@ -232,11 +235,6 @@ void check_vectors_and_index(const Built& b, uint32_t tlsh_options) {
     }
     ++i;
     if (i < b.toc.entries.size() && b.toc.entries[i].second == Chunk::RIDX) {
-      ++i;
-    }
-    if (want_vec) {
-      REQUIRE(i < b.toc.entries.size());
-      CHECK(b.toc.entries[i].second == Chunk::TVEC);
       ++i;
     }
     if (want_idx) {
@@ -252,42 +250,6 @@ void check_vectors_and_index(const Built& b, uint32_t tlsh_options) {
     for (size_t j = 1; j < b.toc.entries.size(); ++j) {
       CHECK(b.toc.entries[j - 1].first < b.toc.entries[j].first);
     }
-  }
-
-  // vectors
-  const auto& tv = std::get<ConstTlshVectors>(hs);
-  size_t dims = 999;
-  const float* vec = sfhash_hashset_tlsh_vectors(hset, tidx, &dims);
-  if (want_vec) {
-    REQUIRE(tv.data);
-    CHECK(tv.dims == TLSH_EMBED_DIMS);
-    CHECK(tv.n == n);
-    CHECK(vec == tv.data);
-    CHECK(dims == SFHASH_TLSH_EMBEDDING_DIMS);
-
-    // float data is page aligned relative to the file start
-    const ptrdiff_t off = reinterpret_cast<const char*>(tv.data) - b.buf.data();
-    CHECK(off > 0);
-    CHECK(off % 4096 == 0);
-
-    // the chunk layout matches the doc: data at chunk offset + 12 + 32
-    const size_t ci = find_type(b.toc, Chunk::TVEC);
-    CHECK(static_cast<uint64_t>(off) == b.toc.entries[ci].first + 12 + 32);
-    const Chunk ch = chunk_at(b.buf, b.toc, ci);
-    CHECK(static_cast<uint64_t>(ch.dend - ch.dbeg) == length_tvec_data(n));
-
-    // every row is the embedding of the HDAT row
-    float exp[TLSH_EMBED_DIMS];
-    for (uint64_t r = 0; r < n; ++r) {
-      tlsh_embed(rows[r], exp);
-      REQUIRE(std::memcmp(exp, tv.data + r * TLSH_EMBED_DIMS, sizeof(exp)) == 0);
-    }
-  }
-  else {
-    CHECK(!tv.data);
-    CHECK(tv.n == 0);
-    CHECK(vec == nullptr);
-    CHECK(dims == 0);
   }
 
   // index
@@ -316,15 +278,11 @@ void check_vectors_and_index(const Built& b, uint32_t tlsh_options) {
     CHECK(strategies == SFHASH_TLSH_KNN_BRUTE);
   }
 
-  // a non-TLSH hashset has neither
+  // a non-TLSH hashset has no index
   const int midx = sfhash_hashset_index_for_type(hset, SFHASH_MD5);
   if (midx >= 0) {
     const auto& ms = hset->holder.hsets[midx];
-    CHECK(!std::get<ConstTlshVectors>(ms).data);
     CHECK(std::get<TlshIvfView>(ms).empty());
-    size_t mdims = 999;
-    CHECK(sfhash_hashset_tlsh_vectors(hset, midx, &mdims) == nullptr);
-    CHECK(mdims == 0);
     CHECK(sfhash_hashset_tlsh_knn_strategies(hset, midx) == 0);
   }
 }
@@ -420,7 +378,7 @@ TEST_CASE("tvec_write_parse_round_trip") {
   CHECK_THROWS(parse_tvec(Chunk{ Chunk::TVEC, data.data(), data.data() + 31 }));
 }
 
-TEST_CASE("hset_tlsh_vectors_options") {
+TEST_CASE("hset_tlsh_options") {
   const struct { bool md5; bool records; const char* path; } modes[] = {
     { true,  true,  "test/tlsh_vec_rh.hset" },
     { true,  false, "test/tlsh_vec_ho.hset" },
@@ -429,7 +387,8 @@ TEST_CASE("hset_tlsh_vectors_options") {
   };
 
   for (const auto& m: modes) {
-    for (const uint32_t opts: { BOTH, uint32_t(SFHASH_HSET_TLSH_VECTORS), uint32_t(SFHASH_HSET_TLSH_INDEX), 0u }) {
+    // 3 and 1 set the reserved bit 1, which is ignored
+    for (const uint32_t opts: { 3u, 1u, uint32_t(SFHASH_HSET_TLSH_INDEX), 0u }) {
       const Built b = build(m.md5, m.path, m.records, true, opts);
       const uint64_t n = sfhash_hashset_count(b.hset.get(), b.tidx);
       if (m.records && m.md5) {
@@ -440,8 +399,22 @@ TEST_CASE("hset_tlsh_vectors_options") {
         CHECK(n <= corpus().size());
         CHECK(n > corpus().size() / 2);
       }
-      check_vectors_and_index(b, opts);
+      check_index(b, opts);
     }
+  }
+}
+
+TEST_CASE("hset_tlsh_options_bit_1_is_ignored") {
+  // HSET_TLSH_OPTIONS=3 (once vectors and index) writes what 2 writes: the
+  // same chunks at the same offsets and the same TIVF payload
+  for (const bool records: { true, false }) {
+    const Built a = build(true, "test/tlsh_opt3.hset", records, true, 3u);
+    const Built b = build(true, "test/tlsh_opt2.hset", records, true, SFHASH_HSET_TLSH_INDEX);
+    CHECK(a.buf.size() == b.buf.size());
+    CHECK(a.toc.entries == b.toc.entries);
+    const Chunk ca = chunk_at(a.buf, a.toc, find_type(a.toc, Chunk::TIVF));
+    const Chunk cb = chunk_at(b.buf, b.toc, find_type(b.toc, Chunk::TIVF));
+    CHECK(std::vector<uint8_t>(ca.dbeg, ca.dend) == std::vector<uint8_t>(cb.dbeg, cb.dend));
   }
 }
 
@@ -581,12 +554,10 @@ TEST_CASE("hset_tlsh_knn_without_index_is_brute") {
   }
 }
 
-TEST_CASE("hset_tlsh_vectors_decode_rejects_corruption") {
-  const Built b = build(true, "test/tlsh_vec_bad.hset", true, true, BOTH);
+TEST_CASE("hset_tlsh_index_decode_rejects_corruption") {
+  const Built b = build(true, "test/tlsh_vec_bad.hset", true, true, SFHASH_HSET_TLSH_INDEX);
 
-  const size_t vi = find_type(b.toc, Chunk::TVEC);
   const size_t ii = find_type(b.toc, Chunk::TIVF);
-  const size_t vdata = b.toc.entries[vi].first + 12; // TVEC payload
   const size_t idata = b.toc.entries[ii].first + 12; // TIVF payload
   const size_t ftoc_data = 8 + 32 + 12;              // first FTOC entry
 
@@ -606,40 +577,6 @@ TEST_CASE("hset_tlsh_vectors_decode_rejects_corruption") {
   // the pristine copy loads
   CHECK(!fails(b.buf));
 
-  // TVEC version
-  {
-    auto buf = b.buf;
-    buf[vdata] = 2;
-    CHECK(fails(buf));
-  }
-  // TVEC variant
-  {
-    auto buf = b.buf;
-    buf[vdata + 2] = 1;
-    CHECK(fails(buf));
-  }
-  // TVEC dims
-  {
-    auto buf = b.buf;
-    buf[vdata + 4] = 0x00;
-    buf[vdata + 5] = 0x02; // 512
-    CHECK(fails(buf));
-  }
-  // TVEC dtype
-  {
-    auto buf = b.buf;
-    buf[vdata + 16] = 2;
-    CHECK(fails(buf));
-  }
-  // TVEC row count disagrees with HDAT
-  {
-    auto buf = b.buf;
-    uint64_t n;
-    std::memcpy(&n, buf.data() + vdata + 8, 8);
-    --n;
-    std::memcpy(buf.data() + vdata + 8, &n, 8);
-    CHECK(fails(buf));
-  }
   // TIVF version
   {
     auto buf = b.buf;
@@ -661,16 +598,7 @@ TEST_CASE("hset_tlsh_vectors_decode_rejects_corruption") {
     std::memcpy(buf.data() + idata + 16, &n, 8);
     CHECK(fails(buf));
   }
-  // TIVF before TVEC: swap the two FTOC entries
-  {
-    auto buf = b.buf;
-    std::vector<char> ve(buf.begin() + ftoc_data + vi * 12, buf.begin() + ftoc_data + (vi + 1) * 12);
-    std::vector<char> ie(buf.begin() + ftoc_data + ii * 12, buf.begin() + ftoc_data + (ii + 1) * 12);
-    std::copy(ie.begin(), ie.end(), buf.begin() + ftoc_data + vi * 12);
-    std::copy(ve.begin(), ve.end(), buf.begin() + ftoc_data + ii * 12);
-    CHECK(fails(buf));
-  }
-  // TVEC on a hashset that is not TLSH: retype the TLSH set as blake3
+  // TIVF on a hashset that is not TLSH: retype the TLSH set as blake3
   // (HH0f -> HH0a) in both the FTOC and the chunk header
   {
     auto buf = b.buf;
