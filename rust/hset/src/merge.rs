@@ -8,11 +8,14 @@
 
 use std::cmp::Ordering;
 
-use crate::builder::{TLSH_OPTION_INDEX, TLSH_OPTION_INDEX_KMEANS, TLSH_OPTION_INHERIT};
+use crate::builder::{TLSH_OPTION_INDEX, TLSH_OPTION_INDEX_KMEANS, TLSH_OPTION_INHERIT, now_utc};
 use crate::error::{Error, Result};
-use crate::format::{FieldDescriptor, RecordHeader};
+use crate::format::{
+    self, Document, FORMAT_VERSION, FieldDescriptor, HashsetIn, HsetFile, RecordHeader,
+};
+use crate::hash_type::HashType;
 use crate::hashset::Hashset;
-use crate::lookup::{BitsPolicy, HintSpec};
+use crate::lookup::{self, BitsPolicy, HintSpec};
 use crate::ops::SetOp;
 use crate::tlsh::ivf::{DEFAULT_COALESCE, IvfBuildOptions};
 
@@ -107,8 +110,93 @@ pub fn merge(
     right: &Hashset<'_>,
     opts: &MergeOptions,
 ) -> Result<Vec<u8>> {
-    let _ = (op, left, right, opts);
-    Err(Error::input("not implemented"))
+    let (lf, rf) = (left.file(), right.file());
+    let ofields = section_fields(lf, rf);
+    let mut secs = Vec::with_capacity(ofields.len());
+    for f in &ofields {
+        secs.push(OutSection::merge(op, f, left, right, opts)?);
+    }
+    let time = match &opts.timestamp {
+        Some(t) => t.clone(),
+        None => now_utc(),
+    };
+    format::encode(&Document {
+        version: FORMAT_VERSION,
+        name: &opts.name,
+        desc: &opts.desc,
+        time: &time,
+        records: None,
+        hashsets: secs.iter().map(OutSection::input).collect(),
+    })
+}
+
+/// The output fields of a merge without records: left's section types,
+/// then right's extras, each with the first side's name and length.
+fn section_fields(lf: &HsetFile<'_>, rf: &HsetFile<'_>) -> Vec<FieldDescriptor> {
+    let mut fields: Vec<FieldDescriptor> = Vec::new();
+    for s in lf.sections.iter().chain(&rf.sections) {
+        if !fields.iter().any(|f| f.htype == s.header.htype) {
+            fields.push(FieldDescriptor {
+                htype: s.header.htype,
+                name: s.header.name.clone(),
+                length: s.header.hash_length,
+            });
+        }
+    }
+    fields
+}
+
+/// The rows of `hs`'s section of type `t`, empty if it has none.
+fn rows_of<'a>(hs: &Hashset<'a>, t: HashType) -> &'a [u8] {
+    hs.index_for_type(t).map_or(&[], |i| hs.section(i).data)
+}
+
+/// One output hash section of a merge, ready to encode.
+struct OutSection {
+    field: FieldDescriptor,
+    data: Vec<u8>,
+    hint: Option<(u16, Vec<u8>)>,
+}
+
+impl OutSection {
+    /// The section of field `f`: the merge of the inputs' sections of its
+    /// type (an absent one is an empty run).
+    fn merge(
+        op: SetOp,
+        f: &FieldDescriptor,
+        left: &Hashset<'_>,
+        right: &Hashset<'_>,
+        opts: &MergeOptions,
+    ) -> Result<Self> {
+        let len = usize::try_from(f.length)
+            .map_err(|_| Error::input(format!("{} hashes are too long", f.name)))?;
+        let (lrows, rrows) = (rows_of(left, f.htype), rows_of(right, f.htype));
+        let m = merge_rows(lrows, rrows, len, RowMode::Set(op))?;
+        let data = m.gather_rows(lrows, rrows, len)?;
+        let hint = if f.htype.is_digest() {
+            let spec = lookup::resolve_bits(opts.hint, data.len() / len, len, &opts.bits_policy);
+            lookup::build_hint(len, &data, spec)?
+        } else {
+            None
+        };
+        Ok(OutSection {
+            field: f.clone(),
+            data,
+            hint,
+        })
+    }
+
+    fn input(&self) -> HashsetIn<'_> {
+        HashsetIn {
+            htype: self.field.htype,
+            name: &self.field.name,
+            hash_length: self.field.length as usize,
+            data: &self.data,
+            hint: self.hint.as_ref().map(|(t, b)| (*t, b.as_slice())),
+            ridx: None,
+            tivf: None,
+        }
+    }
 }
 
 /// The output fields of merging two record tables: the left fields followed

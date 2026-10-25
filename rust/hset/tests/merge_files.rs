@@ -10,9 +10,15 @@
 //! whose inputs and outputs the C++ suites leave on disk are re-run and
 //! their payloads compared chunk by chunk.
 
-use hset::Error;
-use hset::merge::{MergeOptions, TlshIndexPolicy};
-use hset::tlsh::ivf::DEFAULT_COALESCE;
+use std::collections::BTreeSet;
+
+use hset::format::{FieldDescriptor, Hint, RecordHeader, chunk};
+use hset::hashset::KnnStrategy;
+use hset::merge::{MergeOptions, TlshIndexPolicy, merge};
+use hset::tlsh::ivf::{DEFAULT_COALESCE, check_invariant};
+use hset::tlsh::{IvfIndex, TlshDigest, emb_body_dist2};
+use hset::{BuildOptions, Builder, Error, HashType, Hashset, SetOp};
+use hset_testkit::tlsh::{Perturbation, corpus, naive_cell_index, perturb_corpus};
 
 #[test]
 fn tlsh_options_select_the_index_policy_as_cpp_reads_them() {
@@ -58,4 +64,395 @@ fn merge_options_default_to_inheriting_the_index_and_writing_everything() {
     assert!(o.write_records && o.write_hashsets);
     assert_eq!((o.name.as_str(), o.desc.as_str()), ("n", "d"));
     assert_eq!(o.timestamp, None);
+}
+
+// ---------------------------------------------------------------------------
+// Inputs
+// ---------------------------------------------------------------------------
+
+const OPS: [SetOp; 3] = [SetOp::Union, SetOp::Intersect, SetOp::Subtract];
+
+/// A distinct, deterministic `bytes`-byte "hash" per corpus index (C++
+/// `fake_hex` of test_hset_merge.cpp, as bytes).
+fn fake_hash(i: usize, bytes: usize) -> Vec<u8> {
+    let mut out = Vec::with_capacity(bytes + 8);
+    for b in (0..bytes).step_by(8) {
+        let w = ((i as u64) + 1)
+            .wrapping_mul(0x9E37_79B9_7F4A_7C15)
+            .wrapping_add((b as u64).wrapping_mul(0xBF58_476D_1CE4_E5B9));
+        out.extend_from_slice(&w.to_be_bytes());
+    }
+    out.truncate(bytes);
+    out
+}
+
+/// One option set of an input file: records or not, hash sections or not,
+/// the TIVF index or not.
+#[derive(Clone, Copy, Debug)]
+struct In {
+    records: bool,
+    hashsets: bool,
+    index: bool,
+}
+
+const REC: In = In {
+    records: true,
+    hashsets: true,
+    index: true,
+};
+const HO: In = In {
+    records: false,
+    hashsets: true,
+    index: true,
+};
+
+impl In {
+    fn index(self, index: bool) -> Self {
+        In { index, ..self }
+    }
+}
+
+/// An `.hset` of corpus rows `range` with the field `types` (TLSH from
+/// `digests`, MD5 and SHA-1 from [`fake_hash`]), built by the Rust
+/// builder (C++ `build_input`).
+fn build_input(
+    digests: &[TlshDigest],
+    range: std::ops::Range<usize>,
+    types: &[HashType],
+    o: In,
+) -> Vec<u8> {
+    let mut b = Builder::new(types).unwrap();
+    for i in range {
+        let values: Vec<Vec<u8>> = types
+            .iter()
+            .map(|t| match t {
+                HashType::Tlsh => digests[i].0.to_vec(),
+                t => fake_hash(i, t.length().unwrap()),
+            })
+            .collect();
+        let refs: Vec<Option<&[u8]>> = values.iter().map(|v| Some(v.as_slice())).collect();
+        b.add_record(&refs).unwrap();
+    }
+    let opts = BuildOptions::new("input", "merge test input")
+        .timestamp("2024-01-01T00:00:00Z")
+        .records(o.records)
+        .hashsets(o.hashsets)
+        .tlsh_index(o.index);
+    b.build(&opts).unwrap()
+}
+
+fn opts() -> MergeOptions {
+    let mut o = MergeOptions::new("merged", "merge test output");
+    o.timestamp = Some("2024-02-02T00:00:00Z".into());
+    o
+}
+
+fn load(bytes: &[u8]) -> Hashset<'_> {
+    Hashset::load(bytes).unwrap()
+}
+
+/// The merge of `l` and `r` under `o`, which must succeed.
+fn merged(op: SetOp, l: &[u8], r: &[u8], o: &MergeOptions) -> Vec<u8> {
+    merge(op, &load(l), &load(r), o).unwrap_or_else(|e| panic!("{} failed: {e}", op.name()))
+}
+
+// ---------------------------------------------------------------------------
+// The expected output, computed independently over the inputs
+// ---------------------------------------------------------------------------
+
+type Rows = Vec<Vec<u8>>;
+
+/// The rows of `t` in `hs`, in file order (empty without such a section).
+fn rows_of(hs: &Hashset, t: HashType) -> Rows {
+    hs.index_for_type(t).map_or_else(Vec::new, |i| {
+        let s = hs.section(i);
+        (0..s.len()).map(|k| s.hash(k).to_vec()).collect()
+    })
+}
+
+fn unique(rows: &[Vec<u8>]) -> BTreeSet<Vec<u8>> {
+    rows.iter().cloned().collect()
+}
+
+fn set_op(op: SetOp, a: &BTreeSet<Vec<u8>>, b: &BTreeSet<Vec<u8>>) -> Rows {
+    match op {
+        SetOp::Union => a.union(b).cloned().collect(),
+        SetOp::Intersect => a.intersection(b).cloned().collect(),
+        SetOp::Subtract => a.difference(b).cloned().collect(),
+    }
+}
+
+/// The section types of a merge: left's, then right's extras.
+fn section_types(l: &Hashset, r: &Hashset) -> Vec<HashType> {
+    let mut types = Vec::new();
+    for sections in [l.sections(), r.sections()] {
+        for s in sections {
+            if !types.contains(&s.header.htype) {
+                types.push(s.header.htype);
+            }
+        }
+    }
+    types
+}
+
+/// The record fields of a merge: left's, then right's extras.
+fn record_fields(l: &RecordHeader, r: &RecordHeader) -> Vec<FieldDescriptor> {
+    let mut f = l.fields.clone();
+    for rf in &r.fields {
+        if !f.iter().any(|x| x.htype == rf.htype) {
+            f.push(rf.clone());
+        }
+    }
+    f
+}
+
+/// The records of `hs` rewritten to `fields` (an absent field is zeros).
+fn widened(hs: &Hashset, fields: &[FieldDescriptor]) -> Rows {
+    let rhdr = hs.record_header().unwrap();
+    hs.records()
+        .map(|rec| {
+            let mut w = Vec::new();
+            for f in fields {
+                match rhdr.field_offset(f.htype) {
+                    Some(off) => w.extend_from_slice(&rec[off..off + f.stride()]),
+                    None => w.resize(w.len() + f.stride(), 0),
+                }
+            }
+            w
+        })
+        .collect()
+}
+
+/// The present values of field `t` in `records`, sorted, duplicates kept.
+fn rows_from_records(records: &[Vec<u8>], fields: &[FieldDescriptor], t: HashType) -> Rows {
+    let mut off = 0;
+    let mut f = None;
+    for x in fields {
+        if x.htype == t {
+            f = Some(x);
+            break;
+        }
+        off += x.stride();
+    }
+    let Some(f) = f else { return Vec::new() };
+    let mut out: Rows = records
+        .iter()
+        .filter(|r| r[off] == 1)
+        .map(|r| r[off + 1..off + f.stride()].to_vec())
+        .collect();
+    out.sort();
+    out
+}
+
+#[derive(Debug, Default)]
+struct Expected {
+    /// The output fields and records, when both inputs have records.
+    records: Option<(Vec<FieldDescriptor>, Rows)>,
+    /// Per output section, its type and rows.
+    rows: Vec<(HashType, Rows)>,
+}
+
+/// What merging `l` and `r` by `op` writes with both write flags set
+/// (C++ `expected_output`).
+fn expected_output(l: &Hashset, r: &Hashset, op: SetOp) -> Expected {
+    let types = section_types(l, r);
+    match (l.record_header(), r.record_header()) {
+        (Some(lh), Some(rh)) => {
+            let fields = record_fields(lh, rh);
+            let recs = set_op(
+                op,
+                &unique(&widened(l, &fields)),
+                &unique(&widened(r, &fields)),
+            );
+            let rows = if types.is_empty() {
+                // records-only inputs give a records-only output
+                Vec::new()
+            } else {
+                fields
+                    .iter()
+                    .map(|f| (f.htype, rows_from_records(&recs, &fields, f.htype)))
+                    .collect()
+            };
+            Expected {
+                records: Some((fields, recs)),
+                rows,
+            }
+        }
+        _ => Expected {
+            records: None,
+            rows: types
+                .iter()
+                .map(|&t| {
+                    let a = unique(&rows_of(l, t));
+                    let b = unique(&rows_of(r, t));
+                    (t, set_op(op, &a, &b))
+                })
+                .collect(),
+        },
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Output checks
+// ---------------------------------------------------------------------------
+
+/// The chunk tags of `bytes` in FTOC order.
+fn tags(bytes: &[u8]) -> Vec<u32> {
+    hset::format::decode(bytes)
+        .unwrap()
+        .toc
+        .iter()
+        .map(|&(_, t)| t)
+        .collect()
+}
+
+fn count_tag(bytes: &[u8], tag: u32) -> usize {
+    tags(bytes).iter().filter(|&&t| t == tag).count()
+}
+
+/// The output loads and verifies clean, and has the name, description and
+/// timestamp of [`opts`].
+fn check_loads(o: &[u8]) -> Hashset<'_> {
+    let hs = load(o);
+    let report = hs.verify();
+    assert!(report.is_ok(), "{:?}", report.problems);
+    assert_eq!(hs.name(), "merged");
+    assert_eq!(hs.description(), "merge test output");
+    assert_eq!(hs.timestamp(), "2024-02-02T00:00:00Z");
+    let toc = &hs.file().toc;
+    assert!(
+        toc.windows(2).all(|w| w[0].0 < w[1].0),
+        "FTOC offsets ascend"
+    );
+    hs
+}
+
+/// `o` is the merge of `l` and `r` by `op` with both write flags set, its
+/// TLSH section has a `TIVF` iff `want_idx`, and that index is coalesced
+/// when both inputs had one (C++ `check_output`).
+fn check_output(o: &[u8], l: &[u8], r: &[u8], op: SetOp, want_idx: bool) {
+    let (hs, lh, rh) = (check_loads(o), load(l), load(r));
+    let e = expected_output(&lh, &rh, op);
+
+    assert_eq!(hs.section_count(), e.rows.len());
+    for (i, (t, rows)) in e.rows.iter().enumerate() {
+        let s = hs.section(i);
+        assert_eq!(s.header.htype, *t);
+        assert_eq!(&rows_of(&hs, *t), rows, "{t} rows of the {}", op.name());
+        if e.records.is_none() {
+            assert!(rows.windows(2).all(|w| w[0] < w[1]));
+        }
+        for (k, row) in rows.iter().enumerate() {
+            assert!(hs.contains(i, row), "{t} row {k} is found");
+        }
+    }
+
+    let n_sections = hs.section_count();
+    match &e.records {
+        Some((fields, recs)) => {
+            let rhdr = hs.record_header().expect("an RHDR");
+            assert_eq!(&rhdr.fields, fields);
+            let got: Rows = hs.records().map(<[u8]>::to_vec).collect();
+            assert_eq!(&got, recs);
+            assert_eq!(count_tag(o, chunk::RIDX), n_sections);
+            // every RIDX entry names a record whose field is the row
+            for (i, s) in hs.sections().iter().enumerate() {
+                let off = rhdr.field_offset(s.header.htype).unwrap();
+                for k in 0..s.len() {
+                    let rec = hs.record(s.record_index(k).unwrap() as usize).unwrap();
+                    assert_eq!(rec[off], 1, "section {i} row {k}");
+                    assert_eq!(&rec[off + 1..off + 1 + s.hash_length()], s.hash(k));
+                }
+            }
+        }
+        None => {
+            assert!(hs.record_header().is_none());
+            assert_eq!(count_tag(o, chunk::RDAT), 0);
+            assert_eq!(count_tag(o, chunk::RIDX), 0);
+        }
+    }
+
+    let merged_index = has_index(&lh) && has_index(&rh);
+    match hs.index_for_type(HashType::Tlsh) {
+        Some(t) => check_tlsh_section(&hs, t, want_idx, merged_index),
+        None => assert_eq!(count_tag(o, chunk::TIVF), 0),
+    }
+}
+
+/// Whether `hs` has no TLSH section or one with an index.
+fn has_index(hs: &Hashset) -> bool {
+    hs.index_for_type(HashType::Tlsh)
+        .is_none_or(|t| hs.section(t).tivf.is_some())
+}
+
+/// The TLSH section `t` of `hs` has the cell hint of its rows, a `TIVF`
+/// iff `want_idx` with exact radii (coalesced at the default threshold
+/// when `merged_index`), and kNN by index equals brute force (C++
+/// `check_tlsh_section`).
+fn check_tlsh_section(hs: &Hashset, t: usize, want_idx: bool, merged_index: bool) {
+    let s = hs.section(t);
+    let rows = hs.tlsh_rows(t).unwrap();
+    let Some(Hint::TlshCells { table }) = s.hint else {
+        panic!("TLSH hint is {:?}", s.hint.map(|h| h.tag()));
+    };
+    let want: Vec<u8> = naive_cell_index(rows)
+        .iter()
+        .flat_map(|o| o.to_le_bytes())
+        .collect();
+    assert_eq!(table, &want[..], "the cell hint is the rows' cell index");
+    assert_eq!(s.tivf.is_some(), want_idx, "TIVF presence");
+    assert!(!tags(hs.raw()).contains(&chunk::TVEC));
+    if !want_idx {
+        assert!(!hs.tlsh_knn_strategies(t).unwrap().index);
+        return;
+    }
+    let ivf = hs.tlsh_index(t).unwrap().unwrap();
+    // radii are exact: a fresh build computes them, a merge recomputes
+    // those of lists that lost members or were coalesced
+    for l in 0..ivf.lists() {
+        let m = ivf.medoid(l);
+        let tight = ivf
+            .list_ids(l)
+            .map(|id| emb_body_dist2(&m, &TlshDigest(rows[id as usize])))
+            .max()
+            .unwrap();
+        assert_eq!(ivf.radius2(l), tight, "list {l}");
+    }
+    if merged_index {
+        assert!(check_invariant(&ivf, DEFAULT_COALESCE));
+    }
+    check_knn_exact(hs, t, 77);
+}
+
+/// kNN by index equals brute force for queries near the rows.
+fn check_knn_exact(hs: &Hashset, t: usize, seed: u64) {
+    let rows = hs.tlsh_rows(t).unwrap();
+    let digests: Vec<TlshDigest> = rows.iter().map(|r| TlshDigest(*r)).collect();
+    for q in perturb_corpus(seed, &digests, 6, &Perturbation::default()) {
+        for (k, maxd) in [(1, 144), (10, 30), (10, 1000), (50, 144)] {
+            for incl in [true, false] {
+                let brute = hs
+                    .tlsh_knn_with(t, &q, k, maxd, incl, KnnStrategy::Brute, None)
+                    .unwrap();
+                let index = hs
+                    .tlsh_knn_with(t, &q, k, maxd, incl, KnnStrategy::Index, None)
+                    .unwrap();
+                assert_eq!(index, brute, "k {k} max {maxd} length {incl}");
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Merges
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_union_of_hashsets_only_md5_files_is_the_set_union_of_their_rows() {
+    let c = corpus(31, 300);
+    let a = build_input(&c, 0..200, &[HashType::Md5], HO);
+    let b = build_input(&c, 100..300, &[HashType::Md5], HO);
+    let o = merged(SetOp::Union, &a, &b, &opts());
+    check_output(&o, &a, &b, SetOp::Union, false);
+    assert_eq!(load(&o).count(0), 300);
 }
