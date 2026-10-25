@@ -260,6 +260,143 @@ fn a_list_whose_members_all_drop_is_omitted() {
     (&m).validate(&kept).unwrap();
 }
 
+#[test]
+fn default_threshold_coalesces_the_two_small_lists_about_the_better_medoid() {
+    let (h, [_, m_b, d0]) = small_lists_cell();
+    let ab = sorted_union(&h.ids[0], &h.ids[1]);
+    let m = h.merged(DEFAULT_COALESCE);
+    assert_eq!(m.lists(), 2);
+    assert_eq!(m.cell_lists[CELL], 0);
+    assert_eq!(m.cell_lists[CELL + 1], 2);
+    assert_eq!(list_ids(&m, 0), ab);
+    // mB gives radius 11 (to a1, a2), mA would give 12 (to b2)
+    assert_eq!(m.medoids[0], m_b);
+    assert_eq!(m.radius2[0], 11);
+    let [m_a, m_b] = [h.ivf.medoids[0], h.ivf.medoids[1]];
+    assert_eq!(
+        m.radius2[0],
+        h.radius_about(&m_a, &ab).min(h.radius_about(&m_b, &ab))
+    );
+    assert_eq!(list_ids(&m, 1), h.ids[2]);
+    assert_eq!(m.medoids[1], d0);
+    assert_eq!(m.radius2[1], 0);
+    assert!(check_invariant(&m, DEFAULT_COALESCE));
+}
+
+#[test]
+fn c_8_coalesces_two_lists_of_3_into_one_of_6() {
+    // both lists of 3 are below 4, their union of 6 is not
+    let (h, _) = small_lists_cell();
+    let m = h.merged(8);
+    assert_eq!(m.lists(), 2);
+    assert_eq!(list_ids(&m, 0), sorted_union(&h.ids[0], &h.ids[1]));
+    assert!(check_invariant(&m, 8));
+}
+
+/// The cell of `tlsh_ivf_coalesce_greedy_order`: P and Q are close, R is
+/// far from both; three lists of three. Returns the cell and mP, mQ, mR.
+fn greedy_cell() -> (HandCell, [TlshDigest; 3]) {
+    let m_p = digest(&[], &[]);
+    let m_q = digest(&[0, 1], &[]);
+    let twos: Vec<usize> = (10..20).collect();
+    let m_r = digest(&[], &twos);
+    let h = HandCell::new(&[
+        spec(m_p, 1, &[m_p, digest(&[2], &[]), digest(&[3], &[])]),
+        spec(
+            m_q,
+            1,
+            &[m_q, digest(&[0, 1, 4], &[]), digest(&[0, 1, 5], &[])],
+        ),
+        spec(
+            m_r,
+            2,
+            &[m_r, digest(&[30], &twos), digest(&[30, 31], &twos)],
+        ),
+    ]);
+    (h, [m_p, m_q, m_r])
+}
+
+#[test]
+fn c_10_coalesces_the_closest_pair_and_stops_once_it_is_large() {
+    // P and Q coalesce to 6 >= 5 and stop, R stays small alone
+    let (h, [m_p, m_q, _]) = greedy_cell();
+    let m = h.merged(10);
+    assert_eq!(m.lists(), 2);
+    let pq = list_ids(&m, 0);
+    assert_eq!(pq, sorted_union(&h.ids[0], &h.ids[1]));
+    assert!(m.medoids[0] == m_p || m.medoids[0] == m_q);
+    assert_eq!(m.radius2[0], h.radius_about(&m.medoids[0], &pq));
+    assert_eq!(
+        m.radius2[0],
+        h.radius_about(&m_p, &pq).min(h.radius_about(&m_q, &pq))
+    );
+    assert_eq!(list_ids(&m, 1), h.ids[2]);
+    assert!(check_invariant(&m, 10));
+}
+
+#[test]
+fn c_14_coalesces_the_closest_pair_first_then_the_far_list_joins() {
+    // P and Q first (6 < 7), then R joins
+    let (h, [m_p, m_q, m_r]) = greedy_cell();
+    let m = h.merged(14);
+    assert_eq!(m.lists(), 1);
+    let all: Vec<u32> = h.identity();
+    assert_eq!(list_ids(&m, 0), all);
+    assert!([m_p, m_q, m_r].contains(&m.medoids[0]));
+    assert_eq!(m.radius2[0], h.radius_about(&m.medoids[0], &all));
+    assert!(check_invariant(&m, 14));
+}
+
+#[test]
+fn a_cell_lists_the_left_sides_lists_then_the_right_sides() {
+    // the lists of small_lists_cell split over two sides: A and D on the
+    // left, B on the right, each side's rows renumbered densely
+    let (h, [m_a, m_b, d0]) = small_lists_cell();
+    let side = |lists: &[usize]| {
+        let specs: Vec<ListSpec> = lists
+            .iter()
+            .map(|&l| {
+                let members: Vec<TlshDigest> =
+                    h.ids[l].iter().map(|&i| h.digests[i as usize]).collect();
+                spec(h.ivf.medoids[l], h.ivf.radius2[l], &members)
+            })
+            .collect();
+        let s = HandCell::new(&specs);
+        let map: Vec<u32> = s
+            .digests
+            .iter()
+            .map(|d| h.digests.binary_search(d).unwrap() as u32)
+            .collect();
+        (s, map)
+    };
+    let (left, lmap) = side(&[0, 2]);
+    let (right, rmap) = side(&[1]);
+    let m = merge_tlsh_ivf(
+        Some((&left.ivf, &lmap[..])),
+        Some((&right.ivf, &rmap[..])),
+        &h.rows,
+        0,
+    )
+    .unwrap();
+    assert_eq!(m.medoids, [m_a, d0, m_b]);
+    assert_eq!(list_ids(&m, 0), h.ids[0]);
+    assert_eq!(list_ids(&m, 1), h.ids[2]);
+    assert_eq!(list_ids(&m, 2), h.ids[1]);
+    (&m).validate(&h.rows).unwrap();
+
+    // coalescing pairs the small lists across the sides
+    let m = merge_tlsh_ivf(
+        Some((&left.ivf, &lmap[..])),
+        Some((&right.ivf, &rmap[..])),
+        &h.rows,
+        DEFAULT_COALESCE,
+    )
+    .unwrap();
+    assert_eq!(m.medoids, [m_b, d0]);
+    assert_eq!(m.radius2, [11, 0]);
+    assert_eq!(list_ids(&m, 0), sorted_union(&h.ids[0], &h.ids[1]));
+}
+
 //
 // rejected inputs (merge_tlsh_ivf_remaps_and_drops)
 //
