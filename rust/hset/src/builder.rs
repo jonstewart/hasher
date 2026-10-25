@@ -14,6 +14,17 @@ use crate::tlsh::cells::{cell_index, cell_table};
 use crate::tlsh::ivf::{IvfBuildOptions, build_tlsh_ivf};
 use crate::tlsh::{CELL_HINT_TAG, DIGEST_LENGTH as TLSH_LENGTH, TlshDigest};
 
+/// `tlsh_options` bit: write the TIVF index (C `SFHASH_HSET_TLSH_INDEX`).
+pub const TLSH_OPTION_INDEX: u32 = 2;
+
+/// `tlsh_options` bit: a merge writes the index iff its inputs have one
+/// (C `SFHASH_HSET_TLSH_INHERIT`); ignored by [`BuildOptions::tlsh_options`].
+pub const TLSH_OPTION_INHERIT: u32 = 4;
+
+/// `tlsh_options` bit: build the index by float k-means (C
+/// `SFHASH_HSET_TLSH_INDEX_KMEANS`), which Rust does not support.
+pub const TLSH_OPTION_INDEX_KMEANS: u32 = 8;
+
 /// Options controlling how a file is written.
 #[derive(Debug, Clone, PartialEq)]
 pub struct BuildOptions {
@@ -31,9 +42,14 @@ pub struct BuildOptions {
     /// even with [`HintSpec::None`].
     pub hint: HintSpec,
     pub bits_policy: BitsPolicy,
-    /// Write the `TIVF` kNN index of every TLSH section (default true).
+    /// Write the `TIVF` kNN index of every TLSH section, built over the
+    /// section's rows by [`build_tlsh_ivf`] (default true, as the C++
+    /// builder's default `SFHASH_HSET_TLSH_INDEX`). The cell hint is
+    /// written either way. Other sections never get one.
     pub tlsh_index: bool,
-    /// How the `TIVF` index is built.
+    /// The BISECT build's options for the `TIVF` index (default
+    /// [`IvfBuildOptions::default`], C++'s: target list size 32, seed
+    /// `"query"`; the thread count never changes the bytes).
     pub tlsh_ivf: IvfBuildOptions,
 }
 
@@ -78,17 +94,46 @@ impl BuildOptions {
         self
     }
 
+    /// Set [`tlsh_index`](Self::tlsh_index).
     pub fn tlsh_index(mut self, yes: bool) -> Self {
         self.tlsh_index = yes;
         self
     }
 
+    /// Set [`tlsh_ivf`](Self::tlsh_ivf).
     pub fn tlsh_ivf(mut self, ivf: IvfBuildOptions) -> Self {
         self.tlsh_ivf = ivf;
         self
     }
 
-    pub fn tlsh_options(self, _bits: u32) -> Result<Self> {
+    /// Set [`tlsh_index`](Self::tlsh_index) from the C++ `tlsh_options`
+    /// bits (`SFHASH_HSET_TLSH_*`, `HSET_TLSH_OPTIONS` of `mkhashset`), as
+    /// the C++ builder reads them (`wants_tivf`):
+    ///
+    /// * `2` (`INDEX`): write the TIVF index; without it, none is written.
+    /// * `1` (once `VECTORS`, now reserved) is ignored.
+    /// * `4` (`INHERIT`) is ignored: it selects a merge's index policy
+    ///   ([`crate::merge`]) and means nothing to a builder, which the C++
+    ///   builder ignores too.
+    /// * `8` (`INDEX_KMEANS`) is an [`Error::Input`]: the float k-means
+    ///   build is not ported (controller ruling 4); C++ builds with it.
+    /// * any other bit is an [`Error::Input`] (C++ ignores them).
+    ///
+    /// [`tlsh_ivf`](Self::tlsh_ivf) is left as it is.
+    pub fn tlsh_options(mut self, bits: u32) -> Result<Self> {
+        const IGNORED: u32 = 1 | TLSH_OPTION_INHERIT;
+        if bits & TLSH_OPTION_INDEX_KMEANS != 0 {
+            return Err(Error::input(
+                "TLSH option 8 (INDEX_KMEANS, the k-means index build) is not supported",
+            ));
+        }
+        let unknown = bits & !(IGNORED | TLSH_OPTION_INDEX);
+        if unknown != 0 {
+            return Err(Error::input(format!(
+                "unknown TLSH option bits 0x{unknown:x} in {bits}"
+            )));
+        }
+        self.tlsh_index = bits & TLSH_OPTION_INDEX != 0;
         Ok(self)
     }
 }
@@ -283,6 +328,17 @@ impl Builder {
     }
 
     /// Produce the complete file image.
+    ///
+    /// Each TLSH section gets the `0x7400` cell hint and, with
+    /// [`BuildOptions::tlsh_index`], a `TIVF` index over its sorted rows
+    /// (duplicates included in a records file), written after its `HDAT`
+    /// and `RIDX`.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Input`] when neither records nor hash sets are to be
+    /// written, or the index cannot be built with
+    /// [`BuildOptions::tlsh_ivf`] (a target list size of 0).
     pub fn build(&self, opts: &BuildOptions) -> Result<Vec<u8>> {
         if !opts.with_records && !opts.with_hashsets {
             return Err(Error::input(

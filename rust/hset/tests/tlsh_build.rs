@@ -7,8 +7,8 @@
 //! hashsets-only files, and the `0x7400` cell hint on every TLSH section.
 
 use hset::builder::{format_value, parse_value, write_value};
-use hset::format::{FieldDescriptor, Hint, decode};
-use hset::tlsh::{IvfIndex, TivfView, TlshDigest};
+use hset::format::{FieldDescriptor, Hint, HsetFile, Section, chunk, decode};
+use hset::tlsh::{IvfBuildOptions, IvfIndex, TivfView, TlshDigest, build_tlsh_ivf};
 use hset::{BuildOptions, Builder, Error, HashType, HintSpec};
 use hset_testkit::tlsh::{VEC_HEX, example_digests, example_text, fake_md5, naive_cell_index};
 use sha2::{Digest, Sha256};
@@ -463,4 +463,88 @@ fn duplicate_tlsh_rows_list_their_records_in_descending_order() {
     let md5_of = |r: u64| hset::hex::encode(&f.record(r as usize).unwrap()[1..17]);
     assert_eq!(md5_of(82), fake_md5(82));
     assert_eq!(md5_of(7), fake_md5(7));
+}
+
+/// The TLSH section of a decoded file.
+fn tlsh_section<'f, 'a>(f: &'f HsetFile<'a>) -> &'f Section<'a> {
+    &f.sections[f.section_for(HashType::Tlsh).unwrap()]
+}
+
+/// `HSET_TLSH_OPTIONS` as the C++ builder reads it (test_hset_tlsh_vectors.cpp
+/// hset_tlsh_options): bit 2 writes the index, bit 1 is reserved and
+/// ignored, and bit 4 (INHERIT) means something to merges only, so a
+/// builder ignores it as C++ `wants_tivf` does.
+#[test]
+fn tlsh_options_bit_2_selects_the_index_and_bits_1_and_4_are_ignored() {
+    for start in [true, false] {
+        for bits in 0..8u32 {
+            let o = opts().tlsh_index(start).tlsh_options(bits).unwrap();
+            assert_eq!(o.tlsh_index, bits & 2 != 0, "{bits}");
+            assert_eq!(o, opts().tlsh_index(bits & 2 != 0), "{bits}");
+        }
+    }
+}
+
+#[test]
+fn tlsh_options_kmeans_and_unknown_bits_are_input_errors() {
+    for bits in [8, 10, 15, 16, 18, 1 << 31, u32::MAX] {
+        let e = opts().tlsh_options(bits).unwrap_err();
+        assert!(matches!(e, Error::Input(_)), "{bits}: {e}");
+        if bits & 8 != 0 {
+            assert!(e.to_string().contains("KMEANS"), "{bits}: {e}");
+            assert!(e.to_string().contains("not supported"), "{bits}: {e}");
+        }
+    }
+}
+
+/// hset_tlsh_options_bit_1_is_ignored: options 3 write what 2 writes, and
+/// 0 and 1 write the same file, without a TIVF but with the cell hint.
+#[test]
+fn bit_1_changes_nothing_and_without_bit_2_there_is_no_tivf() {
+    let mut b = Builder::new(&[HashType::Md5, HashType::Tlsh]).unwrap();
+    b.add_text(&example_text(false)).unwrap();
+    for records in [true, false] {
+        let build = |bits| {
+            b.build(&opts().records(records).tlsh_options(bits).unwrap())
+                .unwrap()
+        };
+        assert_eq!(build(3), build(2));
+        assert_eq!(build(1), build(0));
+        let without = build(0);
+        let f = decode(&without).unwrap();
+        let s = tlsh_section(&f);
+        assert_eq!(s.tivf, None);
+        assert!(matches!(s.hint, Some(Hint::TlshCells { .. })));
+        assert!(!f.toc.iter().any(|&(_, t)| t == chunk::TIVF));
+        let off = b.build(&opts().records(records).tlsh_index(false)).unwrap();
+        assert_eq!(off, without);
+    }
+}
+
+/// The index is built with `tlsh_ivf`: a smaller target list size gives
+/// more lists over the same rows, and a target of 0 is the BISECT build's
+/// input error.
+#[test]
+fn the_index_is_built_with_the_tlsh_ivf_options() {
+    let mut b = Builder::new(&[HashType::Md5, HashType::Tlsh]).unwrap();
+    b.add_text(&example_text(false)).unwrap();
+    let small = IvfBuildOptions {
+        target_list_size: 1,
+        ..IvfBuildOptions::default()
+    };
+    let bytes = b.build(&opts().tlsh_ivf(small)).unwrap();
+    let f = decode(&bytes).unwrap();
+    let s = tlsh_section(&f);
+    let want = build_tlsh_ivf(s.data.as_chunks::<36>().0, &small).unwrap();
+    assert!(want.lists() > 76, "{}", want.lists());
+    assert_eq!(s.tivf, Some(&want.to_bytes()[..]));
+
+    let zero = IvfBuildOptions {
+        target_list_size: 0,
+        ..IvfBuildOptions::default()
+    };
+    let e = b.build(&opts().tlsh_ivf(zero)).unwrap_err();
+    assert!(matches!(e, Error::Input(_)), "{e}");
+    // Without the index the index options are not used.
+    assert!(b.build(&opts().tlsh_ivf(zero).tlsh_index(false)).is_ok());
 }
