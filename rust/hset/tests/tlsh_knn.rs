@@ -6,6 +6,7 @@
 
 use hset::tlsh::TlshDigest;
 use hset::tlsh::knn::{TlshMatch, TopK, knn_brute};
+use hset::tlsh::order::HeaderOrder;
 use hset_testkit::tlsh::{corpus, example_digests, naive_knn, ref_diff, sorted_rows};
 use proptest::prelude::*;
 
@@ -107,6 +108,111 @@ fn top_k_below_k_keeps_everything_within_the_bound_sorted() {
         top.into_sorted(),
         vec![m(0, 8), m(7, 9), m(30, 2), m(30, 4)]
     );
+}
+
+fn header(l: u8, q1: u8, q2: u8) -> TlshDigest {
+    TlshDigest::from_parts(l, q1, q2, 1, &[0; 128])
+}
+
+#[test]
+fn header_order_lists_hand_computed_neighbours_first() {
+    let o = HeaderOrder::new(&header(77, 3, 9), true);
+    // L, L+1, L-1, L+2, L-2, ... at l_cost 0, 1, 1, 24, 24, 36
+    assert_eq!(o.l()[..6], [77, 78, 76, 79, 75, 80]);
+    assert_eq!(o.l_cost()[..6], [0, 1, 1, 24, 24, 36]);
+    // ..., L-127 (= 206) at 12 * 127, and L+128 (= 205) once, last
+    assert_eq!((o.l()[254], o.l_cost()[254]), (206, 1524));
+    assert_eq!((o.l()[255], o.l_cost()[255]), (205, 1536));
+
+    // (k1, k2) pairs by cost, stable in k1-major order: (0,0) 0; (0,1),
+    // (1,0) 1; (1,1) 2; (0,2), (2,0) 12; (1,2), (2,1) 13. Each expands to
+    // (q1+k1, q2+k2), (q1+k1, q2-k2), (q1-k1, q2+k2), (q1-k1, q2-k2),
+    // dropping repeats when k is 0.
+    assert_eq!(
+        o.q()[..17],
+        [
+            0x39, // (0,0)
+            0x3A, 0x38, // (0,1)
+            0x49, 0x29, // (1,0)
+            0x4A, 0x48, 0x2A, 0x28, // (1,1)
+            0x3B, 0x37, // (0,2)
+            0x59, 0x19, // (2,0)
+            0x4B, 0x47, 0x2B, 0x27, // (1,2)
+        ]
+    );
+    assert_eq!(
+        o.q_cost()[..17],
+        [0, 1, 1, 1, 1, 2, 2, 2, 2, 12, 12, 12, 12, 13, 13, 13, 13]
+    );
+
+    // without the length every L costs 0 and the order is 0..=255
+    let x = HeaderOrder::new(&header(77, 3, 9), false);
+    assert!(x.l().iter().enumerate().all(|(i, &l)| usize::from(l) == i));
+    assert!(x.l_cost().iter().all(|&c| c == 0));
+    assert_eq!(x.q(), o.q());
+}
+
+#[test]
+fn header_order_is_a_cost_sorted_permutation() {
+    // test_tlsh_header_order.cpp, plus wrap-around corners
+    for (l, q1, q2) in [
+        (0, 0, 0),
+        (255, 15, 15),
+        (77, 3, 9),
+        (128, 8, 8),
+        (1, 15, 0),
+    ] {
+        let q = header(l, q1, q2);
+        for incl in [true, false] {
+            let o = HeaderOrder::new(&q, incl);
+            let mut ls = o.l().to_vec();
+            ls.sort_unstable();
+            ls.dedup();
+            assert_eq!(ls.len(), 256);
+            let mut qs = o.q().to_vec();
+            qs.sort_unstable();
+            qs.dedup();
+            assert_eq!(qs.len(), 256);
+            for i in 0..256 {
+                let lc = if incl {
+                    ref_l_cost(circ(o.l()[i], l, 256))
+                } else {
+                    0
+                };
+                assert_eq!(o.l_cost()[i], lc, "{l} {q1} {q2} {incl} l[{i}]");
+                let qc = ref_q_cost(circ(o.q()[i] >> 4, q1, 16))
+                    + ref_q_cost(circ(o.q()[i] & 0x0F, q2, 16));
+                assert_eq!(o.q_cost()[i], qc, "{l} {q1} {q2} {incl} q[{i}]");
+                if i > 0 {
+                    assert!(o.l_cost()[i - 1] <= o.l_cost()[i]);
+                    assert!(o.q_cost()[i - 1] <= o.q_cost()[i]);
+                }
+            }
+            if incl {
+                assert_eq!(o.l()[0], l);
+            }
+            assert_eq!(o.q()[0], (q1 << 4) | q2);
+        }
+    }
+}
+
+// Reference costs written from the TLSH rules, not the crate's tables.
+
+fn circ(x: u8, y: u8, r: u32) -> u32 {
+    let d = u32::from(x.abs_diff(y));
+    d.min(r - d)
+}
+
+fn ref_l_cost(k: u32) -> u32 {
+    match k {
+        0 => 0,
+        1 => 1,
+        _ => 12 * k,
+    }
+}
+
+fn ref_q_cost(k: u32) -> u32 {
+    if k <= 1 { k } else { 12 * (k - 1) }
 }
 
 #[test]
