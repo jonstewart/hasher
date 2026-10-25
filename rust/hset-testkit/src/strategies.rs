@@ -6,6 +6,7 @@
 
 use hset::lookup::{BatchMode, BitsPolicy, HintSpec, SearchConfig, SingleMode};
 use hset::synth::{SplitMix64, adversarial_hashes, sort_unique_rows};
+use hset::tlsh::ivf::{DEFAULT_COALESCE, TARGET_LIST_SIZE};
 use hset::{HashType, SetOp, TlshIndexPolicy};
 use proptest::collection::vec;
 use proptest::prelude::*;
@@ -13,6 +14,7 @@ use proptest::sample::select;
 
 use crate::corrupt::{ChunkEdit, Corruption};
 use crate::doc::{Doc, Field, Opts, STORABLE_TYPES};
+use crate::tlsh::{DOC_FAMILIES, DOC_VALUE_KINDS, doc_value};
 
 /// Hash lengths the lookup engine supports.
 pub const SUPPORTED_LENGTHS: [usize; 8] = [4, 8, 16, 20, 28, 32, 48, 64];
@@ -43,6 +45,10 @@ pub(crate) const TLSH_MERGE_POLICIES: [TlshIndexPolicy; 3] = [
     TlshIndexPolicy::Write,
     TlshIndexPolicy::Omit,
 ];
+/// `TIVF` clustering targets, the default first.
+pub(crate) const TLSH_LIST_SIZES: [usize; 3] = [TARGET_LIST_SIZE, 8, 3];
+/// Merge coalescing thresholds, the default first.
+pub(crate) const TLSH_COALESCE: [u32; 3] = [DEFAULT_COALESCE, 0, 6];
 /// Bytes that make dense shared prefixes.
 pub(crate) const DENSE_BYTES: [u8; 3] = [0x00, 0x80, 0xFF];
 
@@ -216,9 +222,14 @@ pub fn fields(max_fields: usize) -> BoxedStrategy<Vec<Field>> {
 }
 
 /// A value of `htype`: digests uniform or from a three-byte alphabet; sizes
-/// any `u64` LE; entropies any finite `f64` LE (so text round-trips).
+/// any `u64` LE; entropies any finite `f64` LE (so text round-trips); TLSH
+/// digests canonical, never null, random or from a few near-digest
+/// families ([`doc_value`]).
 pub fn value(htype: HashType) -> BoxedStrategy<Vec<u8>> {
     match htype {
+        HashType::Tlsh => (0..DOC_VALUE_KINDS, 0..DOC_FAMILIES, any::<u64>())
+            .prop_map(|(kind, family, variant)| doc_value(kind, family, variant).0.to_vec())
+            .boxed(),
         HashType::Size => any::<u64>().prop_map(|v| v.to_le_bytes().to_vec()).boxed(),
         HashType::Entropy => any::<f64>()
             .prop_filter("finite", |v| v.is_finite())
@@ -258,7 +269,9 @@ fn bits_policies() -> BoxedStrategy<BitsPolicy> {
 }
 
 /// Build options; never both records and hash sets off. A TLSH index
-/// three times in four; any merge index policy.
+/// three times in four; any merge index policy, clustering target (the
+/// default or small, so that cells of a few rows have several lists) and
+/// coalescing threshold (the default, none, or small).
 pub fn opts() -> BoxedStrategy<Opts> {
     (
         "[ -~]{0,32}",
@@ -273,6 +286,8 @@ pub fn opts() -> BoxedStrategy<Opts> {
         bits_policies(),
         prop::bool::weighted(0.75),
         select(TLSH_MERGE_POLICIES.to_vec()),
+        select(TLSH_LIST_SIZES.to_vec()),
+        select(TLSH_COALESCE.to_vec()),
     )
         .prop_map(
             |(
@@ -284,6 +299,8 @@ pub fn opts() -> BoxedStrategy<Opts> {
                 bits_policy,
                 tlsh_index,
                 tlsh_merge,
+                tlsh_list_size,
+                tlsh_coalesce,
             )| Opts {
                 name,
                 desc,
@@ -294,6 +311,8 @@ pub fn opts() -> BoxedStrategy<Opts> {
                 bits_policy,
                 tlsh_index,
                 tlsh_merge,
+                tlsh_list_size,
+                tlsh_coalesce,
             },
         )
         .boxed()
@@ -372,7 +391,8 @@ pub fn doc_pair_mismatched() -> BoxedStrategy<(Doc, Doc)> {
 }
 
 /// A document `hset make` can express: canonical names, records and hash
-/// sets, and the default bits policy apart from the budget.
+/// sets, the default bits policy apart from the budget, and the default
+/// `TIVF` build (with or without the index).
 ///
 /// A single-field document's all-absent record has no text rendering:
 /// `Doc::to_text()` writes its one empty column as a blank line, and a
@@ -393,6 +413,7 @@ pub fn cli_doc() -> BoxedStrategy<Doc> {
                 budget: d.opts.bits_policy.budget,
                 ..BitsPolicy::default()
             };
+            d.opts.tlsh_list_size = TARGET_LIST_SIZE;
             if d.fields.len() == 1 {
                 d.records.retain(|r| r[0].is_some());
             }
@@ -575,5 +596,39 @@ mod tests {
             let bytes: [u8; 8] = v.as_slice().try_into().unwrap();
             prop_assert!(f64::from_le_bytes(bytes).is_finite());
         }
+
+        #[test]
+        fn tlsh_values_are_canonical_and_never_null(v in value(HashType::Tlsh)) {
+            let d = hset::tlsh::TlshDigest::from_bytes(v.as_slice().try_into().unwrap());
+            prop_assert!(d.is_ok_and(|d| !d.is_null()), "{v:02x?}");
+        }
+    }
+
+    /// TLSH sections of generated documents are not all one row per cell:
+    /// some cell holds several distinct rows, and some row repeats.
+    #[test]
+    fn tlsh_values_share_cells_and_repeat() {
+        let mut runner = TestRunner::deterministic();
+        let s = vec(value(HashType::Tlsh), 32);
+        let (mut shared_cells, mut repeats) = (0, 0);
+        for _ in 0..20 {
+            let mut rows = s.new_tree(&mut runner).unwrap().current();
+            rows.sort();
+            let distinct = {
+                let mut d = rows.clone();
+                d.dedup();
+                d
+            };
+            repeats += usize::from(distinct.len() < rows.len());
+            let mut cells: Vec<&[u8]> = distinct.iter().map(|r| &r[..2]).collect();
+            let n = cells.len();
+            cells.dedup();
+            shared_cells += usize::from(cells.len() < n);
+        }
+        assert!(
+            shared_cells >= 15,
+            "{shared_cells} of 20 samples share a cell"
+        );
+        assert!(repeats >= 10, "{repeats} of 20 samples repeat a row");
     }
 }

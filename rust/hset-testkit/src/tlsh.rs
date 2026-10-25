@@ -463,6 +463,44 @@ pub fn sorted_rows(digests: &[TlshDigest]) -> Vec<[u8; 36]> {
     rows
 }
 
+// ---------------------------------------------------------------------------
+// Values of generated documents
+// ---------------------------------------------------------------------------
+
+/// The kinds of [`doc_value`]: random, family base, three of near copies in
+/// the base's cell, near copies with header moves.
+pub const DOC_VALUE_KINDS: u8 = 6;
+/// The families [`doc_value`] draws from.
+pub const DOC_FAMILIES: u8 = 4;
+/// The seeds a near copy of [`doc_value`] takes, per family and kind.
+pub const DOC_VARIANTS: u64 = 8;
+
+/// A TLSH value for a generated document, canonical and never null: kind 0
+/// a random digest (seeded by `variant`); 1 the base of family
+/// `family % DOC_FAMILIES`; 2..=4 a near copy of that base in its cell
+/// (bucket moves only); 5 a near copy with header moves too, often in a
+/// neighbouring cell. A near copy is seeded by `variant % DOC_VARIANTS`, so
+/// equal draws are equal rows. With so few families and seeds the records
+/// of one document, and of a document pair, share cells and rows: cells
+/// hold several rows (and so several `TIVF` lists), and rows repeat.
+pub fn doc_value(kind: u8, family: u8, variant: u64) -> TlshDigest {
+    if kind == 0 {
+        return random_digest(&mut SplitMix64::new(variant));
+    }
+    let family = u64::from(family % DOC_FAMILIES);
+    let base = random_digest(&mut SplitMix64::new(DOC_FAMILY_SEED + family));
+    let (class, p) = match kind {
+        1 => return base,
+        2..=4 => (0, Perturbation::body_only(0.05)),
+        _ => (1, Perturbation::default()),
+    };
+    let seed = DOC_FAMILY_SEED ^ (family << 8) ^ (class << 16) ^ (variant % DOC_VARIANTS);
+    perturb(&mut SplitMix64::new(seed), &base, &p)
+}
+
+/// The seed space of [`doc_value`]'s families.
+const DOC_FAMILY_SEED: u64 = 0x7154_0000_0000;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -674,6 +712,53 @@ mod tests {
         assert_eq!(rows.len(), 41);
         assert!(rows.is_sorted());
         assert_eq!(rows.iter().filter(|r| **r == c[3].0).count(), 2);
+    }
+
+    #[test]
+    fn doc_values_are_canonical_share_family_cells_and_repeat() {
+        let mut cells = std::collections::BTreeSet::new();
+        for family in 0..DOC_FAMILIES {
+            let base = doc_value(1, family, 12345);
+            assert_eq!(
+                base,
+                doc_value(1, family + DOC_FAMILIES, 0),
+                "family modulo"
+            );
+            cells.insert(base.cell());
+            let mut distinct = std::collections::BTreeSet::new();
+            for variant in 0..2 * DOC_VARIANTS {
+                for kind in 0..DOC_VALUE_KINDS {
+                    let d = doc_value(kind, family, variant);
+                    assert!(!d.is_null());
+                    assert_eq!(d.0[35], 0, "reserved byte");
+                    if (2..=4).contains(&kind) {
+                        assert_eq!(d.cell(), base.cell(), "kind {kind} leaves the cell");
+                        assert_eq!(d, doc_value(2, family, variant + DOC_VARIANTS));
+                        distinct.insert(d);
+                    }
+                    if kind == 5 {
+                        assert_eq!(d, doc_value(5, family, variant + DOC_VARIANTS));
+                        assert!(ref_distance(&d, &base, true) < 80);
+                    }
+                }
+            }
+            assert!(
+                distinct.len() > 4,
+                "family {family}: {} near copies",
+                distinct.len()
+            );
+        }
+        assert_eq!(
+            cells.len(),
+            usize::from(DOC_FAMILIES),
+            "one cell per family"
+        );
+        assert_ne!(doc_value(0, 0, 1), doc_value(0, 0, 2));
+        assert_eq!(
+            doc_value(0, 0, 1),
+            doc_value(0, 3, 1),
+            "random ignores the family"
+        );
     }
 
     #[test]

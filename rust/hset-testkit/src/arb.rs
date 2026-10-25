@@ -11,8 +11,10 @@ use crate::corrupt::{ChunkEdit, Corruption};
 use crate::doc::{Doc, Field, Opts, STORABLE_TYPES};
 use crate::strategies::{
     BATCH_MODES, BUDGETS, DENSE_BYTES, LookupCase, SINGLE_MODES, SUPPORTED_LENGTHS, TIMESTAMPS,
-    TLSH_MERGE_POLICIES, UNSUPPORTED_LENGTH, queries, with_duplicates,
+    TLSH_COALESCE, TLSH_LIST_SIZES, TLSH_MERGE_POLICIES, UNSUPPORTED_LENGTH, queries,
+    with_duplicates,
 };
+use crate::tlsh::{DOC_FAMILIES, DOC_VALUE_KINDS, doc_value};
 
 /// Field-name characters of the ASCII class of `strategies::field`.
 const NAME_ASCII: &[u8] = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_ -";
@@ -41,6 +43,11 @@ fn field_name(u: &mut Unstructured<'_>, htype: HashType) -> Result<String> {
 
 fn value(u: &mut Unstructured<'_>, htype: HashType) -> Result<Vec<u8>> {
     Ok(match htype {
+        HashType::Tlsh => {
+            let kind = u.int_in_range(0..=DOC_VALUE_KINDS - 1)?;
+            let family = u.int_in_range(0..=DOC_FAMILIES - 1)?;
+            doc_value(kind, family, u64::arbitrary(u)?).0.to_vec()
+        }
         HashType::Size => u64::arbitrary(u)?.to_le_bytes().to_vec(),
         HashType::Entropy => {
             let v = f64::arbitrary(u)?;
@@ -98,6 +105,8 @@ fn opts(u: &mut Unstructured<'_>) -> Result<Opts> {
     let max_bits = u.int_in_range(min_bits..=12)?;
     let tlsh_index = u.ratio(3u8, 4)?;
     let tlsh_merge = *u.choose(&TLSH_MERGE_POLICIES)?;
+    let tlsh_list_size = *u.choose(&TLSH_LIST_SIZES)?;
+    let tlsh_coalesce = *u.choose(&TLSH_COALESCE)?;
     Ok(Opts {
         name,
         desc,
@@ -112,6 +121,8 @@ fn opts(u: &mut Unstructured<'_>) -> Result<Opts> {
         },
         tlsh_index,
         tlsh_merge,
+        tlsh_list_size,
+        tlsh_coalesce,
     })
 }
 
@@ -274,6 +285,10 @@ mod tests {
                 for (f, v) in d.fields.iter().zip(r) {
                     if let Some(v) = v {
                         assert_eq!(v.len(), f.length(), "seed {seed}");
+                        if f.htype == HashType::Tlsh {
+                            let d = hset::tlsh::TlshDigest::from_bytes(v[..].try_into().unwrap());
+                            assert!(d.is_ok_and(|d| !d.is_null()), "seed {seed}: {v:02x?}");
+                        }
                     }
                 }
             }

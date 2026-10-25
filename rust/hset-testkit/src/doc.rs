@@ -10,15 +10,17 @@ use hset::format::{FieldDescriptor, Hint, HsetFile, hint_tag_block, hint_tag_hul
 use hset::lookup::resolve_bits;
 use hset::merge::MergeOptions;
 use hset::tlsh::CELL_HINT_TAG;
+use hset::tlsh::ivf::{DEFAULT_COALESCE, IvfBuildOptions, TARGET_LIST_SIZE};
 use hset::{BitsPolicy, BuildOptions, Builder, HashType, HintSpec, SetOp, TlshIndexPolicy};
 
 use crate::oracle::set_op_model;
 use crate::tlsh::naive_cell_index;
 
-/// Every type that can be stored in a hash set: `HashType::ALL` minus `Fuzzy`,
-/// and minus `Tlsh`, whose values must be canonical TLSH digests and whose
-/// sections carry a cell index rather than a block or hull hint.
-pub const STORABLE_TYPES: [HashType; 14] = [
+/// Every type that can be stored in a hash set: `HashType::ALL` minus `Fuzzy`.
+/// A `Tlsh` value must be a canonical digest (reserved byte zero; the null
+/// digest is stored absent, so documents hold none), and a TLSH section
+/// carries the cell index whatever the hint options say.
+pub const STORABLE_TYPES: [HashType; 15] = [
     HashType::Md5,
     HashType::Sha1,
     HashType::Sha2_224,
@@ -33,6 +35,7 @@ pub const STORABLE_TYPES: [HashType; 14] = [
     HashType::Entropy,
     HashType::Size,
     HashType::QuickMd5,
+    HashType::Tlsh,
 ];
 
 /// One field of a document's records.
@@ -80,6 +83,12 @@ pub struct Opts {
     /// As a set operation's output options: the merge's TLSH index policy
     /// ([`MergeOptions::tlsh_index`]).
     pub tlsh_merge: TlshIndexPolicy,
+    /// The clustering target of a `TIVF` build, by the builder or by a
+    /// merge that rebuilds ([`IvfBuildOptions::target_list_size`]).
+    pub tlsh_list_size: usize,
+    /// As a set operation's output options: the coalescing threshold of a
+    /// merged index ([`MergeOptions::coalesce_threshold`]).
+    pub tlsh_coalesce: u32,
 }
 
 impl Opts {
@@ -96,6 +105,8 @@ impl Opts {
             bits_policy: BitsPolicy::default(),
             tlsh_index: true,
             tlsh_merge: TlshIndexPolicy::default(),
+            tlsh_list_size: TARGET_LIST_SIZE,
+            tlsh_coalesce: DEFAULT_COALESCE,
         }
     }
 
@@ -107,6 +118,16 @@ impl Opts {
             .hint(self.hint)
             .bits_policy(self.bits_policy)
             .tlsh_index(self.tlsh_index)
+            .tlsh_ivf(self.ivf_build())
+    }
+
+    /// The `TIVF` build of these options: the default with
+    /// `tlsh_list_size` as the target.
+    pub fn ivf_build(&self) -> IvfBuildOptions {
+        IvfBuildOptions {
+            target_list_size: self.tlsh_list_size,
+            ..IvfBuildOptions::default()
+        }
     }
 }
 
@@ -309,7 +330,8 @@ pub const REFUSE_NOTHING_TO_WRITE: &str = "neither records nor hash sections are
 impl Opts {
     /// The merge options of an output built with these options: the same
     /// metadata, hint and bits policy, `with_records` and `with_hashsets`
-    /// as the write flags, and `tlsh_merge` as the TLSH index policy.
+    /// as the write flags, and the TLSH index policy, coalescing threshold
+    /// and rebuild of `tlsh_merge`, `tlsh_coalesce` and `tlsh_list_size`.
     pub fn merge_options(&self) -> MergeOptions {
         let mut o = MergeOptions::new(self.name.clone(), self.desc.clone());
         o.timestamp = Some(self.timestamp.clone());
@@ -318,6 +340,8 @@ impl Opts {
         o.hint = self.hint;
         o.bits_policy = self.bits_policy;
         o.tlsh_index = self.tlsh_merge;
+        o.coalesce_threshold = self.tlsh_coalesce;
+        o.ivf_build = self.ivf_build();
         o
     }
 }

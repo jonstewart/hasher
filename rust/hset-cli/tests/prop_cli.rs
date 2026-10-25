@@ -16,6 +16,7 @@ use hset::synth::SplitMix64;
 use hset_testkit::doc::{Doc, Field, Opts};
 use hset_testkit::oracle::NaiveSet;
 use hset_testkit::strategies::cli_doc;
+use hset_testkit::tlsh::random_digest;
 use proptest::prelude::*;
 
 fn bin() -> Command {
@@ -127,8 +128,11 @@ fn render_record(fields: &[FieldDescriptor], row: &[u8]) -> String {
 /// A random value shaped like `htype`, drawn from `rng`. Entropy bits that
 /// decode to a non-finite float are coerced to `0.0` so the CLI's decimal
 /// text round-trip (`format_value`/`parse_value`) agrees with the oracle.
+///
+/// A TLSH value is a random canonical digest, which `hset query` can parse.
 fn random_value(htype: HashType, rng: &mut SplitMix64) -> Vec<u8> {
     match htype {
+        HashType::Tlsh => random_digest(rng).0.to_vec(),
         HashType::Size => rng.next_u64().to_le_bytes().to_vec(),
         HashType::Entropy => {
             let v = f64::from_bits(rng.next_u64());
