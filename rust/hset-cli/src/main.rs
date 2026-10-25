@@ -486,7 +486,11 @@ fn cmd_dump(a: DumpArgs) -> CliResult<()> {
         if a.r#type.is_none() && hs.section_count() > 1 {
             let _ = writeln!(o, "# {} ({} hashes)", s.header.name, s.len());
         }
-        if matches!(fd.htype, HashType::Size | HashType::Entropy) {
+        if matches!(
+            fd.htype,
+            HashType::Size | HashType::Entropy | HashType::Tlsh
+        ) {
+            // Values with a text form of their own (TLSH: `T1` hex).
             for j in 0..s.len() {
                 let _ = builder::write_value(&fd, s.hash(j), &mut o);
                 let _ = o.write_all(b"\n");

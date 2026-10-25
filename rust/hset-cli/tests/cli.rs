@@ -3,6 +3,8 @@
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
+use hset::tlsh::TlshDigest;
+
 fn bin() -> Command {
     Command::new(env!("CARGO_BIN_EXE_hset"))
 }
@@ -487,4 +489,65 @@ fn bench_single_only_times_single_lookups() {
     ]);
     assert!(o.status.success(), "{}", stderr(&o));
     assert!(stdout(&o).contains("hits 1000/1000"), "{}", stdout(&o));
+}
+
+// ---------------------------------------------------------------------------
+// TLSH
+// ---------------------------------------------------------------------------
+
+/// `make -t md5,tlsh` over `example_text(false)` (83 records, 81 TLSH rows,
+/// 80 distinct digests), with `extra` arguments and `env` variables; any
+/// inherited `HSET_TLSH_OPTIONS` is removed first.
+fn make_tlsh(out: &Path, extra: &[&str], env: &[(&str, &str)]) -> Output {
+    use std::io::Write;
+    use std::process::Stdio;
+    let mut args = vec!["make", "-t", "md5,tlsh", "-o", p(out)];
+    args.extend_from_slice(extra);
+    let mut cmd = bin();
+    cmd.args(&args)
+        .env_remove("HSET_TLSH_OPTIONS")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    for (k, v) in env {
+        cmd.env(k, v);
+    }
+    let mut child = cmd.spawn().unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(hset_testkit::tlsh::example_text(false).as_bytes())
+        .unwrap();
+    child.wait_with_output().unwrap()
+}
+
+/// [`make_tlsh`] that must succeed.
+fn made_tlsh(out: &Path, extra: &[&str]) {
+    let o = make_tlsh(out, extra, &[]);
+    assert!(o.status.success(), "{}", stderr(&o));
+}
+
+/// The 80 distinct example digests in canonical (row) order, as T1 hex.
+fn sorted_example_digests() -> Vec<String> {
+    let mut d: Vec<TlshDigest> = hset_testkit::tlsh::example_digests()
+        .iter()
+        .map(|h| TlshDigest::from_hex(h).unwrap())
+        .collect();
+    d.sort();
+    d.iter().map(TlshDigest::to_hex).collect()
+}
+
+#[test]
+fn dump_prints_tlsh_rows_as_t1_hex() {
+    let dir = tmpdir("tlsh-dump");
+    let f = dir.join("t.hset");
+    made_tlsh(&f, &["--no-records"]);
+    let o = run(&["dump", p(&f), "-t", "tlsh"]);
+    assert!(o.status.success(), "{}", stderr(&o));
+    let want: String = sorted_example_digests()
+        .iter()
+        .map(|h| format!("{h}\n"))
+        .collect();
+    assert_eq!(stdout(&o), want);
 }
