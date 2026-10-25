@@ -20,3 +20,13 @@ block8="b\x08"
 block1="b\x01"
 version2="\x02\x00\x00\x00\x00\x00\x00\x00"
 len0="\x00\x00\x00\x00\x00\x00\x00\x00"
+# TLSH: the hash header (type 2^15), the 0x7400 cell-index hint, the TIVF
+# index and the rejected TVEC chunk, the TIVF header's version, flags and
+# dims, and the digest's hex prefixes.
+hh_tlsh="HH\x00\x0f"
+tivf="TIVF"
+tvec="TVEC"
+hint_tlsh="t\x00"
+tivf_head="\x03\x00\x00\x00\x00\x01\x00\x00"
+tlsh_t1="T1"
+tlsh_null="TNULL"

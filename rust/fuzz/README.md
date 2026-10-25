@@ -13,6 +13,7 @@ outside the workspace (`exclude = ["fuzz"]`), so it builds into
 | `set_ops` | `(Doc, Doc, u8)` | `check_set_op` with the op chosen by `u8 % 3` |
 | `hex` | raw bytes | `check_hex`, then `check_hex_rows` with width and separator taken from the first bytes |
 | `text_input` | `&str` | `check_text_input`: `Builder::add_text` accepts exactly what the line oracle does |
+| `tlsh_hex` | raw bytes | `TlshDigest::from_hex` accepts exactly `TNULL` and 70 hex digits (optional `T1`) and round-trips through `to_hex`; `from_bytes` enforces the reserved byte; `diff` is symmetric, `Some` iff neither digest is null and equals the kit's `ref_diff` |
 
 ## Two corpora
 
