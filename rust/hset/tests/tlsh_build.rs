@@ -293,6 +293,134 @@ fn md5_tlsh_payloads_equal_the_cpp_encoders() {
     );
 }
 
+/// tlsh_md5.hset, the same text with the TLSH column first: the same
+/// sections, records laid out TLSH first (RDAT and RIDX SHAs from the C++
+/// fixture; the plan lists their prefixes 0a3d7b47 and 047ed8f9).
+#[test]
+fn tlsh_md5_payloads_equal_the_cpp_encoders() {
+    let got = payload_shas(&build_example(true, true));
+    assert_eq!(got.records, 83);
+    assert_eq!(
+        got.rdat,
+        some("0a3d7b4710b199c256f5953a6cdfa12d25c13961d5f40e310a9853af7dbfe7ee")
+    );
+    assert_eq!(
+        got.tlsh,
+        SectionShas {
+            rows: 81,
+            hdat: TLSH_HDAT.into(),
+            hint: some(TLSH_HINT),
+            ridx: some("047ed8f99a69dd4e7e6dd0a9b59fe6958a52379bc2bf281f77b1dc318fe38498"),
+        }
+    );
+    assert_eq!(
+        got.md5,
+        SectionShas {
+            rows: 83,
+            hdat: MD5_HDAT.into(),
+            hint: some(MD5_LEGACY_HINT),
+            ridx: some("3a2c8daacc6449a3ac403ed5e69f8a6a33792edd242c5762b88d20f59f93e8ef"),
+        }
+    );
+}
+
+/// md5_tlsh_ho.hset: hashsets only, so the 81 TLSH values dedup to 80
+/// rows and nothing has a RIDX.
+#[test]
+fn md5_tlsh_hashsets_only_payloads_equal_the_cpp_encoders() {
+    let got = payload_shas(&build_example(false, false));
+    assert_eq!(got.records, 0);
+    assert_eq!(got.rdat, None);
+    assert_eq!(
+        got.tlsh,
+        SectionShas {
+            rows: 80,
+            hdat: "dfd6efe8bb7bc40136077922ea3cfa77c7e46a2bcc9886c5ccb1fb83a3cb980b".into(),
+            hint: some("1c91d0c2f3f28dd89e301a02da13adfd903a57cdc7d8702ba2ff729d158d8258"),
+            ridx: None,
+        }
+    );
+    assert_eq!(
+        got.md5,
+        SectionShas {
+            rows: 83,
+            hdat: MD5_HDAT.into(),
+            hint: some(MD5_LEGACY_HINT),
+            ridx: None,
+        }
+    );
+}
+
+/// Without the legacy hint the md5 section gets the Rust default hint, and
+/// everything else is unchanged.
+#[test]
+fn only_the_md5_hint_depends_on_the_hint_spec() {
+    let mut b = Builder::new(&[HashType::Md5, HashType::Tlsh]).unwrap();
+    b.add_text(&example_text(false)).unwrap();
+    let got = payload_shas(&b.build(&opts()).unwrap());
+    let legacy = payload_shas(&build_example(false, true));
+    assert_eq!(got.tlsh, legacy.tlsh);
+    assert_eq!(got.rdat, legacy.rdat);
+    assert_eq!(got.md5.hdat, legacy.md5.hdat);
+    assert_eq!(got.md5.ridx, legacy.md5.ridx);
+    assert_ne!(got.md5.hint, legacy.md5.hint);
+}
+
+/// The C++ files themselves, when `make check` has written them: every
+/// payload but the TIVF (built in a later step) is the C++ encoder's.
+#[test]
+fn payloads_equal_the_cpp_fixtures_when_present() {
+    for (name, tlsh_first, with_records) in [
+        ("md5_tlsh.hset", false, true),
+        ("tlsh_md5.hset", true, true),
+        ("md5_tlsh_ho.hset", false, false),
+    ] {
+        let path = hset_testkit::fixtures::fixtures_dir().join(name);
+        let Ok(theirs) = std::fs::read(&path) else {
+            eprintln!(
+                "SKIP: {} is absent (run the C++ make check)",
+                path.display()
+            );
+            continue;
+        };
+        let ours = build_example(tlsh_first, with_records);
+        let (a, b) = (decode(&ours).unwrap(), decode(&theirs).unwrap());
+        assert_eq!(a.fhdr.name, b.fhdr.name, "{name}");
+        assert_eq!(a.fhdr.desc, b.fhdr.desc, "{name}");
+        assert_eq!(a.rhdr, b.rhdr, "{name}");
+        assert_eq!(a.rdat, b.rdat, "{name}");
+        assert_eq!(a.sections.len(), b.sections.len(), "{name}");
+        for (x, y) in a.sections.iter().zip(&b.sections) {
+            assert_eq!(x.header, y.header, "{name}");
+            assert_eq!(x.data, y.data, "{name} {}", x.header.name);
+            assert_eq!(x.hint, y.hint, "{name} {}", x.header.name);
+            assert_eq!(x.ridx, y.ridx, "{name} {}", x.header.name);
+        }
+    }
+}
+
+#[test]
+fn a_line_with_a_bad_tlsh_column_is_an_input_error() {
+    // test_hset_tlsh.cpp hset_tlsh_bad_digest_throws
+    let mut b = Builder::new(&[HashType::Md5, HashType::Tlsh]).unwrap();
+    let md5 = fake_md5(0);
+    for line in [
+        format!("{md5} T1notatlsh"),
+        format!("{md5} {VEC_HEX}junk"),
+        format!("{md5} {VEC_HEX} junk"),
+        format!("{md5} TNULL "),
+    ] {
+        let e = b.add_text_line(&line).unwrap_err();
+        assert!(matches!(e, Error::Input(_)), "{line:?}: {e}");
+    }
+    let e = b.add_text(&format!("{md5} {VEC_HEX}\n{md5} T1notatlsh\n"));
+    assert!(
+        matches!(e, Err(Error::Input(ref m)) if m.starts_with("line 2")),
+        "{e:?}"
+    );
+    assert_eq!(b.record_count(), 1);
+}
+
 /// The duplicated digest 7 is two rows, one per record, the later record
 /// first (the plan's rows 57 and 58, records 82 and 7: md5s are distinct
 /// and sort the records, and fake_md5(82) sorts last of the 83).
