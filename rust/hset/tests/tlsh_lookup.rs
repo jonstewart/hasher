@@ -6,11 +6,13 @@
 //! `naive_cell_index`, written out little endian here, not from
 //! `hset::tlsh::cells`.
 
-use hset::Error;
 use hset::format::Hint;
 use hset::lookup::{Lookup, hint_from_parts, make_lookup};
+use hset::{Error, HashType, Hashset};
 use hset_testkit::oracle::NaiveSet;
 use hset_testkit::tlsh::{corpus, naive_cell_index, sorted_rows};
+use proptest::collection::vec;
+use proptest::prelude::*;
 
 /// The `0x7400` table of sorted `rows`: 65,537 little-endian `u64`s.
 fn table_of(rows: &[[u8; 36]]) -> Vec<u8> {
@@ -311,5 +313,109 @@ fn hint_from_parts_maps_0x7400_to_the_cell_index() {
             "{tag:#06x}: {}",
             h.describe()
         );
+    }
+}
+
+/// md5_tlsh.hset, written by the C++ test_hset_tlsh suite: its TLSH
+/// section carries a 0x7400 cell index, so `Hashset` looks it up through
+/// the cell strategy, and every row (first of its run), its run and its
+/// near misses come out as the linear scan says.
+#[test]
+fn the_cpp_tlsh_fixture_is_searched_through_its_cell_index() {
+    let path = hset_testkit::fixtures::fixtures_dir().join("md5_tlsh.hset");
+    if !path.exists() {
+        eprintln!(
+            "SKIP: {} is absent (run the C++ make check)",
+            path.display()
+        );
+        return;
+    }
+    let bytes = std::fs::read(&path).unwrap();
+    let hs = Hashset::load(&bytes).unwrap();
+    let t = hs.index_for_type(HashType::Tlsh).unwrap();
+    let lk = hs.lookup(t);
+    assert!(
+        lk.describe().starts_with("tlsh cell index"),
+        "{}",
+        lk.describe()
+    );
+    let s = hs.section(t);
+    assert_eq!(s.len(), 81);
+    let naive = NaiveSet::from_bytes(s.data, 36);
+    let rows = s.data.as_chunks::<36>().0;
+    for (i, r) in rows.iter().enumerate() {
+        assert!(hs.contains(t, r), "row {i}");
+        assert!(hs.equal_range(t, r).contains(&i), "row {i}");
+        agrees_with_naive(lk, &naive, r);
+        for q in perturbations(r) {
+            agrees_with_naive(lk, &naive, &q);
+        }
+    }
+    let mut out = vec![false; rows.len()];
+    hs.contains_batch(t, s.data, &mut out);
+    assert!(out.iter().all(|&b| b));
+    let report = hs.verify();
+    assert!(report.is_ok(), "{:?}", report.problems);
+}
+
+/// Sorted rows whose (L, Q) come from a few values and whose bodies from
+/// a few bytes, so cells repeat, neighbouring cells are both empty and
+/// full, and equal rows (duplicates) are common.
+fn prop_rows() -> impl Strategy<Value = Vec<[u8; 36]>> {
+    vec(row_strategy(), 0..=80).prop_map(|mut rows| {
+        rows.sort_unstable();
+        rows
+    })
+}
+
+fn row_strategy() -> impl Strategy<Value = [u8; 36]> {
+    (
+        prop::sample::select(vec![0u8, 1, 0x80, 0xff]),
+        prop::sample::select(vec![0u8, 0x10, 0xff]),
+        prop::sample::select(vec![0u8, 1, 0x80]),
+        prop::sample::select(vec![0u8, 0x40]),
+        prop::sample::select(vec![0u8, 1, 0xff]),
+    )
+        .prop_map(|(l, q, hi, lo, checksum)| {
+            let mut r = [0u8; 36];
+            r[0] = l;
+            r[1] = q;
+            r[2] = hi;
+            r[18] = lo;
+            r[34] = checksum;
+            r
+        })
+}
+
+proptest! {
+    // Each case counts, encodes, parses and copies a 65,537-entry table
+    // (about 70 ms in a debug build); 32 cases keep the run near 2 s.
+    #![proptest_config(ProptestConfig::with_cases(32))]
+
+    /// For any sorted rows (duplicates allowed) and queries from the same
+    /// small alphabet, every method agrees with the linear scan, the batch
+    /// with the singles, and each stored row lies in its window.
+    #[test]
+    fn cell_lookup_matches_the_linear_scan(
+        rows in prop_rows(),
+        extra in vec(row_strategy(), 0..40),
+    ) {
+        let data = flat(&rows);
+        let table = table_of(&rows);
+        let lk = cell_lookup(&data, &table);
+        let naive = NaiveSet::from_bytes(&data, 36);
+        let queries: Vec<[u8; 36]> = rows.iter().copied().chain(extra).collect();
+        for q in &queries {
+            prop_assert_eq!(lk.find(q), naive.find(q));
+            prop_assert_eq!(lk.contains(q), naive.contains(q));
+            prop_assert_eq!(lk.equal_range(q), naive.equal_range(q));
+        }
+        for (i, r) in rows.iter().enumerate() {
+            prop_assert!(lk.window(r).contains(&i));
+        }
+        let mut out = vec![false; queries.len()];
+        lk.contains_batch(&flat(&queries), &mut out);
+        let want: Vec<bool> = queries.iter().map(|q| naive.contains(q)).collect();
+        prop_assert_eq!(out, want);
     }
 }
