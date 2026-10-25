@@ -2,9 +2,11 @@
 //! (merge_rows_sets, merge_rows_records, the differing-fields record
 //! merges) plus proptests against `BTreeSet` / `BTreeMap` models.
 
-use hset::Error;
+use hset::format::{FieldDescriptor, RecordHeader};
+use hset::merge::merged_record_fields;
 use hset::merge::{DROPPED, RECORD_DROPPED, RowMerge, RowMode, RowOwners, merge_rows};
 use hset::ops::SetOp;
+use hset::{Error, HashType};
 
 const D: u32 = DROPPED;
 
@@ -199,4 +201,78 @@ fn merge_rows_rejects_owners_that_disagree_with_the_rows() {
     let e = merge_rows(&[], &R2, 2, mode(none, ro)).unwrap_err();
     assert!(matches!(e, Error::Format(_)), "{e}");
     assert!(e.to_string().contains("right row 1 names record 2"), "{e}");
+}
+
+fn field(htype: HashType, name: &str, length: u64) -> FieldDescriptor {
+    FieldDescriptor {
+        htype,
+        name: name.to_string(),
+        length,
+    }
+}
+
+fn canonical(t: HashType) -> FieldDescriptor {
+    FieldDescriptor::for_type(t).unwrap()
+}
+
+fn header(fields: Vec<FieldDescriptor>, count: u64) -> RecordHeader {
+    RecordHeader {
+        record_length: fields.iter().map(FieldDescriptor::stride).sum::<usize>() as u64,
+        record_count: count,
+        fields,
+    }
+}
+
+#[test]
+fn merged_fields_are_the_left_fields_then_the_right_extras() {
+    // test_hset_merge.cpp hset_merge_records_differing_fields, with SIZE in
+    // TLSH's place: md5 + size against sha1 + size gives md5, size, sha1
+    let l = header(
+        vec![
+            canonical(HashType::Md5),
+            field(HashType::Size, "left size", 8),
+        ],
+        0,
+    );
+    let r = header(
+        vec![
+            canonical(HashType::Sha1),
+            field(HashType::Size, "right size", 8),
+        ],
+        0,
+    );
+    let f = merged_record_fields(&l, &r).unwrap();
+    assert_eq!(
+        f,
+        [
+            canonical(HashType::Md5),
+            field(HashType::Size, "left size", 8),
+            canonical(HashType::Sha1)
+        ]
+    );
+    let f = merged_record_fields(&r, &l).unwrap();
+    assert_eq!(
+        f,
+        [
+            canonical(HashType::Sha1),
+            field(HashType::Size, "right size", 8),
+            canonical(HashType::Md5)
+        ]
+    );
+}
+
+#[test]
+fn merged_fields_reject_a_type_with_two_lengths() {
+    let l = header(vec![field(HashType::Md5, "md5", 16)], 0);
+    let r = header(
+        vec![canonical(HashType::Sha1), field(HashType::Md5, "md5", 15)],
+        0,
+    );
+    let e = merged_record_fields(&l, &r).unwrap_err();
+    assert!(matches!(e, Error::Input(_)), "{e}");
+    assert!(
+        e.to_string()
+            .contains("field md5 has length 16 on the left and 15 on the right"),
+        "{e}"
+    );
 }

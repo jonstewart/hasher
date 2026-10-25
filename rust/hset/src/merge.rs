@@ -9,7 +9,31 @@
 use std::cmp::Ordering;
 
 use crate::error::{Error, Result};
+use crate::format::{FieldDescriptor, RecordHeader};
 use crate::ops::SetOp;
+
+/// The output fields of merging two record tables: the left fields followed
+/// by the right fields the left lacks (fields are matched by type). A field
+/// with different lengths on the two sides is an error.
+pub fn merged_record_fields(
+    left: &RecordHeader,
+    right: &RecordHeader,
+) -> Result<Vec<FieldDescriptor>> {
+    let mut fields = left.fields.clone();
+    for f in &right.fields {
+        match fields.iter().find(|o| o.htype == f.htype) {
+            None => fields.push(f.clone()),
+            Some(o) if o.length != f.length => {
+                return Err(Error::input(format!(
+                    "field {} has length {} on the left and {} on the right",
+                    f.name, o.length, f.length
+                )));
+            }
+            Some(_) => {}
+        }
+    }
+    Ok(fields)
+}
 
 /// A row that the merge does not emit (the same value as the TLSH index's
 /// dropped-row marker).
