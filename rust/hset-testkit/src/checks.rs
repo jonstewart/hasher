@@ -721,12 +721,14 @@ pub fn check_hex_rows(data: &[u8], width: usize, sep: &[u8]) {
 }
 
 /// The field sets [`check_text_input`] parses against: one digest, a
-/// digest with a size, the float column alone, and three columns mixed.
-const TEXT_FIELD_SETS: [&[HashType]; 4] = [
+/// digest with a size, the float column alone, three columns mixed, and
+/// TLSH with a digest.
+const TEXT_FIELD_SETS: [&[HashType]; 5] = [
     &[HashType::Md5],
     &[HashType::Sha1, HashType::Size],
     &[HashType::Entropy],
     &[HashType::Md5, HashType::Sha1, HashType::Size],
+    &[HashType::Tlsh, HashType::Md5],
 ];
 
 /// Whether `Builder::add_text` should accept `text` for `fields`, decided
@@ -734,7 +736,8 @@ const TEXT_FIELD_SETS: [&[HashType]; 4] = [
 /// line is accepted; otherwise the line needs exactly `fields.len()`
 /// columns split on `' '`, and each non-empty column must parse — a
 /// digest as exactly `2 * length` ASCII hex digits, `Size` as a `u64`,
-/// `Entropy` as an `f64`. An empty column is an absent value.
+/// `Entropy` as an `f64`, TLSH as `"TNULL"` or 70 ASCII hex digits after
+/// an optional `"T1"`. An empty column is an absent value.
 fn text_oracle_accepts(fields: &[HashType], text: &str) -> bool {
     text.lines().all(|line| {
         let line = line.strip_suffix('\r').unwrap_or(line);
@@ -748,6 +751,12 @@ fn text_oracle_accepts(fields: &[HashType], text: &str) -> bool {
                     || match t {
                         HashType::Size => col.parse::<u64>().is_ok(),
                         HashType::Entropy => col.parse::<f64>().is_ok(),
+                        HashType::Tlsh => {
+                            let digits = col.strip_prefix("T1").unwrap_or(col);
+                            *col == "TNULL"
+                                || (digits.len() == 70
+                                    && digits.bytes().all(|b| b.is_ascii_hexdigit()))
+                        }
                         t => {
                             let len = t.length().expect("storable type has a length");
                             col.len() == 2 * len && col.bytes().all(|b| b.is_ascii_hexdigit())
@@ -872,6 +881,13 @@ mod tests {
         ));
         assert!(text_oracle_accepts(&[HashType::Entropy], "7.5\ninf\n"));
         check_text_input(&format!("{md5}\r\n{md5} {sha1} 42\n"));
+        let tlsh = crate::tlsh::VEC_HEX;
+        let lower = tlsh[2..].to_ascii_lowercase();
+        let tm = [HashType::Tlsh, HashType::Md5];
+        let text = format!("{tlsh} {md5}\n{lower} \nTNULL {md5}\n {md5}\n");
+        assert!(text_oracle_accepts(&tm, &text));
+        check_text_input(&text);
+        check_text_input(&format!("T1{} {md5}\n", "0".repeat(70)));
     }
 
     #[test]
@@ -884,5 +900,18 @@ mod tests {
         assert!(!text_oracle_accepts(&[HashType::Entropy], "x"));
         assert!(!text_oracle_accepts(&[HashType::Md5], "a b"));
         check_text_input("0123\n a b\t\n");
+        let tlsh = crate::tlsh::VEC_HEX;
+        let tm = [HashType::Tlsh, HashType::Md5];
+        for bad in [
+            format!("{tlsh}0 "),
+            format!("T2{} ", &tlsh[2..]),
+            format!("{} ", &tlsh[..71]),
+            "TNULLX ".to_string(),
+            "T1 ".to_string(),
+            format!("{}{} ", &tlsh[2..], "00"),
+        ] {
+            assert!(!text_oracle_accepts(&tm, &bad), "{bad:?}");
+            check_text_input(&bad);
+        }
     }
 }
