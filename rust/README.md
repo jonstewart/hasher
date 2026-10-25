@@ -121,15 +121,22 @@ other hardware should be added there.
 hset make -t md5,sha1 -n "NSRL" -d "RDS 2.80" -o nsrl.hset hashes.txt
 hset make -t sha1 -o s.hset < sha1-list.txt          # stdin
 hset make -t sha1,size --hint legacy -o s.hset in.txt # readable by the C++ library
+hset make -t md5,tlsh -o t.hset md5_tlsh.txt         # TLSH: T1 hex, TNULL/empty = none
+hset make -t md5,tlsh --no-tlsh-index -o t.hset in.txt # no TIVF kNN index
+HSET_TLSH_OPTIONS=0 hset make -t md5,tlsh -o t.hset in.txt  # the same, as mkhashset reads it
 
-hset info nsrl.hset [--chunks]       # metadata, sections, hints, chunk table
-hset verify nsrl.hset                # digest, ordering, record links, hint soundness
+hset info nsrl.hset [--chunks]       # metadata, sections, hints, TLSH index, chunk table
+hset verify nsrl.hset                # digest, ordering, record links, hint soundness, TLSH cells/index
 hset dump nsrl.hset [-t sha1]        # records (or one type's hashes) as text
 
 hset query nsrl.hset d404b125f9f11f2e2a86a6090def8a23 ...   # type inferred from length
 hset query nsrl.hset -t sha1 -f hashes.txt --found-only      # bulk, batched lookups
 hset query nsrl.hset -t sha1 -r 7f8d4622...                  # print matching records
 hset query nsrl.hset -q <hash>       # exit status only: 0 = all found, 1 = some missing
+hset query t.hset T11FA1B357F7...    # exact TLSH lookup, T1 hex
+
+hset knn t.hset T11FA1B357F7... [-k 10] [--max-distance 144] [--no-length]
+hset knn t.hset -f digests.txt --strategy brute|index|auto --records --stats
 
 hset union a.hset b.hset -o aub.hset
 hset intersect a.hset b.hset -o anb.hset
@@ -140,6 +147,21 @@ hset bench nsrl.hset --queries 1000000 --compare     # ns/lookup, single and bat
 ```
 
 Exit status is 2 on any error.
+
+TLSH sections print and parse digests in the `T1` hex form. `hset make`
+writes the TIVF kNN index unless given `--no-tlsh-index`; without the flag
+it reads `HSET_TLSH_OPTIONS` as `mkhashset` does (2 = index, 0 = none; 1 and
+4 are ignored), and rejects a negative or non-numeric value, the k-means
+bit 8, or any other bit. `hset reindex` keeps a TLSH section's TIVF index
+byte for byte (rebuilding it only when `--no-records` drops duplicate rows)
+and rewrites its cell hint.
+
+`hset knn` prints one line per match, `QUERY<TAB>DISTANCE<TAB>ROW<TAB>DIGEST`
+(with `--records`, the row's record in place of the digest), or
+`QUERY<TAB>none`; `--stats` adds `# QUERY: strategy=index cells=C lists=L
+rows=R` (or `strategy=brute rows=R`) after each query. Every strategy
+returns the same matches. Its exit status is 1 when some query has no
+match within `--max-distance`.
 
 ## Lookup acceleration: convex-hull fitted blocks
 
