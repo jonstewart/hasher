@@ -7,7 +7,7 @@
 use std::collections::BTreeSet;
 use std::ops::Range;
 
-use hset::ops::SetOp;
+use hset::SetOp;
 
 /// A linear-scan reference set of fixed-width rows, kept however it was
 /// built (callers that want `equal_range` to be a contiguous span of equal

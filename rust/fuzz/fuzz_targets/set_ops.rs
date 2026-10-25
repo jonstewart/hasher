@@ -1,6 +1,6 @@
 #![no_main]
 
-use hset::ops::SetOp;
+use hset::SetOp;
 use hset_testkit::checks::check_set_op;
 use hset_testkit::doc::Doc;
 use libfuzzer_sys::fuzz_target;

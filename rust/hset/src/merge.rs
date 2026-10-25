@@ -24,12 +24,31 @@ use crate::format::{
 use crate::hash_type::HashType;
 use crate::hashset::Hashset;
 use crate::lookup::{self, BitsPolicy, HintSpec};
-use crate::ops::SetOp;
 use crate::tlsh::cells::{cell_index, cell_table};
 use crate::tlsh::ivf::{
     DEFAULT_COALESCE, IvfBuildOptions, TlshIvf, build_tlsh_ivf, merge_tlsh_ivf,
 };
 use crate::tlsh::{CELL_HINT_TAG, DIGEST_LENGTH as TLSH_LENGTH};
+
+/// A binary set operation (C `SFHASH_HSET_OP_*`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SetOp {
+    Union,
+    Intersect,
+    /// Left minus right.
+    Subtract,
+}
+
+impl SetOp {
+    /// The operation's noun: "union", "intersection" or "difference".
+    pub fn name(self) -> &'static str {
+        match self {
+            SetOp::Union => "union",
+            SetOp::Intersect => "intersection",
+            SetOp::Subtract => "difference",
+        }
+    }
+}
 
 /// Whether a merge writes the `TIVF` index of a TLSH section
 /// ([`MergeOptions::tlsh_index`]).

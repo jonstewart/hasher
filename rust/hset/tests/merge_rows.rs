@@ -4,12 +4,12 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use hset::SetOp;
 use hset::format::{FieldDescriptor, RecordHeader};
 use hset::merge::{
     DROPPED, RECORD_DROPPED, RowMerge, RowMode, RowOwners, merge_records, merge_rows,
     merged_record_fields,
 };
-use hset::ops::SetOp;
 use hset::{Error, HashType};
 use hset_testkit::oracle::set_op_model;
 use hset_testkit::strategies::set_op;

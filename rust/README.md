@@ -140,7 +140,9 @@ hset knn t.hset -f digests.txt --strategy brute|index|auto --records --stats
 
 hset union a.hset b.hset -o aub.hset
 hset intersect a.hset b.hset -o anb.hset
-hset subtract a.hset b.hset -o a-b.hset
+hset subtract a.hset b.hset -o a-b.hset              # alias: difference
+hset union t.hset batch.hset -o t2.hset --tlsh-index write --coalesce 0
+HSET_TLSH_OPTIONS=0 hset union a.hset b.hset -o u.hset  # no TIVF, as hsetop reads it
 
 hset reindex old.hset -o new.hset --hint hull        # rewrite with a new hint
 hset bench nsrl.hset --queries 1000000 --compare     # ns/lookup, single and batch
@@ -155,6 +157,28 @@ it reads `HSET_TLSH_OPTIONS` as `mkhashset` does (2 = index, 0 = none; 1 and
 bit 8, or any other bit. `hset reindex` keeps a TLSH section's TIVF index
 byte for byte (rebuilding it only when `--no-records` drops duplicate rows)
 and rewrites its cell hint.
+
+The set operations merge the inputs' sorted sections, as the C++
+`hsetop` and `sfhash_hashset_merge` do (HASHSET_FORMAT, "Set operations");
+the operands need not share field types. When both inputs have records the
+operation applies to the records, widened to the left's fields followed by
+the right's extras (an absent field is a zero presence byte), and each
+section's rows follow their records; otherwise the output is hashsets-only,
+with a section per type of either input (the left's first), each the set
+operation on the two sides' rows. A records-only file merges only with
+another records-only file. `--no-records` and `--no-hashsets` choose what
+is written, and it is an error when they leave nothing. A TLSH section's
+cell hint is recomputed from the merged rows; its TIVF index follows
+`--tlsh-index`: `inherit` (the default) writes it iff every input with the
+section has one, carried through the merge, `write` always writes it
+(built from the merged rows when an input lacks one), `omit` never does.
+Without the flag `HSET_TLSH_OPTIONS` is read as `hsetop` reads it (4 =
+inherit, winning over 2 = write, 0 = none; 1 is ignored; the k-means bit 8
+or any other bit is an error). `--coalesce C` (else `HSET_COALESCE`, else
+64) sets the threshold below which a merged index coalesces a cell's small
+lists; 0 disables it. Both values must be plain nonnegative decimals. One
+deliberate difference from C++: the builder-shaped C++ set operations
+default to writing the index, Rust's always to inheriting it.
 
 `hset knn` prints one line per match, `QUERY<TAB>DISTANCE<TAB>ROW<TAB>DIGEST`
 (with `--records`, the row's record in place of the digest), or
@@ -455,6 +479,6 @@ for rec in hs.records_for(sha1, &hash) { /* linked records */ }
 ```
 
 Modules: `format` (chunks, decode, encode), `lookup` (`Lookup` trait, hull and
-flat models, searcher, `BitsPolicy`), `builder`, `ops` (union, intersection,
-difference), `synth` (deterministic data for tests and benches), `hex`,
+flat models, searcher, `BitsPolicy`), `builder`, `merge` (union,
+intersection, difference by merging: `SetOp`, `MergeOptions`, `merge`), `synth` (deterministic data for tests and benches), `hex`,
 `hash_type`.

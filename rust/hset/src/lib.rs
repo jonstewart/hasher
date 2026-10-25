@@ -5,8 +5,9 @@
 //!   accelerated by on-disk hint tables; the default hint fits a line per
 //!   block of the key space using convex hulls (see [`lookup::hull`]).
 //! * [`Hashset`] ties a decoded file to its lookup strategies.
-//! * [`Builder`] creates files from records or text, and [`ops`] implements
-//!   union, intersection, and difference.
+//! * [`Builder`] creates files from records or text, and [`merge`] writes
+//!   the union, intersection, or difference of two files by merging them
+//!   ([`SetOp`], [`MergeOptions`]).
 //!
 //! ```
 //! use hset::{Builder, BuildOptions, HashType, Hashset};
@@ -35,7 +36,6 @@ pub mod hex;
 pub mod key;
 pub mod lookup;
 pub mod merge;
-pub mod ops;
 pub mod synth;
 pub mod tlsh;
 
@@ -44,4 +44,4 @@ pub use error::{Error, Result};
 pub use hash_type::HashType;
 pub use hashset::{Hashset, VerifyReport};
 pub use lookup::{BatchMode, BitsPolicy, HintSpec, Lookup, SearchConfig, SingleMode};
-pub use ops::SetOp;
+pub use merge::{MergeOptions, SetOp, TlshIndexPolicy};
