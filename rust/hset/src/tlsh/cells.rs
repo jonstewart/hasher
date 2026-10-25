@@ -66,20 +66,44 @@ impl<'a> CellIndex<'a> {
     /// offset 0, last offset `n`, offsets non-decreasing. Any violation is an
     /// [`Error::Format`].
     pub fn parse(table: &'a [u8], n: usize) -> Result<Self> {
-        let _ = n;
-        Ok(CellIndex { table })
+        if table.len() != CELL_TABLE_LEN {
+            return Err(Error::format(format!(
+                "bad TLSH cell index: table length is {} bytes, expected {CELL_TABLE_LEN}",
+                table.len()
+            )));
+        }
+        let ix = CellIndex { table };
+        let first = ix.offset(0);
+        if first != 0 {
+            return Err(Error::format(format!(
+                "bad TLSH cell index: first offset is {first}"
+            )));
+        }
+        let last = ix.offset(CELL_COUNT);
+        if last != n as u64 {
+            return Err(Error::format(format!(
+                "bad TLSH cell index: last offset is {last}, expected {n}"
+            )));
+        }
+        if let Some(c) = (0..CELL_COUNT).find(|&c| ix.offset(c) > ix.offset(c + 1)) {
+            return Err(Error::format(format!(
+                "bad TLSH cell index: offsets decrease at cell {c}"
+            )));
+        }
+        Ok(ix)
     }
 
     /// The `c`th offset, `c <= CELL_COUNT`.
     pub fn offset(&self, c: usize) -> u64 {
-        let _ = c;
-        0
+        let (entries, _) = self.table.as_chunks::<8>();
+        u64::from_le_bytes(entries[c])
     }
 
-    /// The rows of `cell`.
+    /// The rows of `cell`. The offsets are at most the row count, which
+    /// fits in `usize`, so the conversions cannot truncate.
     pub fn range(&self, cell: u16) -> Range<usize> {
-        let _ = cell;
-        0..0
+        let c = usize::from(cell);
+        self.offset(c) as usize..self.offset(c + 1) as usize
     }
 
     /// The table bytes, [`CELL_TABLE_LEN`] of them.
@@ -154,8 +178,130 @@ mod tests {
         assert_eq!(&t[..16], &[0, 0, 0, 0, 0, 0, 0, 0, 3, 0, 0, 0, 0, 0, 0, 0]);
         // 65536 * 3 = 0x3_0000
         assert_eq!(&t[524288..], &[0, 0, 3, 0, 0, 0, 0, 0]);
-        for (i, e) in t.chunks_exact(8).enumerate() {
-            assert_eq!(u64::from_le_bytes(e.try_into().unwrap()), i as u64 * 3);
+        for (i, e) in t.as_chunks::<8>().0.iter().enumerate() {
+            assert_eq!(u64::from_le_bytes(*e), i as u64 * 3);
+        }
+    }
+
+    fn five_row_table() -> Vec<u8> {
+        cell_table(&cell_index(&five_rows()).unwrap())
+    }
+
+    #[test]
+    fn a_parsed_index_gives_each_cell_its_rows() {
+        let t = five_row_table();
+        let ix = CellIndex::parse(&t, 5).unwrap();
+        assert_eq!(ix.as_bytes(), &t[..]);
+        assert_eq!(ix.offset(0), 0);
+        assert_eq!(ix.offset(0x0103), 4);
+        assert_eq!(ix.offset(CELL_COUNT), 5);
+        assert_eq!(ix.range(0x0000), 0..2);
+        assert_eq!(ix.range(0x0001), 2..2);
+        assert_eq!(ix.range(0x0102), 2..4);
+        assert_eq!(ix.range(0x8000), 4..4);
+        assert_eq!(ix.range(0xFFFF), 4..5);
+    }
+
+    #[test]
+    fn an_unaligned_table_parses() {
+        let t = five_row_table();
+        let mut buf = vec![0u8; 1];
+        buf.extend_from_slice(&t);
+        let ix = CellIndex::parse(&buf[1..], 5).unwrap();
+        assert_eq!(ix.range(0x0102), 2..4);
+    }
+
+    fn parse_err(t: &[u8], n: usize) -> String {
+        match CellIndex::parse(t, n) {
+            Err(e @ Error::Format(_)) => e.to_string(),
+            other => panic!("expected a format error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_table_of_the_wrong_length_is_rejected() {
+        let mut t = five_row_table();
+        assert!(parse_err(&t[..t.len() - 1], 5).contains("length"));
+        t.extend_from_slice(&5u64.to_le_bytes());
+        assert!(parse_err(&t, 5).contains("length"));
+        assert!(parse_err(&[], 0).contains("length"));
+    }
+
+    #[test]
+    fn a_nonzero_first_offset_is_rejected() {
+        let mut t = five_row_table();
+        t[0] = 1;
+        assert!(parse_err(&t, 5).contains("first offset is 1"));
+    }
+
+    #[test]
+    fn a_last_offset_other_than_the_row_count_is_rejected() {
+        let t = five_row_table();
+        let e = parse_err(&t, 4);
+        assert!(e.contains("last offset is 5, expected 4"), "{e}");
+        assert!(parse_err(&t, 6).contains("expected 6"));
+    }
+
+    #[test]
+    fn decreasing_offsets_are_rejected() {
+        // cells[0x0103] = 5 is above cells[0x0104] = 4.
+        let mut cells = cell_index(&five_rows()).unwrap();
+        cells[0x0103] = 5;
+        let e = parse_err(&cell_table(&cells), 5);
+        assert!(e.contains("decrease at cell 259"), "{e}");
+    }
+}
+
+#[cfg(test)]
+mod proptests {
+    use super::*;
+    use proptest::collection::vec;
+    use proptest::prelude::*;
+
+    /// Sorted rows whose (L, Q) come from a few values, so cells repeat and
+    /// neighbouring cells are both empty and full.
+    fn rows() -> impl Strategy<Value = Vec<[u8; DIGEST_LENGTH]>> {
+        vec(
+            (
+                prop::sample::select(vec![0u8, 1, 2, 0x7f, 0xff]),
+                prop::sample::select(vec![0u8, 1, 0x10, 0xff]),
+                any::<u8>(),
+            ),
+            0..=64,
+        )
+        .prop_map(|v| {
+            let mut rows: Vec<_> = v
+                .into_iter()
+                .map(|(l, q, b)| {
+                    let mut r = [0u8; DIGEST_LENGTH];
+                    r[0] = l;
+                    r[1] = q;
+                    r[2] = b;
+                    r
+                })
+                .collect();
+            rows.sort_unstable();
+            rows
+        })
+    }
+
+    proptest! {
+        // Each case builds and checks a 512 KiB table; 64 cases keep the
+        // debug-build run near two seconds.
+        #![proptest_config(ProptestConfig { cases: 64, ..ProptestConfig::default() })]
+
+        #[test]
+        fn every_row_lies_in_its_cells_range(rows in rows()) {
+            let table = cell_table(&cell_index(&rows).unwrap());
+            let ix = CellIndex::parse(&table, rows.len()).unwrap();
+            for (i, r) in rows.iter().enumerate() {
+                let cell = u16::from_be_bytes([r[0], r[1]]);
+                let range = ix.range(cell);
+                prop_assert!(range.contains(&i), "row {} cell {:#06x} {:?}", i, cell, range);
+                // The range holds exactly the rows of that cell.
+                let count = rows.iter().filter(|s| s[..2] == r[..2]).count();
+                prop_assert_eq!(range.len(), count);
+            }
         }
     }
 }
