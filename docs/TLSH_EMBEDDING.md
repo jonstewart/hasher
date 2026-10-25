@@ -104,7 +104,8 @@ reader rejects a file that has one, as any chunk the format does not allow.
 Bit 1 of the TLSH options, which selected it, is reserved and ignored.
 
 To get the embedding, compute it from the rows: `sfhash_tlsh_embed` in C
-(`include/hasher/tlsh.h`) for one digest, `hasher.tlsh_embed` in Python,
+(`include/hasher/tlsh.h`) for one digest and `sfhash_tlsh_embed_n` for n
+contiguous digests (a hash set's rows), `hasher.tlsh_embed` in Python,
 and `HSet.tlsh_embeddings()` for the whole n × 264 matrix of a TLSH hash
 set (section 6). On one core of a Xeon E5645 `sfhash_tlsh_embed` takes
 0.56–0.63 µs per digest (1,000,000 random digests, three runs), so the
@@ -546,7 +547,8 @@ T = 32, C = 64:
 The ctypes bindings compute the embedding from the rows: `hasher.tlsh_embed`
 for one digest, and `HSet.tlsh_embeddings(tidx=None)` for a whole TLSH hash
 set as a new (n, 264) float32 numpy array whose row r is the embedding of row
-r (about 1 KiB per row in memory):
+r (about 1 KiB per row in memory), computed by one `sfhash_tlsh_embed_n` call
+over the rows:
 
 ```python
 import hasher

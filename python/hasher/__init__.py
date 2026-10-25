@@ -341,6 +341,11 @@ _sfhash_tlsh_embed = _hasher.sfhash_tlsh_embed
 _sfhash_tlsh_embed.argtypes = [c_void_p, POINTER(c_float)]
 _sfhash_tlsh_embed.restype = None
 
+# void sfhash_tlsh_embed_n(const void* digests, size_t n, float* out);
+_sfhash_tlsh_embed_n = _hasher.sfhash_tlsh_embed_n
+_sfhash_tlsh_embed_n.argtypes = [c_void_p, c_size_t, POINTER(c_float)]
+_sfhash_tlsh_embed_n.restype = None
+
 # float sfhash_tlsh_embed_dist2(const float* a, const float* b, bool include_length);
 _sfhash_tlsh_embed_dist2 = _hasher.sfhash_tlsh_embed_dist2
 _sfhash_tlsh_embed_dist2.argtypes = [POINTER(c_float), POINTER(c_float), c_bool]
@@ -602,11 +607,10 @@ def _tlsh_embeddings(hset, tidx):
         raise ValueError(f"hash set {tidx} is not a TLSH hash set")
     n = _sfhash_hashset_count(hset, tidx)
     out = np.empty((n, TLSH_EMBEDDING_DIMS), dtype=np.float32)
-    base = out.ctypes.data
-    row_bytes = TLSH_EMBEDDING_DIMS * 4
-    for r in range(n):
-        _sfhash_tlsh_embed(
-            _sfhash_hashset_hash(hset, tidx, r), cast(base + r * row_bytes, POINTER(c_float))
+    if n:
+        # the rows are contiguous, so one call embeds them all
+        _sfhash_tlsh_embed_n(
+            _sfhash_hashset_hash(hset, tidx, 0), n, out.ctypes.data_as(POINTER(c_float))
         )
     return out
 
