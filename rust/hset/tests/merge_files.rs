@@ -469,3 +469,61 @@ fn record_merges_apply_the_operation_to_records_and_rows_follow_them() {
         assert_eq!(load(&o).record_count(), want, "{}", op.name());
     }
 }
+
+/// The TLSH corpus of the merge tests (C++ `corpus()`, 9000 rows, scaled
+/// down for debug builds). Every 50th digest repeats an earlier one, so
+/// records files have duplicate TLSH rows (owned by different records).
+fn tlsh_corpus() -> Vec<TlshDigest> {
+    let mut c = corpus(31, 1200);
+    for i in (50..c.len()).step_by(50) {
+        c[i] = c[i - 7];
+    }
+    c
+}
+
+const MD5_TLSH: [HashType; 2] = [HashType::Md5, HashType::Tlsh];
+
+/// The input and option matrix of C++ `run_matrix`: overlapping thirds of
+/// the corpus, each with or without an index, merged under each policy
+/// (given as C `tlsh_options` bits) by every operation.
+fn run_matrix(input: In) {
+    let c = tlsh_corpus();
+    // (left index, right index, merge tlsh_options, output has an index)
+    let cases = [
+        (true, true, 4, true),    // both indexed: index carried through
+        (false, false, 4, false), // both off
+        (true, false, 4, false),  // b lacks the index: none
+        (true, false, 2, true),   // ... index rebuilt from scratch
+        (true, false, 3, true),   // ... the same with bit 1 set
+        (false, false, 2, true),  // index computed for the output
+        (true, true, 3, true),    // index merged, bit 1 ignored
+        (true, true, 0, false),   // index dropped
+        (true, true, 1, false),   // ... bit 1 alone writes nothing
+    ];
+    for (aidx, bidx, bits, want_idx) in cases {
+        let a = build_input(&c, 0..800, &MD5_TLSH, input.index(aidx));
+        let b = build_input(&c, 400..1200, &MD5_TLSH, input.index(bidx));
+        let tlsh = rows_of(&load(&a), HashType::Tlsh);
+        assert_eq!(
+            tlsh.len() - unique(&tlsh).len(),
+            if input.records { 15 } else { 0 },
+            "duplicate TLSH rows of the left input"
+        );
+        let mut o = opts();
+        o.tlsh_index = TlshIndexPolicy::from_tlsh_options(bits).unwrap();
+        for op in OPS {
+            let out = merged(op, &a, &b, &o);
+            check_output(&out, &a, &b, op, want_idx);
+        }
+    }
+}
+
+#[test]
+fn hashsets_only_merges_over_the_option_matrix() {
+    run_matrix(HO);
+}
+
+#[test]
+fn record_merges_over_the_option_matrix() {
+    run_matrix(REC);
+}

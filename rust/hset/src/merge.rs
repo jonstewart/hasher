@@ -18,7 +18,11 @@ use crate::hash_type::HashType;
 use crate::hashset::Hashset;
 use crate::lookup::{self, BitsPolicy, HintSpec};
 use crate::ops::SetOp;
-use crate::tlsh::ivf::{DEFAULT_COALESCE, IvfBuildOptions};
+use crate::tlsh::cells::{cell_index, cell_table};
+use crate::tlsh::ivf::{
+    DEFAULT_COALESCE, IvfBuildOptions, TlshIvf, build_tlsh_ivf, merge_tlsh_ivf,
+};
+use crate::tlsh::{CELL_HINT_TAG, DIGEST_LENGTH as TLSH_LENGTH};
 
 /// Whether a merge writes the `TIVF` index of a TLSH section.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -192,6 +196,7 @@ struct OutSection {
     data: Vec<u8>,
     hint: Option<(u16, Vec<u8>)>,
     ridx: Option<Vec<u8>>,
+    tivf: Option<Vec<u8>>,
 }
 
 impl SectionMerge<'_, '_, '_> {
@@ -234,7 +239,15 @@ impl SectionMerge<'_, '_, '_> {
             _ => None,
         };
         let opts = self.opts;
-        let hint = if f.htype.is_digest() {
+        let mut tivf = None;
+        let hint = if f.htype == HashType::Tlsh && len == TLSH_LENGTH {
+            // the cell index is recomputed from the merged rows
+            let (rows, _) = data.as_chunks::<TLSH_LENGTH>();
+            tivf = self
+                .tlsh_index(f.htype, &m, rows)?
+                .map(|ivf| ivf.to_bytes());
+            Some((CELL_HINT_TAG, cell_table(&cell_index(rows)?)))
+        } else if f.htype.is_digest() {
             let spec = lookup::resolve_bits(opts.hint, data.len() / len, len, &opts.bits_policy);
             lookup::build_hint(len, &data, spec)?
         } else {
@@ -245,7 +258,44 @@ impl SectionMerge<'_, '_, '_> {
             data,
             hint,
             ridx,
+            tivf,
         })
+    }
+
+    /// The `TIVF` index of the merged TLSH section of type `t` (its rows
+    /// `rows`, merged by `m`), if the policy writes one: carried through
+    /// the merge ([`merge_tlsh_ivf`]) when every input that has the
+    /// section has an index, else built over `rows` ([`build_tlsh_ivf`]).
+    fn tlsh_index(
+        &self,
+        t: HashType,
+        m: &RowMerge,
+        rows: &[[u8; TLSH_LENGTH]],
+    ) -> Result<Option<TlshIvf>> {
+        let (li, ri) = (self.left.index_for_type(t), self.right.index_for_type(t));
+        let indexed =
+            |hs: &Hashset<'_>, i: Option<usize>| i.is_none_or(|i| hs.section(i).tivf.is_some());
+        let all_indexed = indexed(self.left, li) && indexed(self.right, ri);
+        let write = match self.opts.tlsh_index {
+            TlshIndexPolicy::Inherit => all_indexed,
+            TlshIndexPolicy::Write => true,
+            TlshIndexPolicy::Omit => false,
+        };
+        if !write {
+            return Ok(None);
+        }
+        if !all_indexed {
+            return build_tlsh_ivf(rows, &self.opts.ivf_build).map(Some);
+        }
+        let lv = li.map(|i| self.left.tlsh_index(i)).transpose()?.flatten();
+        let rv = ri.map(|i| self.right.tlsh_index(i)).transpose()?.flatten();
+        merge_tlsh_ivf(
+            lv.as_ref().map(|v| (v, &m.lmap[..])),
+            rv.as_ref().map(|v| (v, &m.rmap[..])),
+            rows,
+            self.opts.coalesce_threshold,
+        )
+        .map(Some)
     }
 }
 
@@ -263,7 +313,7 @@ impl OutSection {
             data: &self.data,
             hint: self.hint.as_ref().map(|(t, b)| (*t, b.as_slice())),
             ridx: self.ridx.as_deref(),
-            tivf: None,
+            tivf: self.tivf.as_deref(),
         }
     }
 }
