@@ -221,6 +221,21 @@ pub fn fields(max_fields: usize) -> BoxedStrategy<Vec<Field>> {
         .boxed()
 }
 
+/// `1..=max_fields` fields of distinct storable types, one of them (at any
+/// position) of type `t`.
+pub fn fields_with(t: HashType, max_fields: usize) -> BoxedStrategy<Vec<Field>> {
+    let others: Vec<HashType> = STORABLE_TYPES.into_iter().filter(|&x| x != t).collect();
+    (Just(others).prop_shuffle(), 1..=max_fields)
+        .prop_flat_map(move |(others, k)| {
+            (0..k).prop_flat_map(move |at| {
+                let mut types = others[..k - 1].to_vec();
+                types.insert(at, t);
+                types.into_iter().map(field).collect::<Vec<_>>()
+            })
+        })
+        .boxed()
+}
+
 /// A value of `htype`: digests uniform or from a three-byte alphabet; sizes
 /// any `u64` LE; entropies any finite `f64` LE (so text round-trips); TLSH
 /// digests canonical, never null, random or from a few near-digest
@@ -320,7 +335,12 @@ pub fn opts() -> BoxedStrategy<Opts> {
 
 /// A document with at most `max_fields` fields and `max_records` records.
 pub fn doc_with(max_fields: usize, max_records: usize) -> BoxedStrategy<Doc> {
-    fields(max_fields)
+    doc_over(fields(max_fields), max_records)
+}
+
+/// A document over `fields` with at most `max_records` records.
+fn doc_over(fields: BoxedStrategy<Vec<Field>>, max_records: usize) -> BoxedStrategy<Doc> {
+    fields
         .prop_flat_map(move |fields| (vec(record(&fields), 0..=max_records), opts(), Just(fields)))
         .prop_map(|(records, opts, fields)| Doc {
             fields,
@@ -392,7 +412,8 @@ pub fn doc_pair_mismatched() -> BoxedStrategy<(Doc, Doc)> {
 
 /// A document `hset make` can express: canonical names, records and hash
 /// sets, the default bits policy apart from the budget, and the default
-/// `TIVF` build (with or without the index).
+/// `TIVF` build (with or without the index). Half of them have a TLSH
+/// field.
 ///
 /// A single-field document's all-absent record has no text rendering:
 /// `Doc::to_text()` writes its one empty column as a blank line, and a
@@ -402,7 +423,7 @@ pub fn doc_pair_mismatched() -> BoxedStrategy<(Doc, Doc)> {
 /// round-trippable through `hset make`, so `cli_doc()` never generates
 /// one.
 pub fn cli_doc() -> BoxedStrategy<Doc> {
-    doc()
+    prop_oneof![doc(), doc_over(fields_with(HashType::Tlsh, 4), 64)]
         .prop_map(|mut d| {
             for f in &mut d.fields {
                 *f = Field::canonical(f.htype);
@@ -581,6 +602,14 @@ mod tests {
         #[test]
         fn doc_pair_mismatched_differs((a, b) in doc_pair_mismatched()) {
             prop_assert_ne!(type_set(&a), type_set(&b));
+        }
+
+        #[test]
+        fn fields_with_holds_the_type_once(f in fields_with(HashType::Tlsh, 4)) {
+            prop_assert!((1..=4).contains(&f.len()));
+            prop_assert_eq!(f.iter().filter(|f| f.htype == HashType::Tlsh).count(), 1);
+            let types: BTreeSet<HashType> = f.iter().map(|f| f.htype).collect();
+            prop_assert_eq!(types.len(), f.len());
         }
 
         #[test]
