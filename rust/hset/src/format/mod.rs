@@ -20,10 +20,24 @@
 //! | `HINT` | lookup acceleration table: `hint_type u16 BE`, then type-specific data |
 //! | `HDAT` | `hash_count` sorted fixed-width hashes |
 //! | `RIDX` | `hash_count` record indices (`u64 LE`), parallel to `HDAT` |
+//! | `TIVF` | TLSH sections only: the inverted-file kNN index (see [`crate::tlsh::ivf`]); exposed raw as [`Section::tivf`] |
 //! | `FLTR` | optional filter (skipped) |
 //! | `FEND` | end marker, no data |
 //!
 //! A pstring is a `u16 LE` length followed by UTF-8 bytes.
+//!
+//! A section is `HHnn [HINT] [FLTR] HDAT [RIDX] [TIVF]`; `HDAT` starts on
+//! a 4096-byte boundary, the chunks after it follow unpadded. Hint types:
+//! `0x62nn` flat block table and `0x68nn` hull table over the top `nn` bits
+//! (`0x6208` is the C++ library's legacy table), and `0x7400` the TLSH cell
+//! index ([`crate::tlsh::cells`]), `65537` `u64 LE` row offsets, one per
+//! `(L << 8) | Q` cell plus the row count.
+//!
+//! TLSH (`HH\x00\x0f`, 36-byte rows) is held stricter than the C++ decoder
+//! holds it: a `0x7400` hint must be a valid cell index and is accepted
+//! only on a 36-byte TLSH section, `TIVF` only on a TLSH section, and a
+//! `TVEC` chunk (TLSH embedding vectors, which older C++ builds wrote and
+//! the format has dropped) is rejected by name.
 
 pub mod chunk;
 pub mod decode;

@@ -10,7 +10,9 @@ use hset::format::{FieldDescriptor, Hint, HsetFile, hint_tag_block, hint_tag_hul
 use hset::lookup::resolve_bits;
 use hset::{BitsPolicy, BuildOptions, Builder, HashType, HintSpec};
 
-/// Every type that can be stored in a hash set: `HashType::ALL` minus `Fuzzy`.
+/// Every type that can be stored in a hash set: `HashType::ALL` minus `Fuzzy`,
+/// and minus `Tlsh`, whose values must be canonical TLSH digests and whose
+/// sections carry a cell index rather than a block or hull hint.
 pub const STORABLE_TYPES: [HashType; 14] = [
     HashType::Md5,
     HashType::Sha1,
