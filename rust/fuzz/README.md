@@ -21,7 +21,12 @@ outside the workspace (`exclude = ["fuzz"]`), so it builds into
 
 - `fuzz/corpus/<target>/` holds the committed seeds: small, minimised and
   reviewed. `decode_bytes` is seeded from the `test/*.hset` fixtures
-  under 64 KiB; the others from `just fuzz-seed`.
+  under 64 KiB (`md5_tlsh_ro.hset` has a TLSH record field) and two
+  files with a six-row TLSH section and no cell hint, written with
+  `hset::format::encode`: `tlsh_section.hset`, and
+  `tlsh_section_tivf_stub.hset` with a record index and an 8-byte `TIVF`
+  chunk. `tivf` and `bisect` start from hand-encoded `Arbitrary` cases;
+  the others from `just fuzz-seed`.
 - `target/fuzz-corpus/<target>/` is the scratch corpus. `just fuzz` passes
   it first, so every new input libFuzzer finds lands there and the
   committed seeds stay clean. It is under `target/`, so it is never
