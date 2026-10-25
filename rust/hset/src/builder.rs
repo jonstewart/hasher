@@ -10,6 +10,7 @@ use crate::hash_type::HashType;
 use crate::hex;
 use crate::key::key64_dyn;
 use crate::lookup::{self, BitsPolicy, HintSpec};
+use crate::tlsh::{DIGEST_LENGTH as TLSH_LENGTH, TlshDigest};
 
 /// Options controlling how a file is written.
 #[derive(Debug, Clone, PartialEq)]
@@ -320,8 +321,29 @@ impl Builder {
     }
 }
 
+/// True for a field that holds canonical 36-byte TLSH digests. A `Tlsh`
+/// field of any other length (possible only through
+/// [`Builder::with_fields`]) is opaque bytes: hex text, no cell hint.
+fn is_tlsh(field: &FieldDescriptor) -> bool {
+    field.htype == HashType::Tlsh && field.length == TLSH_LENGTH as u64
+}
+
+/// A 36-byte TLSH value as a digest, if its reserved byte is zero.
+fn tlsh_digest(value: &[u8]) -> Option<TlshDigest> {
+    let bytes: &[u8; TLSH_LENGTH] = value.try_into().ok()?;
+    TlshDigest::from_bytes(bytes).ok()
+}
+
 /// Parse one text column for `field`.
+///
+/// A TLSH field takes the `T1` hex form ([`TlshDigest::from_hex`]: `"T1"`
+/// and 70 hex digits, or the digits alone, nothing else in the column) and
+/// returns the 36 canonical bytes; `"TNULL"` returns the null digest, which
+/// [`Builder::add_record`] stores as an absent value.
 pub fn parse_value(field: &FieldDescriptor, col: &str) -> Result<Vec<u8>> {
+    if is_tlsh(field) {
+        return Ok(TlshDigest::from_hex(col)?.as_bytes().to_vec());
+    }
     match field.htype {
         HashType::Size => {
             let v: u64 = col
@@ -350,6 +372,11 @@ pub fn write_value<W: io::Write + ?Sized>(
     value: &[u8],
     w: &mut W,
 ) -> io::Result<()> {
+    if is_tlsh(field)
+        && let Some(d) = tlsh_digest(value)
+    {
+        return d.write_hex(w);
+    }
     match field.htype {
         HashType::Size if value.len() == 8 => {
             write!(w, "{}", u64::from_le_bytes(value.try_into().unwrap()))
@@ -362,7 +389,17 @@ pub fn write_value<W: io::Write + ?Sized>(
 }
 
 /// Render a field value as text (inverse of [`parse_value`]).
+///
+/// A TLSH value prints in the `T1` hex form (`"TNULL"` for the null
+/// digest). One the hex form cannot carry, a non-zero reserved byte or a
+/// length other than 36, prints as plain hex of its bytes, as do the
+/// numeric types at a width other than 8.
 pub fn format_value(field: &FieldDescriptor, value: &[u8]) -> String {
+    if is_tlsh(field)
+        && let Some(d) = tlsh_digest(value)
+    {
+        return d.to_hex();
+    }
     match field.htype {
         HashType::Size if value.len() == 8 => {
             u64::from_le_bytes(value.try_into().unwrap()).to_string()
@@ -657,6 +694,10 @@ mod proptests {
             } else {
                 let mut v = raw;
                 v.resize(t.length().unwrap(), 0);
+                if t == HashType::Tlsh {
+                    // The T1 hex form has no room for the reserved byte.
+                    v[TLSH_LENGTH - 1] = 0;
+                }
                 v
             };
             let text = format_value(&fd, &value);
