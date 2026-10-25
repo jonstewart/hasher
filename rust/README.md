@@ -45,8 +45,8 @@ lacks nextest's process-per-test parallelism; the commit-gate's 30 s budget is
 measured on `just test`, not the bare command.
 
 Variables with environment overrides: `FUZZ_SECONDS` (default 60),
-`FUZZ_SANITIZER` (default `none`; the crate has one `unsafe`, the prefetch
-hint, and sanitizer-free builds are portable), `MUTANTS_JOBS` (default 2),
+`FUZZ_SANITIZER` (default `none`; the crate's only `unsafe` is the prefetch
+hint and the TLSH POPCNT dispatch, and sanitizer-free builds are portable), `MUTANTS_JOBS` (default 2),
 `MUTANTS_MEMORY` (default `3G`), `KANI_MEMORY` (default `4G`),
 `PROPTEST_CASES` (default 20000 for `prop`).
 `HSET_FIXTURES_DIR` points the fixture-backed tests at the C++ reference
@@ -361,6 +361,48 @@ piece is a cheap startup guess, `SearchConfig::for_this_machine()`, built on
 `cpuid` leaf 4 / `sysctl` for cache sizes and a small table keyed on
 microarchitecture for the number of outstanding misses, which no interface
 reports.
+
+## TLSH kernel performance
+
+Rust targets baseline x86-64, where `u64::count_ones` is a bit-twiddling
+sequence, while the C++ library is built with `-mpopcnt`. Every TLSH scan
+loop (brute, cell and TIVF kNN, the BISECT build's distance loops, the
+merge's coalescing radii, TIVF validation) therefore runs through one
+dispatcher, `tlsh::distance::Popcount::scan`, which calls a
+`#[target_feature(enable = "popcnt")]` copy after `is_x86_feature_detected!`
+(the crate's second `unsafe`, next to the prefetch hint), else the portable
+copy; aarch64 has one copy (`count_ones` is NEON `cnt` there).
+`tlsh::distance::with_popcount` forces either kind on a thread for tests and
+benchmarks; results never differ. Three more fixes closed the rest of the
+gap: `TopK::offer` tests its bound inline (a call per row before), the BISECT
+k-means dot product keeps vector accumulators across the 256 dims, and the
+TIVF scan of multi-list cells prefetches rows 8 entries ahead, as C++ does.
+
+`cargo bench --bench tlsh` (`hset/benches/tlsh.rs`) against a C++ twin of it
+built on `libhasher.a`, both on the same rows (`HSET_BENCH_TLSH_TEXT`: the
+digests of `vs-eval/synthetic/s100k.txt` and `s1m.txt`, the C++ synthetic
+hsets' inputs) and the same 20 SplitMix64 queries per set; Xeon E5645, one
+pinned core, interleaved runs on a shared VM, best of 3 (s100k) or 2 (s1m);
+per query, build single-threaded; "before" is 5a02c6b:
+
+| | s100k before | after | C++ | s1m before | after | C++ |
+|---|---|---|---|---|---|---|
+| body kernel, ns/row | 15.1 | 7.1 | 7.7 | 17.3 | 9.0 | 9.6 |
+| brute, near (k 10, max 144) | 604 µs | 508 µs | 491 µs | 8.68 ms | 7.41 ms | 7.81 ms |
+| brute, member (k 100, unbounded) | 1218 µs | 871 µs | 896 µs | 12.8 ms | 9.74 ms | 9.94 ms |
+| brute, random (k 100, unbounded) | 1550 µs | 1051 µs | 1083 µs | 15.6 ms | 11.4 ms | 11.2 ms |
+| TIVF, near | 207 µs | 130 µs | 117 µs | 191 µs | 114 µs | 103 µs |
+| TIVF, member | 848 µs | 549 µs | 495 µs | 1.25 ms | 0.72 ms | 0.66 ms |
+| TIVF, random | 1115 µs | 805 µs | 763 µs | 8.09 ms | 4.71 ms | 4.35 ms |
+| BISECT build | 386 ms | 269 ms | 281 ms | 32.1 s | 20.9 s | 22.8 s |
+
+Brute force and the build are level with C++; the TIVF search is within
+about 10%. The body row is a plain loop over `BodyQuery::body` compiled
+with POPCNT (a caller's own loop gets the portable kernel, 12.9 ns/row on
+s100k). The s1m build numbers are single runs; these corpora have large,
+duplicate-heavy cells, so the build is far slower than on `bench_tlsh`'s
+corpus. The bench's default corpus (`HSET_BENCH_TLSH_N`, testkit digest-space
+families) spreads rows over many more cells.
 
 ## Format notes
 

@@ -7,8 +7,8 @@ set shell := ["sh", "-euc"]
 
 # Seconds each fuzz target runs under `just fuzz-ci`.
 fuzz_seconds := env_var_or_default("FUZZ_SECONDS", "60")
-# Sanitizer for fuzz builds. The crate has one `unsafe` (a prefetch hint);
-# sanitizer-free builds are portable to the Mac.
+# Sanitizer for fuzz builds. The crate's `unsafe` is a prefetch hint and the
+# TLSH POPCNT dispatch; sanitizer-free builds are portable to the Mac.
 fuzz_sanitizer := env_var_or_default("FUZZ_SANITIZER", "none")
 # Parallel cargo-mutants jobs.
 mutants_jobs := env_var_or_default("MUTANTS_JOBS", "2")

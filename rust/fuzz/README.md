@@ -66,8 +66,8 @@ FUZZ_SECONDS=20 just fuzz-ci
 FUZZ_SANITIZER=address just fuzz-ci  # AddressSanitizer; Linux only
 ```
 
-The default sanitizer is `none` (the crate has a single `unsafe`, a
-prefetch hint), which keeps the build working on stable and on macOS.
+The default sanitizer is `none` (the crate's only `unsafe` is a prefetch
+hint and the TLSH POPCNT dispatch, `tlsh::distance::Popcount::scan`), which keeps the build working on stable and on macOS.
 Every recipe prints `SKIP:` and exits 0 when `cargo-fuzz` is not
 installed.
 
