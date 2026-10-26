@@ -174,10 +174,11 @@ fn ivf_scan<I: IvfIndex + ?Sized>(
                 break;
             }
             let c = usize::from(l) << 8 | usize::from(qb);
-            let cell = ivf.cell_range(c)?;
-            if cell.is_empty() {
+            // most cells are empty: test that first, as C++ does
+            if ivf.cell_lists(c) == ivf.cell_lists(c + 1) {
                 continue;
             }
+            let cell = ivf.cell_range(c)?;
             if let Some(s) = stats.as_deref_mut() {
                 s.cells += 1;
             }
@@ -206,11 +207,7 @@ fn ivf_scan<I: IvfIndex + ?Sized>(
                 }
                 let first = ivf.id(members.start) as usize;
                 let Some(run) = rows.get(first..).and_then(|r| r.get(..members.len())) else {
-                    return Err(Error::format(format!(
-                        "TIVF list {fl} has rows {first}..{} out of range for {} rows",
-                        first as u64 + count,
-                        rows.len()
-                    )));
+                    return Err(run_error(fl, first, count, rows.len()));
                 };
                 for (i, r) in run.iter().enumerate() {
                     top.offer(TlshMatch {
@@ -252,10 +249,7 @@ fn ivf_scan<I: IvfIndex + ?Sized>(
                     }
                     let id = ivf.id(i);
                     let Some(r) = rows.get(id as usize) else {
-                        return Err(Error::format(format!(
-                            "TIVF list {fl} has id {id} out of range for {} rows",
-                            rows.len()
-                        )));
+                        return Err(id_error(fl, id, rows.len()));
                     };
                     top.offer(TlshMatch {
                         index: id.into(),
@@ -266,6 +260,25 @@ fn ivf_scan<I: IvfIndex + ?Sized>(
         }
     }
     Ok(top.into_sorted())
+}
+
+/// The error of an id past the rows, out of the scan's way.
+#[cold]
+#[inline(never)]
+fn id_error(list: usize, id: u32, rows: usize) -> Error {
+    Error::format(format!(
+        "TIVF list {list} has id {id} out of range for {rows} rows"
+    ))
+}
+
+/// The error of a single-list cell whose rows run past the end.
+#[cold]
+#[inline(never)]
+fn run_error(list: usize, first: usize, count: u64, rows: usize) -> Error {
+    Error::format(format!(
+        "TIVF list {list} has rows {first}..{} out of range for {rows} rows",
+        first as u64 + count
+    ))
 }
 
 #[cfg(kani)]

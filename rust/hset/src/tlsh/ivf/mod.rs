@@ -324,18 +324,11 @@ pub trait IvfIndex {
     /// range is inverted or runs past `lists()`. Two comparisons, no walk.
     fn cell_range(&self, c: usize) -> Result<Range<usize>> {
         let (start, end) = (self.cell_lists(c) as usize, self.cell_lists(c + 1) as usize);
-        if start > end {
-            return Err(Error::format(format!(
-                "TIVF cell_lists decreases from {start} to {end} after cell 0x{c:04x}"
-            )));
+        if start <= end && end <= self.lists() {
+            Ok(start..end)
+        } else {
+            Err(cell_range_error(c, start, end, self.lists()))
         }
-        if end > self.lists() {
-            return Err(Error::format(format!(
-                "TIVF lists of cell 0x{c:04x} end at {end}, past the {} lists",
-                self.lists()
-            )));
-        }
-        Ok(start..end)
     }
 
     /// The positions in `ids` of list `l`'s members (`l < lists()`):
@@ -343,19 +336,12 @@ pub trait IvfIndex {
     /// range is inverted or runs past `n`. Two comparisons, no walk.
     fn list_range(&self, l: usize) -> Result<Range<usize>> {
         let (start, end) = (self.list_start(l), self.list_start(l + 1));
-        if start > end {
-            return Err(Error::format(format!(
-                "TIVF list {l} starts at {start}, after its end {end}"
-            )));
+        if start <= end && end <= self.n() {
+            // end <= n, and n ids are in memory (check_layout)
+            Ok(start as usize..end as usize)
+        } else {
+            Err(list_range_error(l, start, end, self.n()))
         }
-        if end > self.n() {
-            return Err(Error::format(format!(
-                "TIVF list {l} ends at {end}, past the {} ids",
-                self.n()
-            )));
-        }
-        // end <= n, and n ids are in memory (check_layout)
-        Ok(start as usize..end as usize)
     }
 
     /// Number of members of list `l`, `list_start[l + 1] - list_start[l]`
@@ -399,6 +385,34 @@ pub fn check_index<I: IvfIndex + ?Sized>(ivf: &I, rows: &[[u8; DIGEST_LENGTH]]) 
         #[inline(always)]
         || check_valid(ivf, rows),
     )
+}
+
+/// The error of a bad [`IvfIndex::cell_range`], out of the search's way.
+#[cold]
+#[inline(never)]
+fn cell_range_error(c: usize, start: usize, end: usize, lists: usize) -> Error {
+    if start > end {
+        Error::format(format!(
+            "TIVF cell_lists decreases from {start} to {end} after cell 0x{c:04x}"
+        ))
+    } else {
+        Error::format(format!(
+            "TIVF lists of cell 0x{c:04x} end at {end}, past the {lists} lists"
+        ))
+    }
+}
+
+/// The error of a bad [`IvfIndex::list_range`], out of the search's way.
+#[cold]
+#[inline(never)]
+fn list_range_error(l: usize, start: u64, end: u64, n: u64) -> Error {
+    if start > end {
+        Error::format(format!(
+            "TIVF list {l} starts at {start}, after its end {end}"
+        ))
+    } else {
+        Error::format(format!("TIVF list {l} ends at {end}, past the {n} ids"))
+    }
 }
 
 /// The checks of [`check_index`].
