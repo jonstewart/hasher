@@ -384,7 +384,8 @@ fn list_start_must_cover_the_rows() {
 }
 
 //
-// validation (ruling 5; check_index_valid in test_hset_merge_incremental.cpp)
+// the full structural check, check_index (check_index_valid in
+// test_hset_merge_incremental.cpp); run only on request, as by verify
 //
 
 #[test]
