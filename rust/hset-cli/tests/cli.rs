@@ -863,7 +863,7 @@ fn verify_fails_on_a_wrong_cell_hint_or_an_invalid_index() {
     );
 
     // Repeat the first row id over the second in the TIVF ids (the last
-    // 4n bytes): the header still parses, the full validation fails.
+    // 4n bytes): the header still parses, the full check fails.
     let tivf = tivf.unwrap();
     let mut bad = good.clone();
     let ids = tivf.end - 4 * 81;
@@ -878,6 +878,56 @@ fn verify_fails_on_a_wrong_cell_hint_or_an_invalid_index() {
         "{s}"
     );
     assert!(s.contains("PROBLEM: tlsh: invalid TIVF index"), "{s}");
+}
+
+/// A TIVF id out of range is not looked at by the load: `verify` reports
+/// it, an index search that reads it exits 2 naming it, and brute force
+/// answers.
+#[test]
+fn knn_reports_an_index_read_out_of_bounds_and_verify_names_it() {
+    let dir = tmpdir("tlsh-knn-corrupt");
+    let f = dir.join("t.hset");
+    made_tlsh(&f, &[]);
+    let good = std::fs::read(&f).unwrap();
+    let (_, tivf) = tlsh_chunk_ranges(&good);
+    let ids = tivf.unwrap().end - 4 * 81;
+    let mut bad = good.clone();
+    bad[ids..ids + 4].copy_from_slice(&u32::MAX.to_le_bytes());
+    let damaged = dir.join("bad-id.hset");
+    write_redigested(&damaged, bad);
+
+    let o = run(&["verify", p(&damaged)]);
+    assert_eq!(o.status.code(), Some(1), "{}", stdout(&o));
+    let s = stdout(&o);
+    assert!(s.contains("index lists=76 valid=false"), "{s}");
+    assert!(
+        s.contains("PROBLEM: tlsh: invalid TIVF index") && s.contains("out of range"),
+        "{s}"
+    );
+
+    let d = hset_testkit::tlsh::example_digests()[0].clone();
+    let all = ["-k", "1000", "--max-distance", "4294967295"];
+    let o = run(&[
+        &["knn", p(&damaged), "--strategy", "index"][..],
+        &all,
+        &[&d],
+    ]
+    .concat());
+    assert_eq!(o.status.code(), Some(2), "{}", stdout(&o));
+    assert!(
+        stderr(&o).contains("TIVF") && stderr(&o).contains("out of range"),
+        "{}",
+        stderr(&o)
+    );
+    let o = run(&[
+        &["knn", p(&damaged), "--strategy", "brute"][..],
+        &all,
+        &[&d],
+    ]
+    .concat());
+    assert!(o.status.success(), "{}", stderr(&o));
+    // every one of the 81 rows matches
+    assert_eq!(stdout(&o).lines().count(), 81, "{}", stdout(&o));
 }
 
 /// The TLSH section's cell table, `TIVF` payload and rows (`HDAT`) of the

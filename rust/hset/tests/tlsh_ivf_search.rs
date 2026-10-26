@@ -825,9 +825,9 @@ fn a_single_list_cell_whose_rows_run_past_the_end_is_a_format_error() {
     let (rows, mut ivf, _, s) = corruptible();
     let at = ivf.list_start[s] as usize;
     ivf.ids[at] = rows.len() as u32 - 1;
-    assert_search_error(&ivf, &rows, &format!("TIVF list {s} covers rows"));
+    assert_search_error(&ivf, &rows, &format!("TIVF list {s} has rows"));
     ivf.ids[at] = u32::MAX;
-    assert_search_error(&ivf, &rows, &format!("TIVF list {s} covers rows"));
+    assert_search_error(&ivf, &rows, &format!("TIVF list {s} has rows"));
 }
 
 #[test]

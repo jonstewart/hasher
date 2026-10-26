@@ -207,7 +207,7 @@ fn ivf_scan<I: IvfIndex + ?Sized>(
                 let first = ivf.id(members.start) as usize;
                 let Some(run) = rows.get(first..).and_then(|r| r.get(..members.len())) else {
                     return Err(Error::format(format!(
-                        "TIVF list {fl} covers rows {first}..{}, past the {} rows",
+                        "TIVF list {fl} has rows {first}..{} out of range for {} rows",
                         first as u64 + count,
                         rows.len()
                     )));

@@ -191,8 +191,11 @@ impl MergeOptions {
 /// flags leave nothing to write, a field has two lengths, a section's
 /// hash length is not its output field's, or in a record merge a side has
 /// a field without its section or a section without `RIDX`; also for a
-/// name or description over 65535 bytes. [`Error::Format`] when an input
-/// `TIVF` that the merge carries is not valid for its rows.
+/// name or description over 65535 bytes. [`Error::Format`] when the merge
+/// carries an input `TIVF` and reads it out of bounds, and
+/// [`Error::Input`] when such an index's mapped ids are not increasing
+/// within a list ([`merge_tlsh_ivf`]); the input index is not otherwise
+/// checked, as in C++.
 ///
 /// # Differences from the C++ library
 ///
@@ -204,8 +207,9 @@ impl MergeOptions {
 ///   Rust writes [`MergeOptions::hint`] on digest sections only, as the
 ///   builder does (none on SIZE or ENTROPY), and the cell index only on a
 ///   36-byte TLSH section (a TLSH section of another length is opaque).
-/// * An input index is validated ([`Hashset::tlsh_index`]) before it is
-///   merged; C++ trusts it.
+/// * An input index is not validated before it is merged (C++ trusts it
+///   too), but every read of it is bounds-checked: one out of bounds is an
+///   error, never a panic or undefined behaviour.
 /// * The output is returned, not written to a file, and its timestamp is
 ///   [`MergeOptions::timestamp`] when given.
 pub fn merge(

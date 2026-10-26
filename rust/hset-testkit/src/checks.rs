@@ -31,7 +31,8 @@
 //!
 //! [`check_tlsh_knn`] is the TLSH search property, run by all of the
 //! above on every TLSH section they load: brute force answers like
-//! [`naive_knn`], and a valid index like brute force.
+//! [`naive_knn`], an index that passes `check_index` like brute force, and
+//! any other index without a panic.
 
 use std::collections::BTreeSet;
 use std::panic::{AssertUnwindSafe, catch_unwind, resume_unwind};
@@ -41,7 +42,7 @@ use hset::hashset::{KnnStrategy, VerifyReport};
 use hset::lookup::{HintSpec, Lookup, build_hint, hint_from_parts, make_lookup_with};
 use hset::merge::merge;
 use hset::synth::SplitMix64;
-use hset::tlsh::TlshDigest;
+use hset::tlsh::{TlshDigest, check_index};
 use hset::{Builder, Error, HashType, Hashset, SetOp};
 
 use hset::builder::parse_value;
@@ -370,10 +371,13 @@ const TLSH_QUERY_ROWS: usize = 3;
 
 /// The kNN property of TLSH section `idx` of `hs`: for a few queries (the
 /// first, middle and last rows, a near copy of each, a random digest and
-/// the null digest) and [`KNN_PARAMS`], brute force equals [`naive_knn`];
-/// when the section's index validates, the index search and `tlsh_knn`
-/// equal brute force; when it does not, both are an `Error::Format`.
-/// Returns whether the index validated (`None` when there is none).
+/// the null digest) and [`KNN_PARAMS`], brute force equals [`naive_knn`].
+/// When the section's index passes [`check_index`], the index search and
+/// `tlsh_knn` equal brute force. When it does not (a corrupt file), they
+/// return without panicking: an `Error::Format` where the search read the
+/// index out of bounds, or matches that may be inexact where it read it
+/// within bounds (as C++ does). Returns whether the index passed
+/// `check_index` (`None` when there is none).
 ///
 /// # Panics
 ///
@@ -381,9 +385,10 @@ const TLSH_QUERY_ROWS: usize = 3;
 pub fn check_tlsh_knn(hs: &Hashset<'_>, idx: usize) -> Option<bool> {
     let rows = hs.tlsh_rows(idx).expect("a TLSH section");
     let n = rows.len();
-    let index = hs.tlsh_index(idx).map(|v| v.is_some());
+    let index = hs.tlsh_index(idx).expect("a TLSH section");
     let has_index = hs.tlsh_knn_strategies(idx).expect("strategies").index;
-    assert_eq!(has_index, !matches!(index, Ok(false)), "strategies: index");
+    assert_eq!(has_index, index.is_some(), "strategies: index");
+    let sound = index.map(|ivf| check_index(&ivf, rows).is_ok());
 
     let mut rng = SplitMix64::new(idx as u64);
     let mut qs: Vec<TlshDigest> = Vec::new();
@@ -409,13 +414,13 @@ pub fn check_tlsh_knn(hs: &Hashset<'_>, idx: usize) -> Option<bool> {
             let brute = with(KnnStrategy::Brute).expect("brute force");
             assert_eq!(brute, want, "brute force kNN, {}", ctx());
             let auto = hs.tlsh_knn(idx, q, k, max_distance, include_length);
-            match index {
-                Ok(true) => {
+            match sound {
+                Some(true) => {
                     let got = with(KnnStrategy::Index).expect("index kNN");
                     assert_eq!(got, want, "index kNN, {}", ctx());
                     assert_eq!(auto.expect("tlsh_knn"), want, "tlsh_knn, {}", ctx());
                 }
-                Ok(false) => {
+                None => {
                     assert!(
                         matches!(with(KnnStrategy::Index), Err(Error::Input(_))),
                         "{}",
@@ -423,18 +428,18 @@ pub fn check_tlsh_knn(hs: &Hashset<'_>, idx: usize) -> Option<bool> {
                     );
                     assert_eq!(auto.expect("tlsh_knn"), want, "tlsh_knn, {}", ctx());
                 }
-                Err(_) => {
-                    assert!(
-                        matches!(with(KnnStrategy::Index), Err(Error::Format(_))),
-                        "{}",
-                        ctx()
-                    );
-                    assert!(matches!(auto, Err(Error::Format(_))), "tlsh_knn, {}", ctx());
+                Some(false) => {
+                    // any answer, but a format error is the only error
+                    for got in [with(KnnStrategy::Index), auto] {
+                        if let Err(e) = got {
+                            assert!(matches!(e, Error::Format(_)), "{e}, {}", ctx());
+                        }
+                    }
                 }
             }
         }
     }
-    has_index.then_some(index.is_ok())
+    sound
 }
 
 /// The TLSH checks of a file built or merged from a model: per expected
@@ -840,6 +845,21 @@ mod tests {
         let at = tivf.as_ptr() as usize - bytes.as_ptr() as usize + tivf.len() - 4;
         let mut bad = bytes.clone();
         bad[at..at + 4].copy_from_slice(&u32::MAX.to_le_bytes());
+        let hs = Hashset::load(&bad).unwrap();
+        assert_eq!(check_tlsh_knn(&hs, 0), Some(false));
+        assert!(exercise_loaded(&bad));
+    }
+
+    #[test]
+    fn tlsh_knn_check_accepts_any_answer_from_an_index_corrupt_within_bounds() {
+        let bytes = tlsh_doc(40, 0).build().unwrap();
+        let file = decode(&bytes).unwrap();
+        let tivf = file.sections[0].tivf.unwrap();
+        let lists = u32::from_le_bytes(tivf[8..12].try_into().unwrap()) as usize;
+        // every radius2 0: the index prunes lists that hold matches
+        let at = tivf.as_ptr() as usize - bytes.as_ptr() as usize + 32 + 4 * 65537 + 36 * lists;
+        let mut bad = bytes.clone();
+        bad[at..at + 4 * lists].fill(0);
         let hs = Hashset::load(&bad).unwrap();
         assert_eq!(check_tlsh_knn(&hs, 0), Some(false));
         assert!(exercise_loaded(&bad));

@@ -537,7 +537,7 @@ fn cmd_make(a: MakeArgs) -> CliResult<()> {
 /// What `info` says of TLSH section `idx` beyond its hint: whether it has
 /// the `0x7400` cell hint, and its `TIVF` index's list count and size;
 /// `None` for a section that is not a TLSH section of 36-byte digests.
-/// The index is not validated here (`verify` does that).
+/// The index is not checked here (`verify` does that).
 fn tlsh_info(hs: &Hashset<'_>, idx: usize) -> CliResult<Option<String>> {
     let Ok(rows) = hs.tlsh_rows(idx) else {
         return Ok(None);

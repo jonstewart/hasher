@@ -937,52 +937,108 @@ fn digest_sections_get_the_hint_of_the_options_and_tlsh_the_cell_index() {
     }
 }
 
-/// `bytes` with the first two ids of its TIVF equal, so that the index
-/// fails validation (a row twice, another missing) while its header
-/// still parses.
-fn with_a_repeated_tivf_id(bytes: &[u8]) -> Vec<u8> {
+/// `bytes` with its TLSH section's TIVF payload changed by `patch`, which
+/// gets the payload, the row count and the list count. The header still
+/// parses, so the file loads.
+fn with_tivf_patched(bytes: &[u8], patch: impl FnOnce(&mut [u8], usize, usize)) -> Vec<u8> {
     let f = hset::format::decode(bytes).unwrap();
     let t = f.section_for(HashType::Tlsh).unwrap();
     let n = f.sections[t].len();
     let &(off, _) = f.toc.iter().find(|&&(_, tag)| tag == chunk::TIVF).unwrap();
     let chunk = chunk::read_chunk(bytes, off as usize).unwrap();
-    let ids = off as usize + chunk::CHUNK_HEADER_LEN + chunk.data.len() - 4 * n;
+    let start = off as usize + chunk::CHUNK_HEADER_LEN;
+    let len = chunk.data.len();
+    let lists = u32::from_le_bytes(chunk.data[8..12].try_into().unwrap()) as usize;
     let mut out = bytes.to_vec();
-    out.copy_within(ids + 4..ids + 8, ids);
+    patch(&mut out[start..start + len], n, lists);
+    assert!(load(&out).tlsh_index(1).unwrap().is_some());
     out
 }
 
-/// Rust validates an input index before merging it (controller ruling
-/// 5); C++ trusts it. An invalid index fails a merge that carries it and
-/// is ignored by one that does not.
-#[test]
-fn an_invalid_input_index_fails_only_the_merges_that_carry_it() {
+/// Merge `a` (corrupted) with an indexed and an unindexed right side
+/// under every policy: the merges that carry `a`'s index (Inherit and
+/// Write with an indexed right side) fail with `carried` when it is given,
+/// else succeed with an output that loads and searches without error (its
+/// index carries the corruption, so `verify` may report it); every other
+/// merge succeeds with an output that verifies.
+#[track_caller]
+fn assert_merges(a: &[u8], carried: Option<fn(&Error) -> bool>) {
     let c = tlsh_corpus();
-    let a = with_a_repeated_tivf_id(&build_input(&c, 0..300, &MD5_TLSH, HO));
-    assert!(load(&a).tlsh_index(1).is_err());
     let b = build_input(&c, 200..500, &MD5_TLSH, HO);
     let b_bare = build_input(&c, 200..500, &MD5_TLSH, HO.index(false));
     let mut o = opts();
-    for (r, policy, ok) in [
-        (&b, TlshIndexPolicy::Inherit, false),
-        (&b, TlshIndexPolicy::Write, false),
-        (&b, TlshIndexPolicy::Omit, true),
-        (&b_bare, TlshIndexPolicy::Inherit, true),
-        (&b_bare, TlshIndexPolicy::Write, true),
+    for (r, policy, carries) in [
+        (&b, TlshIndexPolicy::Inherit, true),
+        (&b, TlshIndexPolicy::Write, true),
+        (&b, TlshIndexPolicy::Omit, false),
+        (&b_bare, TlshIndexPolicy::Inherit, false),
+        (&b_bare, TlshIndexPolicy::Write, false),
     ] {
         o.tlsh_index = policy;
-        match merge(SetOp::Union, &load(&a), &load(r), &o) {
-            Ok(out) => {
-                assert!(ok, "{policy:?}");
+        let got = merge(SetOp::Union, &load(a), &load(r), &o);
+        match (carries.then_some(carried).flatten(), got) {
+            (None, Ok(out)) if carries => {
+                let hs = load(&out);
+                let t = hs.index_for_type(HashType::Tlsh).unwrap();
+                let q = TlshDigest(hs.tlsh_rows(t).unwrap()[0]);
+                hs.tlsh_knn(t, &q, usize::MAX, u32::MAX, true).unwrap();
+            }
+            (None, Ok(out)) => {
                 check_loads(&out);
             }
-            Err(e) => {
-                assert!(!ok, "{policy:?}: {e}");
-                assert!(matches!(e, Error::Format(_)), "{e}");
+            (Some(want), Err(e)) => {
+                assert!(want(&e), "{policy:?}: {e}");
                 assert_contains(&e.to_string(), "TIVF");
             }
+            (want, got) => panic!(
+                "{policy:?}: expected an error: {}, got {got:?}",
+                want.is_some()
+            ),
         }
     }
+}
+
+/// Rust does not validate an input index before merging it, as C++ does
+/// not: an index corrupt within bounds (here every radius 0, too small)
+/// is carried through every merge without an error.
+#[test]
+fn an_input_index_is_not_validated_before_a_merge() {
+    let c = tlsh_corpus();
+    let a = with_tivf_patched(&build_input(&c, 0..300, &MD5_TLSH, HO), |p, _, lists| {
+        let radius2 = 32 + 4 * 65537 + 36 * lists;
+        p[radius2..radius2 + 4 * lists].fill(0);
+    });
+    assert!(!load(&a).verify().is_ok());
+    assert_merges(&a, None);
+}
+
+/// An input id out of range is read by the merges that carry the index,
+/// and is a format error there (C++ reads past its row map); the others
+/// never read it.
+#[test]
+fn an_input_index_id_out_of_range_fails_only_the_merges_that_carry_it() {
+    let c = tlsh_corpus();
+    let a = with_tivf_patched(&build_input(&c, 0..300, &MD5_TLSH, HO), |p, n, _| {
+        let ids = p.len() - 4 * n;
+        p[ids..ids + 4].copy_from_slice(&u32::MAX.to_le_bytes());
+    });
+    assert_merges(&a, Some(|e| matches!(e, Error::Format(_))));
+}
+
+/// The first two ids of an input index equal (a row twice, another
+/// missing): the mapped ids of the list are not increasing, which C++
+/// checks too, so the merges that carry it fail with its input error.
+#[test]
+fn a_repeated_input_index_id_fails_the_merges_that_carry_it_as_cpp_does() {
+    let c = tlsh_corpus();
+    let a = with_tivf_patched(&build_input(&c, 0..300, &MD5_TLSH, HO), |p, n, _| {
+        let ids = p.len() - 4 * n;
+        p.copy_within(ids + 4..ids + 8, ids);
+    });
+    assert_merges(
+        &a,
+        Some(|e| matches!(e, Error::Input(_)) && e.to_string().contains("not increasing")),
+    );
 }
 
 // ---------------------------------------------------------------------------

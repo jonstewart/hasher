@@ -8,9 +8,8 @@
 //!
 //! * [`Hashset::tlsh_rows`]: the section's sorted rows; match indexes
 //!   are positions in them.
-//! * [`Hashset::tlsh_index`]: its `TIVF` index, validated on first use,
-//!   for searching ([`crate::tlsh::knn_ivf`]) or merging
-//!   ([`crate::tlsh::merge_tlsh_ivf`]).
+//! * [`Hashset::tlsh_index`]: its `TIVF` index, for searching
+//!   ([`crate::tlsh::knn_ivf`]) or merging ([`crate::tlsh::merge_tlsh_ivf`]).
 //! * [`Hashset::tlsh_knn_strategies`], [`Hashset::tlsh_knn`] (the index
 //!   when there is one, else brute force) and [`Hashset::tlsh_knn_with`]
 //!   (a chosen [`KnnStrategy`], optionally counting [`KnnStats`]).
@@ -18,12 +17,15 @@
 //! Every strategy returns the same matches: at most k rows within the
 //! distance bound, ordered by (distance, row index).
 //!
-//! The `TIVF` header is checked by [`Hashset::load`], so a file with a bad
-//! version, dims, row count, length or list offsets does not load. The
-//! rest of the index (ids, cells, radii) is validated in O(n) on first
-//! use and the outcome kept: an invalid index makes index searches an
-//! [`Error::Format`] and [`Hashset::verify`] report it, while brute force
-//! still works (controller ruling 5).
+//! The `TIVF` header is checked by [`Hashset::load`] in O(1), as C++
+//! checks it, so a file with a bad version, dims, row count, length or
+//! list-offset ends does not load. Nothing else about the index (ids,
+//! cells, radii, inner offsets) is checked at load or on first use: the
+//! index search bounds-checks each access it makes, so an index that is
+//! out of bounds where a search reads it makes that search an
+//! [`Error::Format`], and one that is corrupt but in bounds gives the
+//! answer C++ gives (possibly inexact). [`Hashset::verify`] runs the full
+//! structural check ([`check_index`]); brute force always works.
 //!
 //! ## Differences from the C API
 //!
@@ -31,10 +33,11 @@
 //!   [`Error::Input`]; C returns 0 matches (or strategies).
 //! * Asking for the index of a file without one is an [`Error::Input`];
 //!   C returns 0 matches.
-//! * C trusts a loaded index; Rust validates it before searching it.
+//! * C trusts a loaded index and reads it unchecked; Rust bounds-checks
+//!   the reads, so a corrupt index is an error or an inexact answer, never
+//!   undefined behaviour.
 
 use std::ops::Range;
-use std::sync::OnceLock;
 
 use crate::error::{Error, Result};
 use crate::format::{self, FieldDescriptor, Hint, HsetFile, RecordHeader, Section};
@@ -92,9 +95,6 @@ struct TlshPart<'a> {
     rows: &'a [[u8; DIGEST_LENGTH]],
     /// The `TIVF` index, its header checked at load.
     tivf: Option<TivfView<'a>>,
-    /// The outcome of validating `tivf` against `rows`, on first use; the
-    /// error as text, since [`Error`] is not `Clone`.
-    valid: OnceLock<std::result::Result<(), String>>,
 }
 
 impl<'a> TlshPart<'a> {
@@ -121,11 +121,7 @@ impl<'a> TlshPart<'a> {
                     .map_err(|e| Error::Format(format!("hash set '{}': {e}", s.header.name)))
             })
             .transpose()?;
-        Ok(Some(TlshPart {
-            rows,
-            tivf,
-            valid: OnceLock::new(),
-        }))
+        Ok(Some(TlshPart { rows, tivf }))
     }
 }
 
@@ -337,46 +333,28 @@ impl<'a> Hashset<'a> {
         Ok(self.tlsh_part(idx)?.rows)
     }
 
-    /// The `TIVF` index of TLSH section `idx`, validated against its rows
-    /// ([`IvfIndex::validate`]), or `None` when the file has none.
+    /// The `TIVF` index of TLSH section `idx`, or `None` when the file has
+    /// none. Its rows are [`tlsh_rows`](Self::tlsh_rows).
     ///
     /// The header was checked when the file was loaded (a bad version,
-    /// dims, row count, length or list offsets fail [`Hashset::load`]);
-    /// the full O(n) validation runs on the first call for the section
-    /// (from here, an index search, or [`verify`](Self::verify)) and its
-    /// outcome is kept, so later calls are free and an invalid index is
-    /// reported every time (controller ruling 5). The returned
-    /// [`ValidIvf`] is `Copy`, borrows the file, and is what
-    /// [`crate::tlsh::knn_ivf`] and [`crate::tlsh::merge_tlsh_ivf`] take.
+    /// dims, row count, length or list-offset ends fail [`Hashset::load`]),
+    /// in O(1); nothing else is, here or later. The view is what
+    /// [`crate::tlsh::knn_ivf`] and [`crate::tlsh::merge_tlsh_ivf`] take;
+    /// both bounds-check what they read, so a corrupt index is an error
+    /// or an inexact answer, never a panic. [`verify`](Self::verify)
+    /// checks it fully ([`check_index`]).
     ///
     /// # Errors
     ///
-    /// [`Error::Input`] as for [`tlsh_rows`](Self::tlsh_rows);
-    /// [`Error::Format`] when the index is not valid for the rows (ids out
-    /// of range, repeated or missing, not ascending in a list, outside
-    /// their list's cell, beyond their list's radius, an empty list, ...).
+    /// [`Error::Input`] as for [`tlsh_rows`](Self::tlsh_rows).
     pub fn tlsh_index(&self, idx: usize) -> Result<Option<TivfView<'a>>> {
-        let part = self.tlsh_part(idx)?;
-        let Some(view) = part.tivf else {
-            return Ok(None);
-        };
-        let valid = part
-            .valid
-            .get_or_init(|| check_index(&view, part.rows).map_err(|e| e.to_string()));
-        match valid {
-            Ok(()) => Ok(Some(view)),
-            Err(e) => Err(Error::Format(format!(
-                "TIVF index of hash set {idx} ('{}'): {e}",
-                self.file.sections[idx].header.name
-            ))),
-        }
+        Ok(self.tlsh_part(idx)?.tivf)
     }
 
     /// The kNN strategies TLSH section `idx` supports (C
     /// `sfhash_hashset_tlsh_knn_strategies`): brute force always, the
-    /// index when the file has a `TIVF` for the section. Whether that
-    /// index is valid is not checked here (see
-    /// [`tlsh_index`](Self::tlsh_index)).
+    /// index when the file has a `TIVF` for the section (its contents are
+    /// not checked, see [`tlsh_index`](Self::tlsh_index)).
     ///
     /// # Errors
     ///
@@ -403,9 +381,9 @@ impl<'a> Hashset<'a> {
     /// # Errors
     ///
     /// As [`tlsh_knn_with`](Self::tlsh_knn_with) with the strategy chosen:
-    /// in particular an invalid index is an [`Error::Format`] here rather
-    /// than a silent fallback to brute force; ask for
-    /// [`KnnStrategy::Brute`] to search such a file.
+    /// in particular an index search that reads out of bounds is an
+    /// [`Error::Format`] here rather than a silent fallback to brute
+    /// force; ask for [`KnnStrategy::Brute`] to search such a file.
     pub fn tlsh_knn(
         &self,
         idx: usize,
@@ -429,7 +407,7 @@ impl<'a> Hashset<'a> {
     /// `stats` unchanged.
     ///
     /// Empty when `k == 0` or `q` is null, once the section and strategy
-    /// have been checked (and, for the index, validated).
+    /// have been checked.
     ///
     /// # Errors
     ///
@@ -437,9 +415,11 @@ impl<'a> Hashset<'a> {
     ///   [`tlsh_rows`](Self::tlsh_rows)) or the strategy is
     ///   [`KnnStrategy::Index`] and the file has no index for it (C
     ///   returns 0 matches for both).
-    /// * [`Error::Format`] for [`KnnStrategy::Index`] when the index is
-    ///   invalid ([`tlsh_index`](Self::tlsh_index)); brute force still
-    ///   works on such a file.
+    /// * [`Error::Format`] for [`KnnStrategy::Index`] when the search
+    ///   reads the index out of bounds ([`crate::tlsh::knn_ivf`]); brute
+    ///   force still works on such a file. A corrupt index the search
+    ///   reads within bounds is not detected (as in C++) and may give
+    ///   inexact matches; [`verify`](Self::verify) reports it.
     // the C API's parameters, one for one
     #[allow(clippy::too_many_arguments)]
     pub fn tlsh_knn_with(
@@ -462,7 +442,12 @@ impl<'a> Hashset<'a> {
                         self.file.sections[idx].header.name
                     )));
                 };
-                knn_ivf(&ivf, rows, q, k, max_distance, include_length, stats)
+                knn_ivf(&ivf, rows, q, k, max_distance, include_length, stats).map_err(|e| {
+                    Error::Format(format!(
+                        "TIVF index of hash set {idx} ('{}'): {e}",
+                        self.file.sections[idx].header.name
+                    ))
+                })
             }
         }
     }
@@ -488,13 +473,13 @@ impl<'a> Hashset<'a> {
             ));
         }
         let index = part.tivf.map(|view| {
-            let valid = self.tlsh_index(idx).is_ok();
-            if let Some(Err(e)) = part.valid.get() {
+            let checked = check_index(&view, part.rows);
+            if let Err(e) = &checked {
                 problems.push(format!("{}: invalid TIVF index: {e}", s.header.name));
             }
             IndexReport {
                 lists: view.lists(),
-                valid,
+                valid: checked.is_ok(),
             }
         });
         Some(TlshReport { cells_exact, index })
@@ -636,7 +621,9 @@ pub struct TlshReport {
 pub struct IndexReport {
     /// Number of lists (the header's count).
     pub lists: usize,
-    /// It passed the full validation ([`Hashset::tlsh_index`]).
+    /// It passed the full structural check
+    /// ([`check_index`](crate::tlsh::check_index)), which only `verify`
+    /// makes.
     pub valid: bool,
 }
 

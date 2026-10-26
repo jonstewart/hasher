@@ -507,7 +507,7 @@ pub struct ExpectedSection {
     pub ridx: Option<Vec<u64>>,
     pub hint_tag: Option<u16>,
     /// Whether the section has a `TIVF` index. Its bytes are not modelled:
-    /// [`crate::checks`] validates and searches it.
+    /// [`crate::checks`] checks and searches it.
     pub tivf: bool,
 }
 

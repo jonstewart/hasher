@@ -2,9 +2,10 @@
 //! `_knn_with`, `_knn_strategies`; `test/test_hset_tlsh_vectors.cpp`):
 //! the strategies a section offers, the index and brute force agreeing
 //! with the naive specification, the errors Rust returns where C returns
-//! 0, load-time rejection of a corrupt TIVF header, lazy validation of
-//! the rest (an invalid index fails index searches and `verify`, brute
-//! force still works), and the C++ fixtures.
+//! 0, load-time rejection of a corrupt TIVF header, no validation of the
+//! rest (a search fails at an access out of bounds, `verify` reports
+//! every structural problem, brute force still works), and the C++
+//! fixtures.
 //!
 //! Debug builds are slow: only one test builds an index over 5000 rows.
 
@@ -285,8 +286,8 @@ fn a_tivf_on_a_tlsh_section_of_other_lengths_fails_the_load() {
     assert!(hs.contains(0, &rows));
 }
 
-/// [`indexed_file`] with the TIVF's first id out of range, which only the
-/// full validation sees.
+/// [`indexed_file`] with the TIVF's first id out of range, which the load
+/// does not look at.
 fn file_with_a_bad_tivf_id() -> Vec<u8> {
     let (mut bytes, off) = indexed_file();
     let hs = Hashset::load(&bytes).unwrap();
@@ -299,31 +300,90 @@ fn file_with_a_bad_tivf_id() -> Vec<u8> {
     bytes
 }
 
-/// The ids are checked on first use: an out-of-range id makes every index
-/// search (and the default choice, which uses the index) a format error,
-/// while brute force still answers.
+/// Nothing walks the index at load or on first use: a file whose TIVF has
+/// an id out of range loads and offers its index. The search bounds-checks
+/// what it reads, so a search that reaches the bad id is a format error
+/// (naming the section), one that prunes it is answered, and brute force
+/// answers every query.
 #[test]
-fn invalid_tivf_ids_fail_index_searches_but_not_brute_force() {
+fn an_out_of_range_tivf_id_fails_only_the_index_searches_that_read_it() {
     let bytes = file_with_a_bad_tivf_id();
     let hs = Hashset::load(&bytes).unwrap();
     let t = tidx(&hs);
     let rows = hs.tlsh_rows(t).unwrap();
     assert_eq!(hs.tlsh_knn_strategies(t).unwrap(), BOTH);
+    let ivf = hs.tlsh_index(t).unwrap().expect("the index is offered");
+    assert_eq!(ivf.id(0), u32::MAX);
+
+    // every list scanned: the bad id is read
     let q = TlshDigest(rows[17]);
-    let format = |e: Error| assert!(matches!(e, Error::Format(_)), "{e}");
-    format(hs.tlsh_index(t).unwrap_err());
-    format(
-        hs.tlsh_knn_with(t, &q, 5, 200, true, KnnStrategy::Index, None)
-            .unwrap_err(),
-    );
-    format(hs.tlsh_knn(t, &q, 5, 200, true).unwrap_err());
-    // the failure is remembered, and reported again
-    format(hs.tlsh_index(t).unwrap_err());
+    let format = |e: Error| {
+        assert!(matches!(e, Error::Format(_)), "{e}");
+        let e = e.to_string();
+        assert!(e.contains("'tlsh'") && e.contains("out of range"), "{e}");
+    };
+    let all = |s| hs.tlsh_knn_with(t, &q, usize::MAX, u32::MAX, true, s, None);
+    format(all(KnnStrategy::Index).unwrap_err());
+    format(hs.tlsh_knn(t, &q, usize::MAX, u32::MAX, true).unwrap_err());
     assert_eq!(
-        hs.tlsh_knn_with(t, &q, 5, 200, true, KnnStrategy::Brute, None)
-            .unwrap(),
-        naive_knn(rows, &q, 5, 200, true)
+        all(KnnStrategy::Brute).unwrap(),
+        naive_knn(rows, &q, usize::MAX, u32::MAX, true)
     );
+    // an exact-match search of a row in another cell never reaches it
+    let first = ivf.list_ids(0).unwrap().count();
+    let far = TlshDigest(rows[rows.len() - 1]);
+    assert!(TlshDigest(rows[0]).cell() != far.cell(), "{first}");
+    assert_eq!(
+        hs.tlsh_knn_with(t, &far, 1, 0, true, KnnStrategy::Index, None)
+            .unwrap(),
+        naive_knn(rows, &far, 1, 0, true)
+    );
+}
+
+/// [`indexed_file`] with every list's `radius2` 0: in bounds, so the file
+/// loads and searches without error, as C++ does (the pruning may then
+/// miss matches); only `verify` reports it.
+#[test]
+fn a_too_small_tivf_radius_loads_and_searches_and_verify_reports_it() {
+    let (mut bytes, off) = indexed_file();
+    let hs = Hashset::load(&bytes).unwrap();
+    let t = tidx(&hs);
+    let lists = hs.tlsh_index(t).unwrap().unwrap().lists();
+    drop(hs);
+    let radius2 = off + 32 + 4 * 65537 + 36 * lists;
+    bytes[radius2..radius2 + 4 * lists].fill(0);
+    let hs = Hashset::load(&bytes).unwrap();
+    let rows = hs.tlsh_rows(t).unwrap();
+    for i in [0, rows.len() / 2, rows.len() - 1] {
+        let q = TlshDigest(rows[i]);
+        for (k, d) in [(1, 0), (10, 200), (usize::MAX, u32::MAX)] {
+            hs.tlsh_knn_with(t, &q, k, d, true, KnnStrategy::Index, None)
+                .unwrap();
+        }
+    }
+    let report = hs.verify();
+    assert!(
+        report
+            .problems
+            .iter()
+            .any(|p| p.contains("beyond radius2 0")),
+        "{:?}",
+        report.problems
+    );
+    assert!(!report.sections[t].tlsh.unwrap().index.unwrap().valid);
+}
+
+/// The flags and reserved TIVF header fields are ignored at load, as C++
+/// ignores them.
+#[test]
+fn nonzero_tivf_flags_and_reserved_fields_load() {
+    let (bytes, off) = indexed_file();
+    for at in [2, 12, 24] {
+        let mut b = bytes.clone();
+        b[off + at] = 0x5A;
+        let hs = Hashset::load(&b).unwrap_or_else(|e| panic!("byte {at}: {e}"));
+        assert!(hs.tlsh_index(tidx(&hs)).unwrap().is_some());
+    }
 }
 
 /// `verify` reports, per TLSH section, that the cell hint is the cell
@@ -379,8 +439,8 @@ fn verify_reports_an_invalid_tivf() {
     assert!(tivf[0].contains("out of range"), "{}", tivf[0]);
     let index = report.sections[t].tlsh.unwrap().index.unwrap();
     assert!(!index.valid);
-    // validation ran once; searching still reports it
-    assert!(matches!(hs.tlsh_index(t), Err(Error::Format(_))));
+    // verify does not change what the search sees
+    assert!(hs.tlsh_index(t).unwrap().is_some());
 }
 
 /// A cell hint that still loads (offsets from 0 to n, nondecreasing) but
