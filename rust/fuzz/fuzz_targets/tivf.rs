@@ -1,6 +1,7 @@
 #![no_main]
 
-//! TIVF payloads into `TivfView::parse` and `IvfIndex::validate`.
+//! TIVF payloads into `TivfView::parse`, `knn_ivf`, `merge_tlsh_ivf` and
+//! `check_index`.
 //!
 //! A TIVF payload is at least 262 KiB (the 65,537-entry `cell_lists`), far
 //! past libFuzzer's input lengths, so most cases are structured: a small
@@ -9,11 +10,14 @@
 //! mutated byte by byte in a chosen region. A raw case pads the input
 //! with zeros to the length its own header claims (when that is small).
 //!
-//! Parsing and validation never panic; a parsed view copies back to the
-//! same payload; the merge of a parsed view, valid or not, never panics.
-//! An unmutated, well-formed case validates. On a valid index `knn_ivf`
-//! equals `knn_brute`, and the identity merge (with an empty other side)
-//! validates, holds the coalescing invariant and searches the same.
+//! Nothing validates an index before use, so parsing, `check_index`, the
+//! search and the merge must each survive any payload: none panics; the
+//! search of a parsed view, and of whatever its identity merge makes,
+//! returns matches or a format error. A parsed view copies back to the
+//! same payload, but for the ignored flags and reserved header fields. An unmutated, well-formed case passes `check_index`. On
+//! an index that passes, `knn_ivf` equals `knn_brute`, and the identity
+//! merge (with an empty other side) passes `check_index`, holds the
+//! coalescing invariant and searches the same.
 
 #[path = "common/tlsh.rs"]
 mod common;
@@ -21,10 +25,10 @@ mod common;
 use std::collections::BTreeMap;
 
 use arbitrary::Arbitrary;
-use common::{QuerySpec, Row, RowSpec, check_knn, sorted_rows};
+use common::{MAX_QUERIES, QuerySpec, Row, RowSpec, check_knn, sorted_rows};
 use hset::tlsh::ivf::merge::merge_tlsh_ivf;
-use hset::tlsh::ivf::{TIVF_HEADER_LENGTH, check_index, check_invariant, tivf_len};
-use hset::tlsh::{BodyQuery, CELL_COUNT, DIGEST_LENGTH, TivfView, TlshDigest, TlshIvf};
+use hset::tlsh::ivf::{TIVF_HEADER_LENGTH, check_index, check_invariant, knn_ivf, tivf_len};
+use hset::tlsh::{BodyQuery, CELL_COUNT, DIGEST_LENGTH, IvfIndex, TivfView, TlshDigest, TlshIvf};
 use libfuzzer_sys::fuzz_target;
 
 /// Most mutations applied to a structured payload.
@@ -202,7 +206,7 @@ fn padded(raw: &[u8]) -> Vec<u8> {
     payload
 }
 
-/// The searches and merges of a parsed view, `valid` its validation.
+/// The searches and merges of a parsed view, `valid` its `check_index`.
 fn check_view(
     view: &TivfView<'_>,
     valid: Result<(), hset::Error>,
@@ -214,10 +218,15 @@ fn check_view(
     let none: Option<(&TlshIvf, &[u32])> = None;
     let merged = merge_tlsh_ivf(Some((view, &identity[..])), none, rows, coalesce);
     if valid.is_err() {
-        // Not a valid index: the merge may refuse it or produce an index
-        // that fails validation, but it returned.
+        // Not a sound index: the search and the merge read it unvalidated,
+        // bounds-checked. Any answer, a format error at a read out of
+        // bounds, never a panic; the same for whatever the merge made.
+        search_unsound(view, rows, queries);
+        if let Ok(merged) = merged {
+            search_unsound(&merged, rows, queries);
+        }
         return;
-    };
+    }
     check_knn(view, rows, queries);
     let merged = merged.expect("identity merge of a valid index");
     let empty = TlshIvf::empty();
@@ -230,8 +239,27 @@ fn check_view(
     .expect("merge with an empty side");
     assert_eq!(two_sided, merged, "an empty side changed the merge");
     assert!(check_invariant(&merged, coalesce), "coalescing invariant");
-    check_index(&merged, rows).expect("the merge of a valid index validates");
+    check_index(&merged, rows).expect("the merge of a valid index passes check_index");
     check_knn(&merged, rows, queries);
+}
+
+/// `knn_ivf` over an index that may be corrupt returns, with matches or a
+/// format error, for the first queries and for an unbounded search (which
+/// reads every list).
+fn search_unsound<I: IvfIndex + ?Sized>(ivf: &I, rows: &[Row], queries: &[QuerySpec]) {
+    let unbounded = rows
+        .first()
+        .map(|r| (TlshDigest(*r), usize::MAX, u32::MAX, true));
+    let given = queries.iter().take(MAX_QUERIES).map(|spec| {
+        let (k, max_distance, include_length) = spec.params();
+        (spec.query(rows), k, max_distance, include_length)
+    });
+    for (q, k, max_distance, include_length) in unbounded.into_iter().chain(given) {
+        match knn_ivf(ivf, rows, &q, k, max_distance, include_length, None) {
+            Ok(m) => assert!(m.len() <= rows.len(), "{} matches", m.len()),
+            Err(e) => assert!(matches!(e, hset::Error::Format(_)), "{e}"),
+        }
+    }
 }
 
 fuzz_target!(|case: TivfCase| {
@@ -256,7 +284,12 @@ fuzz_target!(|case: TivfCase| {
         assert!(!expect_valid, "an unmutated payload failed to parse");
         return;
     };
-    assert_eq!(TlshIvf::from_index(&view).to_bytes(), payload);
+    // parse ignores the flags and reserved fields; to_bytes writes zeros
+    let mut canonical = payload.clone();
+    for ignored in [2..4, 12..16, 24..32] {
+        canonical[ignored].fill(0);
+    }
+    assert_eq!(TlshIvf::from_index(&view).to_bytes(), canonical);
     let _ = check_invariant(&view, coalesce);
     let valid = check_index(&view, &rows);
     if expect_valid {

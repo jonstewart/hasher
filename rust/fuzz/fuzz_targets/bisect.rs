@@ -2,8 +2,8 @@
 
 //! The BISECT build over small sorted row sets, and one cell just past
 //! `FLAT_MAX` rows so the coarse bisection runs. The build never fails or
-//! panics on sorted rows, its index validates (every list nonempty, the
-//! lists partition the rows by cell), every medoid is a member, `radius2`
+//! panics on sorted rows, its index passes `check_index` (every list
+//! nonempty, the lists partition the rows by cell), every medoid is a member, `radius2`
 //! is exact, a flat cell of `s` rows has at most `ceil(s / T)` lists, the
 //! thread count does not change a small case's index, the payload round-trips
 //! through `TivfView`, and `knn_ivf` agrees with `knn_brute`. Unsorted rows
@@ -77,7 +77,7 @@ fn row_cells(rows: &[Row]) -> Vec<usize> {
     cells
 }
 
-/// Checked over the cells that have rows only: validation has shown that
+/// Checked over the cells that have rows only: `check_index` has shown that
 /// no other cell has a list, and a walk over all 65,536 cells costs more
 /// under the fuzzer's comparison tracing than the build does.
 fn check_shape(ivf: &TlshIvf, rows: &[Row], target: usize) {
@@ -127,13 +127,13 @@ fuzz_target!(|case: BisectCase| {
         assert_eq!(ivf, one, "the thread count changed the index");
     }
 
-    // Validated once, through the payload: the view holds the same arrays
-    // (from_index), so this is the build's validation too, and each full
-    // validation walks all 65,536 cells.
+    // Checked once, through the payload: the view holds the same arrays
+    // (from_index), so this is the build's check too, and each full check
+    // walks all 65,536 cells.
     let bytes = ivf.to_bytes();
     let view = TivfView::parse(&bytes, rows.len() as u64).expect("own payload parses");
     assert_eq!(TlshIvf::from_index(&view), ivf);
-    check_index(&view, &rows).expect("a fresh build validates");
+    check_index(&view, &rows).expect("a fresh build passes check_index");
     check_shape(&ivf, &rows, opts.target_list_size);
     check_knn(&view, &rows, &case.queries);
 

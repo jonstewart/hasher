@@ -6,16 +6,16 @@ outside the workspace (`exclude = ["fuzz"]`), so it builds into
 
 | target | input | check |
 |---|---|---|
-| `decode_bytes` | raw bytes | `exercise_loaded`: a file that loads survives every query path; on a TLSH section brute-force kNN equals the kit's `naive_knn` and an index that validates searches the same (`check_tlsh_knn`) |
+| `decode_bytes` | raw bytes | `exercise_loaded`: a file that loads survives every query path; on a TLSH section brute-force kNN equals the kit's `naive_knn` an index that passes `check_index` searches the same, and any other index searches without a panic (`check_tlsh_knn`) |
 | `corrupt_doc` | `(Doc, Corruption)` | `check_corruption`: corruption never panics and never passes the digest unless it changed nothing |
 | `lookup` | `LookupCase` | `check_lookup`: every lookup strategy agrees with the linear scan |
 | `build_doc` | `Doc` | `check_doc_roundtrip`: build, decode, verify, look up, search a TLSH section, rebuild. A `Doc` may hold a TLSH field (`tlsh::doc_value`: random digests and near copies from four families) and is built with or without its `TIVF` index |
-| `set_ops` | `(Doc, Doc, u8)` | `check_set_op` with the op chosen by `u8 % 3`; the left `Doc`'s options pick the TLSH index policy, coalescing threshold and clustering target, and a merged TLSH section must validate and search exactly |
+| `set_ops` | `(Doc, Doc, u8)` | `check_set_op` with the op chosen by `u8 % 3`; the left `Doc`'s options pick the TLSH index policy, coalescing threshold and clustering target, and a merged TLSH section must pass `check_index` and search exactly |
 | `hex` | raw bytes | `check_hex`, then `check_hex_rows` with width and separator taken from the first bytes |
 | `text_input` | `&str` | `check_text_input`: `Builder::add_text` accepts exactly what the line oracle does, a TLSH column included |
 | `tlsh_hex` | raw bytes | `TlshDigest::from_hex` accepts exactly `TNULL` and 70 hex digits (optional `T1`) and round-trips through `to_hex`; `from_bytes` enforces the reserved byte; `diff` is symmetric, `Some` iff neither digest is null and equals the kit's `ref_diff` |
-| `bisect` | `BisectCase` (row specs, build options, queries) | `build_tlsh_ivf` over sorted rows (up to 256, or one cell just past `FLAT_MAX` when `big` is `0xB1`, with `T` of at least 64) succeeds and validates, medoids are members, `radius2` is exact, a flat cell has at most `ceil(s / T)` lists, threads do not change a small case's index, the payload round-trips, `knn_ivf` equals `knn_brute`; unsorted rows are refused |
-| `tivf` | `TivfCase` (row specs, a raw or a built-then-mutated payload, coalescing threshold, queries) | `TivfView::parse`, `validate` and `merge_tlsh_ivf` never panic; a parsed view copies back to its payload; an unmutated, well-formed index validates; on a valid index `knn_ivf` equals `knn_brute` and the identity merge validates, holds `check_invariant` and searches the same |
+| `bisect` | `BisectCase` (row specs, build options, queries) | `build_tlsh_ivf` over sorted rows (up to 256, or one cell just past `FLAT_MAX` when `big` is `0xB1`, with `T` of at least 64) succeeds and passes `check_index`, medoids are members, `radius2` is exact, a flat cell has at most `ceil(s / T)` lists, threads do not change a small case's index, the payload round-trips, `knn_ivf` equals `knn_brute`; unsorted rows are refused |
+| `tivf` | `TivfCase` (row specs, a raw or a built-then-mutated payload, coalescing threshold, queries) | Nothing validates an index before use: `TivfView::parse`, `check_index`, `knn_ivf` and `merge_tlsh_ivf` never panic on any payload, and `knn_ivf` over any parsed view (and over its identity merge) returns matches or a format error; a parsed view copies back to its payload (the ignored flags and reserved header fields aside); an unmutated, well-formed index passes `check_index`; on an index that passes, `knn_ivf` equals `knn_brute` and the identity merge passes `check_index`, holds `check_invariant` and searches the same |
 
 ## Two corpora
 
@@ -45,7 +45,7 @@ A TIVF payload is at least 262 KiB (65,537 `cell_lists` entries) and a
 `0x7400` cell-index hint 512 KiB, so neither fits in a 64 KiB input:
 `decode_bytes` sees TLSH sections through its seeds and the dictionary,
 but never a valid hint or index; `tivf` and `bisect` build their indexes
-from structured inputs instead. Every index build, validation, merge
+from structured inputs instead. Every index build, `check_index`, merge
 and search walks the 65,536 cells, which under libFuzzer's comparison
 tracing makes these two targets slow: about 80 runs a second for `tivf`,
 and 10 to 100 for `bisect` depending on how many large (`FLAT_MAX`)

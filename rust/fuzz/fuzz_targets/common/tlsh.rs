@@ -65,7 +65,8 @@ pub struct QuerySpec {
 }
 
 impl QuerySpec {
-    fn query(&self, rows: &[Row]) -> TlshDigest {
+    /// The query digest over `rows`.
+    pub fn query(&self, rows: &[Row]) -> TlshDigest {
         let mut q = match self.row {
             Some(i) if !rows.is_empty() => rows[usize::from(i) % rows.len()],
             _ => self.digest.row(),
@@ -75,6 +76,15 @@ impl QuerySpec {
         }
         TlshDigest(q)
     }
+
+    /// `(k, max_distance, include_length)` of the search.
+    pub fn params(&self) -> (usize, u32, bool) {
+        (
+            usize::from(self.k % 12),
+            u32::from(self.max_distance),
+            self.include_length,
+        )
+    }
 }
 
 /// `knn_ivf` over the index returns exactly what `knn_brute` returns over
@@ -82,8 +92,7 @@ impl QuerySpec {
 pub fn check_knn<I: IvfIndex + ?Sized>(ivf: &I, rows: &[Row], queries: &[QuerySpec]) {
     for spec in queries.iter().take(MAX_QUERIES) {
         let q = spec.query(rows);
-        let k = usize::from(spec.k % 12);
-        let max_distance = u32::from(spec.max_distance);
+        let (k, max_distance, include_length) = spec.params();
         let mut stats = KnnStats::default();
         let got = knn_ivf(
             ivf,
@@ -91,11 +100,11 @@ pub fn check_knn<I: IvfIndex + ?Sized>(ivf: &I, rows: &[Row], queries: &[QuerySp
             &q,
             k,
             max_distance,
-            spec.include_length,
+            include_length,
             Some(&mut stats),
         )
         .expect("knn_ivf on a valid index");
-        let want = knn_brute(rows, &q, k, max_distance, spec.include_length);
+        let want = knn_brute(rows, &q, k, max_distance, include_length);
         assert_eq!(got, want, "knn_ivf != knn_brute for {q:?}, {spec:?}");
         assert!(stats.rows <= rows.len() as u64, "{stats:?}");
     }
