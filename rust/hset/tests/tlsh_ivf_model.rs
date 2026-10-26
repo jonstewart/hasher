@@ -7,7 +7,10 @@
 use hset::Error;
 use hset::tlsh::TlshDigest;
 use hset::tlsh::ivf;
-use hset::tlsh::ivf::{IvfIndex, TivfView, TlshIvf, check_index, check_invariant, tivf_len};
+use hset::tlsh::ivf::{
+    IvfIndex, TivfView, TlshIvf, check_index, check_invariant, knn_ivf, merge_tlsh_ivf, tivf_len,
+};
+use hset::tlsh::knn_brute;
 use proptest::prelude::*;
 
 // Layout (HASHSET_FORMAT, tlsh_ivf.cpp length_tivf_data): 32-byte header,
@@ -806,5 +809,122 @@ proptest! {
         prop_assume!(!wide.is_empty());
         ivf.radius2[wide[which.index(wide.len())]] -= 1;
         prop_assert!(matches!(check_index(&ivf, &rows), Err(Error::Format(_))));
+    }
+
+    /// The search and the merge read a parsed index without validating
+    /// it: whatever a mutated payload of a valid index parses to, they
+    /// return (a format error or matches, any matches) and never panic.
+    /// When the mutated index still passes `check_index`, the search is
+    /// exact and the identity merge passes it too.
+    #[test]
+    fn a_mutated_payload_never_panics_the_search_or_the_merge(
+        rows in arb_rows(),
+        labels in prop::collection::vec(any::<u8>(), 40),
+        pick in any::<usize>(),
+        patches in prop::collection::vec(arb_patch(), 1..5),
+        coalesce in 0u32..12,
+    ) {
+        let ivf = reference_index(&rows, &labels, pick);
+        let mut b = ivf.to_bytes();
+        for p in &patches {
+            p.apply(&mut b, ivf.lists());
+        }
+        let Ok(view) = TivfView::parse(&b, rows.len() as u64) else {
+            return Ok(());
+        };
+        let sound = check_index(&view, &rows).is_ok();
+        let mut queries: Vec<TlshDigest> = rows.iter().take(2).map(|r| TlshDigest(*r)).collect();
+        queries.push(TlshDigest::from_parts(1, 1, 2, 3, &[1; 128]));
+        for q in &queries {
+            for (k, t) in [(1, 0), (3, 150), (usize::MAX, u32::MAX)] {
+                match knn_ivf(&view, &rows, q, k, t, true, None) {
+                    Ok(m) => {
+                        prop_assert!(m.len() <= rows.len());
+                        if sound {
+                            prop_assert_eq!(m, knn_brute(&rows, q, k, t, true));
+                        }
+                    }
+                    Err(e) => {
+                        prop_assert!(!sound, "{}", e);
+                        prop_assert!(matches!(e, Error::Format(_)), "{}", e);
+                    }
+                }
+            }
+        }
+        let identity: Vec<u32> = (0..rows.len() as u32).collect();
+        let none: Option<(&TlshIvf, &[u32])> = None;
+        match merge_tlsh_ivf(Some((&view, &identity[..])), none, &rows, coalesce) {
+            Ok(m) => {
+                if sound {
+                    prop_assert!(check_index(&m, &rows).is_ok());
+                }
+                for q in &queries {
+                    let _ = knn_ivf(&m, &rows, q, usize::MAX, u32::MAX, true, None);
+                }
+            }
+            Err(e) => prop_assert!(!sound, "{}", e),
+        }
+    }
+}
+
+/// A change to a TIVF payload: one byte, or a whole little-endian word
+/// set to a boundary value, at a position chosen within a region.
+#[derive(Clone, Debug)]
+struct Patch {
+    /// 0 header, 1 the `cell_lists` entries of the cells `arb_rows` uses,
+    /// 2 medoids, 3 radius2, 4 list_start, 5 ids.
+    region: u8,
+    at: usize,
+    /// `Some(width)`: write `word` over `width` bytes; else one byte.
+    word: Option<(usize, u64)>,
+    byte: u8,
+}
+
+fn arb_patch() -> impl Strategy<Value = Patch> {
+    (
+        0u8..6,
+        any::<usize>(),
+        prop::option::of((
+            prop::sample::select(vec![4usize, 8]),
+            prop::sample::select(vec![0u64, 1, 2, 7, 39, 40, 41, u32::MAX as u64, u64::MAX]),
+        )),
+        any::<u8>(),
+    )
+        .prop_map(|(region, at, word, byte)| Patch {
+            region,
+            at,
+            word,
+            byte,
+        })
+}
+
+impl Patch {
+    fn apply(&self, b: &mut [u8], lists: usize) {
+        let medoids = MEDOIDS;
+        let radius2 = medoids + 36 * lists;
+        let list_start = radius2 + 4 * lists;
+        let ids = list_start + 8 * (lists + 1);
+        let (base, len) = match self.region {
+            0 => (0, 32),
+            // cells (l << 8) | q for l, q < 3, and the entries after them
+            1 => (32, 4 * 0x0204),
+            2 => (medoids, 36 * lists),
+            3 => (radius2, 4 * lists),
+            4 => (list_start, 8 * (lists + 1)),
+            _ => (ids, b.len() - ids),
+        };
+        if len == 0 {
+            return;
+        }
+        match self.word {
+            Some((width, w)) => {
+                // align to the region's entries
+                let at = base + (self.at % len) / width * width;
+                if at + width <= b.len() {
+                    b[at..at + width].copy_from_slice(&w.to_le_bytes()[..width]);
+                }
+            }
+            None => b[base + self.at % len] ^= self.byte | 1,
+        }
     }
 }
