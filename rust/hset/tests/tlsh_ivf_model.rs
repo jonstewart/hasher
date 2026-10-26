@@ -334,10 +334,16 @@ fn unknown_header_values_are_rejected() {
     // hset_tlsh_index_decode_rejects_corruption: version and dims
     assert_rejected(&patched(|b| b[0] = 9), 6, "version 9");
     assert_rejected(&patched(|b| b[4] = 7), 6, "dims 263");
-    // Rust only: flags and reserved fields C++ ignores must be zero
-    assert_rejected(&patched(|b| b[2] = 1), 6, "flags");
-    assert_rejected(&patched(|b| b[15] = 1), 6, "reserved");
-    assert_rejected(&patched(|b| b[24] = 1), 6, "reserved");
+}
+
+#[test]
+fn flags_and_reserved_fields_are_ignored() {
+    // parse_tivf_data reads and discards them; so does Rust
+    for at in [2, 3, 12, 15, 24, 31] {
+        let b = patched(|b| b[at] = 0xA5);
+        let v = TivfView::parse(&b, 6).unwrap_or_else(|e| panic!("byte {at}: {e}"));
+        assert_eq!(TlshIvf::from_index(&v), two_lists().ivf, "byte {at}");
+    }
 }
 
 #[test]
@@ -355,7 +361,7 @@ fn cell_lists_must_start_at_0_and_end_at_the_list_count() {
 }
 
 #[test]
-fn list_start_must_cover_the_rows_without_decreasing() {
+fn list_start_must_cover_the_rows() {
     assert_rejected(
         &patched(|b| put_u64(b, TWO_LISTS_START, 1)),
         6,
@@ -366,12 +372,12 @@ fn list_start_must_cover_the_rows_without_decreasing() {
         6,
         "do not cover the rows",
     );
-    // list_start = [0, 7, 6]: in range at both ends, decreasing between
-    assert_rejected(
-        &patched(|b| put_u64(b, TWO_LISTS_START + 8, 7)),
-        6,
-        "nondecreasing",
-    );
+    // list_start = [0, 7, 6]: in range at both ends, decreasing between,
+    // loads (the load is O(1) in the index size); check_index reports it
+    let b = patched(|b| put_u64(b, TWO_LISTS_START + 8, 7));
+    let v = TivfView::parse(&b, 6).unwrap();
+    assert_eq!(v.list_start(1), 7);
+    assert_invalid(&v, &two_lists().rows, "nondecreasing");
 }
 
 //

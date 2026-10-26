@@ -55,8 +55,8 @@
 //! # Validation
 //!
 //! [`TivfView::parse`] checks what C++ checks at load (header values,
-//! length, row count, the ends of `cell_lists` and `list_start`, and that
-//! `list_start` never decreases), which is O(lists). [`IvfIndex::validate`]
+//! length, row count, the ends of `cell_lists` and `list_start`), which is
+//! O(1). [`IvfIndex::validate`]
 //! checks the rest against the rows, O(n), and returns a [`ValidIvf`]; the
 //! hash set runs it lazily on first indexed use (controller ruling 5).
 //! [`check_invariant`] is the merge's coalescing invariant, a property of
@@ -64,8 +64,9 @@
 //!
 //! # Differences from the C++ library
 //!
-//! * `parse` rejects non-zero flags and reserved header fields, which
-//!   `parse_tivf_data` ignores.
+//! * `handle_tivf` also checks at load that `list_start` never
+//!   decreases, an O(lists) loop; `parse` does not (the owner's decision:
+//!   no validation pass at load).
 //! * C++ never checks the ids, `cell_lists` monotonicity, cells or radii of
 //!   a loaded index; Rust's `validate` does, so an inconsistent index is a
 //!   format error instead of a wrong (or out-of-bounds) search.
@@ -445,11 +446,10 @@ fn check_valid<I: IvfIndex + ?Sized>(ivf: &I, rows: &[[u8; DIGEST_LENGTH]]) -> R
     Ok(())
 }
 
-/// The checks `parse` makes beyond the header, which also bound every
-/// `list_range`: `cell_lists` runs from 0 to the list count and
-/// `list_start` from 0 to n without decreasing (C++ `parse_tivf_data` and
-/// `handle_tivf`).
-fn check_offsets<I: IvfIndex + ?Sized>(ivf: &I) -> Result<()> {
+/// The checks `parse` makes beyond the header, O(1): `cell_lists` runs
+/// from 0 to the list count and `list_start` from 0 to n (C++
+/// `parse_tivf_data` and `handle_tivf`).
+fn check_ends<I: IvfIndex + ?Sized>(ivf: &I) -> Result<()> {
     let (n, lists) = (ivf.n(), ivf.lists());
     if ivf.cell_lists(0) != 0 || ivf.cell_lists(CELL_COUNT) as usize != lists {
         return Err(Error::format(format!(
@@ -461,6 +461,13 @@ fn check_offsets<I: IvfIndex + ?Sized>(ivf: &I) -> Result<()> {
     if ivf.list_start(0) != 0 || ivf.list_start(lists) != n {
         return Err(Error::format("TIVF list offsets do not cover the rows"));
     }
+    Ok(())
+}
+
+/// [`check_ends`], and that `list_start` never decreases.
+fn check_offsets<I: IvfIndex + ?Sized>(ivf: &I) -> Result<()> {
+    check_ends(ivf)?;
+    let lists = ivf.lists();
     if (0..lists).any(|l| ivf.list_start(l) > ivf.list_start(l + 1)) {
         return Err(Error::format("TIVF list offsets are not nondecreasing"));
     }
@@ -625,16 +632,16 @@ pub struct TivfView<'a> {
 
 impl<'a> TivfView<'a> {
     /// Parse a `TIVF` payload over a section of `expected_n` rows (C++
-    /// `parse_tivf_data` and the checks of `handle_tivf`), in O(lists).
-    /// Errors are [`Error::Format`]:
+    /// `parse_tivf_data` and the checks of `handle_tivf`), in O(1): no
+    /// array is walked. Errors are [`Error::Format`]:
     ///
-    /// * fewer than 32 bytes, version other than 3, dims other than 256,
-    ///   non-zero flags or reserved fields;
+    /// * fewer than 32 bytes, version other than 3, dims other than 256;
     /// * a length other than [`tivf_len`]`(lists, n)`;
     /// * `n != expected_n`;
     /// * `cell_lists[0] != 0` or `cell_lists[CELL_COUNT] != lists`;
-    /// * `list_start[0] != 0`, `list_start[lists] != n`, or a decreasing
-    ///   `list_start`.
+    /// * `list_start[0] != 0` or `list_start[lists] != n`.
+    ///
+    /// The flags and reserved header fields are ignored, as C++ does.
     ///
     /// The ids and inner `cell_lists` entries are not looked at: call
     /// [`IvfIndex::validate`] before relying on them.
@@ -645,30 +652,19 @@ impl<'a> TivfView<'a> {
                 payload.len()
             )));
         };
+        // flags (offset 2) and the reserved fields (12, 24) are ignored
         let (version, rest) = header.split_first_chunk::<2>().expect("32 bytes");
-        let (flags, rest) = rest.split_first_chunk::<2>().expect("30 bytes");
-        let (dims, rest) = rest.split_first_chunk::<4>().expect("28 bytes");
+        let (dims, rest) = rest[2..].split_first_chunk::<4>().expect("28 bytes");
         let (lists, rest) = rest.split_first_chunk::<4>().expect("24 bytes");
-        let (reserved32, rest) = rest.split_first_chunk::<4>().expect("20 bytes");
-        let (n, rest) = rest.split_first_chunk::<8>().expect("16 bytes");
-        let (reserved64, _) = rest.split_first_chunk::<8>().expect("8 bytes");
+        let (n, _) = rest[4..].split_first_chunk::<8>().expect("16 bytes");
 
         let version = u16::from_le_bytes(*version);
         if version != TIVF_VERSION {
             return Err(Error::format(format!("unsupported TIVF version {version}")));
         }
-        let flags = u16::from_le_bytes(*flags);
-        if flags != 0 {
-            return Err(Error::format(format!(
-                "unsupported TIVF flags 0x{flags:04x}"
-            )));
-        }
         let dims = u32::from_le_bytes(*dims);
         if dims != TIVF_DIMS {
             return Err(Error::format(format!("unsupported TIVF dims {dims}")));
-        }
-        if *reserved32 != [0; 4] || *reserved64 != [0; 8] {
-            return Err(Error::format("TIVF reserved header fields are not zero"));
         }
         let lists = u32::from_le_bytes(*lists);
         let n = u64::from_le_bytes(*n);
@@ -699,7 +695,7 @@ impl<'a> TivfView<'a> {
                 "TIVF has {n} rows, expected {expected_n}"
             )));
         }
-        check_offsets(&v)?;
+        check_ends(&v)?;
         Ok(v)
     }
 }
