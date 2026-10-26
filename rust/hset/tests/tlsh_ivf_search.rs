@@ -9,7 +9,7 @@ use std::ops::Range;
 use hset::synth::SplitMix64;
 use hset::tlsh::TlshDigest;
 use hset::tlsh::ivf::search::{knn_ivf, list_bound};
-use hset::tlsh::ivf::{IvfIndex, TivfView, TlshIvf};
+use hset::tlsh::ivf::{TivfView, TlshIvf, check_index};
 use hset::tlsh::knn::{KnnStats, TlshMatch, knn_brute};
 use hset_testkit::tlsh::{
     Perturbation, cell_corpus, corpus, naive_knn, perturb_corpus, random_digest, sorted_rows,
@@ -130,16 +130,16 @@ fn test_queries(rows: &[[u8; 36]], seed: u64, n: usize) -> Vec<TlshDigest> {
 /// equal to brute force and to the naive specification.
 #[track_caller]
 fn assert_index_is_brute(ivf: &TlshIvf, rows: &[[u8; 36]], queries: &[TlshDigest]) {
-    let valid = ivf.validate(rows).expect("test index is valid");
+    check_index(&ivf, rows).expect("test index is valid");
     let payload = ivf.to_bytes();
     let view = TivfView::parse(&payload, rows.len() as u64).unwrap();
-    let valid_view = view.validate(rows).unwrap();
+    check_index(&view, rows).unwrap();
     for q in queries {
         for incl in [true, false] {
             let all = naive_knn(rows, q, usize::MAX, u32::MAX, incl);
             for k in [1, 5, 20] {
                 for t in [10, 30, 60, 100, 144, 400] {
-                    let fast = knn_ivf(&valid, q, k, t, incl, None);
+                    let fast = knn_ivf(&ivf, rows, q, k, t, incl, None).unwrap();
                     let brute = knn_brute(rows, q, k, t, incl);
                     assert_eq!(fast, brute, "q {} k {k} T {t} incl {incl}", q.to_hex());
                     let naive: Vec<TlshMatch> = all
@@ -149,7 +149,7 @@ fn assert_index_is_brute(ivf: &TlshIvf, rows: &[[u8; 36]], queries: &[TlshDigest
                         .take(k)
                         .collect();
                     assert_eq!(fast, naive);
-                    assert_eq!(knn_ivf(&valid_view, q, k, t, incl, None), fast);
+                    assert_eq!(knn_ivf(&view, rows, q, k, t, incl, None).unwrap(), fast);
                 }
             }
         }
@@ -281,14 +281,14 @@ fn index_is_exact_beyond_144() {
     let digests: Vec<TlshDigest> = rows.iter().map(|r| TlshDigest(*r)).collect();
     let q = perturb_corpus(6, &digests, 1, &Perturbation::body_only(0.2))[0];
     for ivf in [random_partition(&rows, 9), loose_partition(&rows, 10)] {
-        let valid = ivf.validate(&rows).unwrap();
-        let fast = knn_ivf(&valid, &q, 1000, 100_000, true, None);
+        check_index(&ivf, &rows).unwrap();
+        let fast = knn_ivf(&ivf, &rows, &q, 1000, 100_000, true, None).unwrap();
         assert_eq!(fast.len(), 1000);
         assert_eq!(fast, knn_brute(&rows, &q, 1000, 100_000, true));
-        let fast_x = knn_ivf(&valid, &q, 1000, 100_000, false, None);
+        let fast_x = knn_ivf(&ivf, &rows, &q, 1000, 100_000, false, None).unwrap();
         assert_eq!(fast_x, knn_brute(&rows, &q, 1000, 100_000, false));
         // every row, when k exceeds n
-        let all = knn_ivf(&valid, &q, rows.len() + 5, 100_000, true, None);
+        let all = knn_ivf(&ivf, &rows, &q, rows.len() + 5, 100_000, true, None).unwrap();
         assert_eq!(all, naive_knn(&rows, &q, usize::MAX, u32::MAX, true));
     }
 }
@@ -323,12 +323,12 @@ fn a_list_whose_bound_equals_max_distance_is_scanned() {
     let rows = test_rows(41);
     let ivf = pairs_partition(&rows);
     let multi = multi_list_rows(&ivf, &rows);
-    let valid = ivf.validate(&rows).unwrap();
+    check_index(&ivf, &rows).unwrap();
     assert!(multi.len() > 500, "{}", multi.len());
     for &i in &multi {
         let q = TlshDigest(rows[i]);
         for incl in [true, false] {
-            let r = knn_ivf(&valid, &q, 1, 0, incl, None);
+            let r = knn_ivf(&ivf, &rows, &q, 1, 0, incl, None).unwrap();
             assert_eq!(r.len(), 1, "row {i} incl {incl}");
             assert_eq!(r[0].distance, 0);
             assert_eq!(r, knn_brute(&rows, &q, 1, 0, incl), "row {i}");
@@ -343,7 +343,7 @@ fn index_with_two_row_lists_equals_brute_force_at_small_distances() {
     let rows = test_rows(43);
     let ivf = pairs_partition(&rows);
     let multi = multi_list_rows(&ivf, &rows);
-    let valid = ivf.validate(&rows).unwrap();
+    check_index(&ivf, &rows).unwrap();
     let members: Vec<TlshDigest> = multi
         .iter()
         .step_by(7)
@@ -360,7 +360,7 @@ fn index_with_two_row_lists_equals_brute_force_at_small_distances() {
         for incl in [true, false] {
             for k in [1, 2, 5] {
                 for t in [0, 1, 12] {
-                    let fast = knn_ivf(&valid, q, k, t, incl, None);
+                    let fast = knn_ivf(&ivf, &rows, q, k, t, incl, None).unwrap();
                     let brute = knn_brute(&rows, q, k, t, incl);
                     assert_eq!(fast, brute, "q {} k {k} T {t} incl {incl}", q.to_hex());
                 }
@@ -374,27 +374,42 @@ fn edge_cases_give_nothing_or_the_exact_member() {
     // C++ tlsh_ivf_knn_edge_cases
     let rows = test_rows(8);
     let ivf = random_partition(&rows, 8);
-    let valid = ivf.validate(&rows).unwrap();
+    check_index(&ivf, &rows).unwrap();
     let member = TlshDigest(rows[123]);
     let mut stats = KnnStats::default();
-    assert_eq!(knn_ivf(&valid, &member, 0, 100, true, Some(&mut stats)), []);
     assert_eq!(
-        knn_ivf(&valid, &TlshDigest::NULL, 5, 100, true, Some(&mut stats)),
+        knn_ivf(&ivf, &rows, &member, 0, 100, true, Some(&mut stats)).unwrap(),
+        []
+    );
+    assert_eq!(
+        knn_ivf(
+            &ivf,
+            &rows,
+            &TlshDigest::NULL,
+            5,
+            100,
+            true,
+            Some(&mut stats)
+        )
+        .unwrap(),
         []
     );
     // nothing visited for k 0 or a null query
     assert_eq!(stats, KnnStats::default());
 
     // exact member found at distance 0
-    let r = knn_ivf(&valid, &member, 1, 0, true, None);
+    let r = knn_ivf(&ivf, &rows, &member, 1, 0, true, None).unwrap();
     assert_eq!(r.len(), 1);
     assert_eq!(r[0].distance, 0);
     assert_eq!(rows[r[0].index as usize], rows[123]);
 
     // the index of no rows
     let empty = TlshIvf::empty();
-    let none = empty.validate(&[]).unwrap();
-    assert_eq!(knn_ivf(&none, &member, 5, 1000, true, Some(&mut stats)), []);
+    check_index(&empty, &[]).unwrap();
+    assert_eq!(
+        knn_ivf(&empty, &[], &member, 5, 1000, true, Some(&mut stats)).unwrap(),
+        []
+    );
     assert_eq!(stats, KnnStats::default());
 }
 
@@ -487,17 +502,35 @@ impl CounterIndex {
     /// counters, through the owned index and its payload (which must
     /// agree).
     fn search(&self, k: usize, t: u32) -> (Vec<(u32, TlshDigest)>, KnnStats) {
-        let valid = (&self.ivf).validate(&self.rows).unwrap();
+        check_index(&self.ivf, &self.rows).unwrap();
         let mut stats = KnnStats::default();
-        let m = knn_ivf(&valid, &self.query, k, t, true, Some(&mut stats));
+        let m = knn_ivf(
+            &self.ivf,
+            &self.rows,
+            &self.query,
+            k,
+            t,
+            true,
+            Some(&mut stats),
+        )
+        .unwrap();
         assert_eq!(m, knn_brute(&self.rows, &self.query, k, t, true));
 
         let payload = self.ivf.to_bytes();
         let view = TivfView::parse(&payload, self.rows.len() as u64).unwrap();
-        let valid = view.validate(&self.rows).unwrap();
+        check_index(&view, &self.rows).unwrap();
         let mut view_stats = KnnStats::default();
         assert_eq!(
-            knn_ivf(&valid, &self.query, k, t, true, Some(&mut view_stats)),
+            knn_ivf(
+                &view,
+                &self.rows,
+                &self.query,
+                k,
+                t,
+                true,
+                Some(&mut view_stats)
+            )
+            .unwrap(),
             m
         );
         assert_eq!(view_stats, stats);
@@ -605,9 +638,9 @@ fn counters_with_max_distance_0() {
 #[test]
 fn counters_add_to_what_they_hold() {
     let x = counter_index();
-    let valid = (&x.ivf).validate(&x.rows).unwrap();
+    check_index(&x.ivf, &x.rows).unwrap();
     let mut stats = counts(10, 20, 30);
-    knn_ivf(&valid, &x.query, 10, 50, true, Some(&mut stats));
+    knn_ivf(&x.ivf, &x.rows, &x.query, 10, 50, true, Some(&mut stats)).unwrap();
     assert_eq!(stats, counts(14, 24, 38));
 }
 
@@ -675,9 +708,7 @@ fn index_equals_brute_force_on_cpp_fixtures() {
             assert!(rest.is_empty(), "{name}: HDAT is not 36-byte rows");
             let view = TivfView::parse(tivf, rows.len() as u64)
                 .unwrap_or_else(|e| panic!("{name}: TIVF does not parse: {e}"));
-            let valid = view
-                .validate(rows)
-                .unwrap_or_else(|e| panic!("{name}: TIVF is invalid: {e}"));
+            check_index(&view, rows).unwrap_or_else(|e| panic!("{name}: TIVF is invalid: {e}"));
             sections += 1;
             if rows.is_empty() {
                 continue;
@@ -688,7 +719,7 @@ fn index_equals_brute_force_on_cpp_fixtures() {
                 for (k, t) in [(1, 30), (10, 144), (50, 400)] {
                     for incl in [true, false] {
                         assert_eq!(
-                            knn_ivf(&valid, q, k, t, incl, None),
+                            knn_ivf(&view, rows, q, k, t, incl, None).unwrap(),
                             knn_brute(rows, q, k, t, incl),
                             "{name}: q {} k {k} T {t} incl {incl}",
                             q.to_hex()

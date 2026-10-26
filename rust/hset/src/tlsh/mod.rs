@@ -8,7 +8,7 @@
 //! * [`cells`], [`order`], [`knn`]: the `0x7400` cell index, the header
 //!   cost order, and brute-force and cell kNN ([`knn_brute`]).
 //! * [`ivf`]: the `TIVF` index: its model ([`TlshIvf`], [`TivfView`],
-//!   [`ValidIvf`]), indexed kNN ([`knn_ivf`]), the BISECT build
+//!   [`check_index`]), indexed kNN ([`knn_ivf`]), the BISECT build
 //!   ([`build_tlsh_ivf`]) and the merge ([`merge_tlsh_ivf`]).
 //!
 //! A loaded file searches its TLSH sections through
@@ -40,7 +40,7 @@ pub use distance::{
     BodyQuery, body_diff, diff, emb_body_dist2, header_diff, l_cost, mod_diff, q_cost,
 };
 pub use ivf::{
-    IvfBuildOptions, IvfIndex, TivfView, TlshIvf, ValidIvf, build_tlsh_ivf, knn_ivf, list_bound,
+    IvfBuildOptions, IvfIndex, TivfView, TlshIvf, build_tlsh_ivf, check_index, knn_ivf, list_bound,
     merge_tlsh_ivf,
 };
 pub use knn::{KnnStats, TlshMatch, TopK, knn_brute, knn_cells};

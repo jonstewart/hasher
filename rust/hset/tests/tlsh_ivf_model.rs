@@ -7,7 +7,7 @@
 use hset::Error;
 use hset::tlsh::TlshDigest;
 use hset::tlsh::ivf;
-use hset::tlsh::ivf::{IvfIndex, TivfView, TlshIvf, check_invariant, tivf_len};
+use hset::tlsh::ivf::{IvfIndex, TivfView, TlshIvf, check_index, check_invariant, tivf_len};
 use proptest::prelude::*;
 
 // Layout (HASHSET_FORMAT, tlsh_ivf.cpp length_tivf_data): 32-byte header,
@@ -387,20 +387,16 @@ fn list_start_must_cover_the_rows() {
 #[test]
 fn a_hand_built_index_validates_owned_and_borrowed() {
     let h = two_lists();
-    let valid = (&h.ivf).validate(&h.rows).unwrap();
-    assert_same_index(&valid, &h.ivf);
-    assert_eq!(valid.rows(), &h.rows[..]);
-
+    check_index(&h.ivf, &h.rows).unwrap();
     let b = h.ivf.to_bytes();
     let view = TivfView::parse(&b, 6).unwrap();
-    let valid = view.validate(&h.rows).unwrap();
-    assert_same_index(&valid, &h.ivf);
-    assert_eq!(TlshIvf::from_index(valid.index()), h.ivf);
+    check_index(&view, &h.rows).unwrap();
+    assert_same_index(&view, &h.ivf);
 }
 
 #[test]
 fn the_empty_index_validates_over_no_rows() {
-    assert!(TlshIvf::empty().validate(&[]).is_ok());
+    assert!(check_index(&TlshIvf::empty(), &[]).is_ok());
 }
 
 #[test]
@@ -413,13 +409,13 @@ fn a_medoid_need_not_be_a_member() {
         2,
         &[digest(&[], &[]), digest(&[0], &[]), digest(&[1], &[])],
     )]);
-    assert!(h.ivf.validate(&h.rows).is_ok());
+    assert!(check_index(&h.ivf, &h.rows).is_ok());
 }
 
 /// `validate` fails with a format error mentioning `needle`.
 #[track_caller]
 fn assert_invalid(ivf: &impl IvfIndex, rows: &[[u8; 36]], needle: &str) {
-    match ivf.validate(rows) {
+    match check_index(&ivf, rows) {
         Err(Error::Format(msg)) => assert!(msg.contains(needle), "{msg:?} lacks {needle:?}"),
         Err(e) => panic!("expected a format error mentioning {needle:?}, got {e:?}"),
         Ok(_) => panic!("expected a format error mentioning {needle:?}, got a valid index"),
@@ -745,10 +741,10 @@ proptest! {
         coalesce in 0u32..12,
     ) {
         let ivf = reference_index(&rows, &labels, pick);
-        prop_assert!((&ivf).validate(&rows).is_ok());
+        prop_assert!(check_index(&ivf, &rows).is_ok());
         let b = ivf.to_bytes();
         let v = TivfView::parse(&b, rows.len() as u64).unwrap();
-        prop_assert!(v.validate(&rows).is_ok());
+        prop_assert!(check_index(&v, &rows).is_ok());
 
         // tlsh_ivf_check_invariant, counted list by list
         let half = u64::from(coalesce / 2);
@@ -781,7 +777,7 @@ proptest! {
             b[at] = *v;
         }
         if let Ok(v) = TivfView::parse(&b, ivf.n) {
-            let _ = v.validate(rows);
+            let _ = check_index(&v, rows);
             let _ = check_invariant(&v, 64);
         }
         // owned: offsets parse never saw
@@ -795,7 +791,7 @@ proptest! {
                 owned.list_start[at] = *v % 32;
             }
         }
-        let _ = (&owned).validate(rows);
+        let _ = check_index(&owned, rows);
     }
 
     #[test]
@@ -809,6 +805,6 @@ proptest! {
         let wide: Vec<usize> = (0..ivf.lists()).filter(|&l| ivf.radius2[l] > 0).collect();
         prop_assume!(!wide.is_empty());
         ivf.radius2[wide[which.index(wide.len())]] -= 1;
-        prop_assert!(matches!(ivf.validate(&rows), Err(Error::Format(_))));
+        prop_assert!(matches!(check_index(&ivf, &rows), Err(Error::Format(_))));
     }
 }

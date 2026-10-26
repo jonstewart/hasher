@@ -9,7 +9,7 @@
 
 use arbitrary::Arbitrary;
 use hset::tlsh::ivf::search::knn_ivf;
-use hset::tlsh::{DIGEST_LENGTH, IvfIndex, KnnStats, TlshDigest, ValidIvf, knn_brute};
+use hset::tlsh::{DIGEST_LENGTH, IvfIndex, KnnStats, TlshDigest, knn_brute};
 
 pub type Row = [u8; DIGEST_LENGTH];
 
@@ -79,8 +79,7 @@ impl QuerySpec {
 
 /// `knn_ivf` over the index returns exactly what `knn_brute` returns over
 /// its rows, for each of the first [`MAX_QUERIES`] queries.
-pub fn check_knn<I: IvfIndex>(ivf: &ValidIvf<'_, I>, queries: &[QuerySpec]) {
-    let rows = ivf.rows();
+pub fn check_knn<I: IvfIndex + ?Sized>(ivf: &I, rows: &[Row], queries: &[QuerySpec]) {
     for spec in queries.iter().take(MAX_QUERIES) {
         let q = spec.query(rows);
         let k = usize::from(spec.k % 12);
@@ -88,12 +87,14 @@ pub fn check_knn<I: IvfIndex>(ivf: &ValidIvf<'_, I>, queries: &[QuerySpec]) {
         let mut stats = KnnStats::default();
         let got = knn_ivf(
             ivf,
+            rows,
             &q,
             k,
             max_distance,
             spec.include_length,
             Some(&mut stats),
-        );
+        )
+        .expect("knn_ivf on a valid index");
         let want = knn_brute(rows, &q, k, max_distance, spec.include_length);
         assert_eq!(got, want, "knn_ivf != knn_brute for {q:?}, {spec:?}");
         assert!(stats.rows <= rows.len() as u64, "{stats:?}");

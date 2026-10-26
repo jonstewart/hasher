@@ -14,7 +14,7 @@
 //! (KMEANS is not built in Rust).
 
 use hset::tlsh::ivf::bisect::{IvfBuildOptions, build_tlsh_ivf};
-use hset::tlsh::ivf::{FLAT_MAX, IvfIndex, TARGET_LIST_SIZE, TlshIvf};
+use hset::tlsh::ivf::{FLAT_MAX, TARGET_LIST_SIZE, TlshIvf, check_index};
 use hset::tlsh::mt64::Mt19937_64;
 use sha2::{Digest, Sha256};
 
@@ -149,7 +149,7 @@ fn golden_bisect_small() {
         94,
         "bdc17ba69181cce3886aba9a75cfabf6eccdf442e5b58c29b36f1379218598be",
     );
-    (&ivf).validate(&rows).expect("valid");
+    check_index(&ivf, &rows).expect("valid");
 }
 
 #[test]
@@ -167,7 +167,7 @@ fn golden_bisect_large() {
         343,
         "b1bb7a6d494bef04007ac04832f89aa00552c11f2d1eb01d6c085d5f0bfe55bb",
     );
-    (&ivf).validate(&rows).expect("valid");
+    check_index(&ivf, &rows).expect("valid");
 }
 
 //
@@ -290,7 +290,7 @@ fn golden_bisect_shaped_cells() {
         305,
         "64db8bbfb78a9fbc4c9dcc2e9bc3cda12abbfcc04fa3010524b0d0741ed9e1e2",
     );
-    (&ivf).validate(&rows).expect("valid");
+    check_index(&ivf, &rows).expect("valid");
 }
 
 #[test]
@@ -310,7 +310,7 @@ fn golden_bisect_deep_cell() {
         283,
         "68688620e4f46a377ebc2356af2412fdd471ea024dc5d741a7db2a74efb84b46",
     );
-    (&ivf).validate(&rows).expect("valid");
+    check_index(&ivf, &rows).expect("valid");
 }
 
 //

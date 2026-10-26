@@ -35,7 +35,7 @@ use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_m
 use hset::synth::SplitMix64;
 use hset::tlsh::ivf::bisect::{IvfBuildOptions, build_tlsh_ivf};
 use hset::tlsh::ivf::search::knn_ivf;
-use hset::tlsh::{BodyQuery, IvfIndex, KnnStats, TlshDigest, knn_brute};
+use hset::tlsh::{BodyQuery, KnnStats, TlshDigest, check_index, knn_brute};
 use hset_testkit::tlsh::{corpus, sorted_rows};
 
 type Row = [u8; 36];
@@ -180,7 +180,7 @@ fn bench_tlsh(c: &mut Criterion) {
             t0.elapsed().as_secs_f64() * 1e3,
             ivf.lists()
         );
-        let valid = (&ivf).validate(&rows).unwrap();
+        check_index(&ivf, &rows).unwrap();
 
         // body kernel over every row: as a caller's loop compiles it, and
         // compiled for POPCNT as the crate's scans are
@@ -205,7 +205,8 @@ fn bench_tlsh(c: &mut Criterion) {
             let mut stats = KnnStats::default();
             for (qi, q) in qs.iter().enumerate() {
                 let brute = knn_brute(&rows, q, k, max_distance, true);
-                let ivf_hits = knn_ivf(&valid, q, k, max_distance, true, Some(&mut stats));
+                let ivf_hits =
+                    knn_ivf(&ivf, &rows, q, k, max_distance, true, Some(&mut stats)).unwrap();
                 assert_eq!(brute, ivf_hits, "{label} {wl} query {qi}");
             }
             let per = |x: u64| x / QUERIES as u64;
@@ -230,7 +231,7 @@ fn bench_tlsh(c: &mut Criterion) {
             g.bench_function(BenchmarkId::new("ivf", &label), |b| {
                 b.iter(|| {
                     for q in &qs {
-                        black_box(knn_ivf(&valid, q, k, max_distance, true, None));
+                        black_box(knn_ivf(&ivf, &rows, q, k, max_distance, true, None).unwrap());
                     }
                 })
             });

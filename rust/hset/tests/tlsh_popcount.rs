@@ -5,8 +5,8 @@
 //! kind, equal to a bucket-by-bucket reference.
 
 use hset::tlsh::distance::{Popcount, popcount, with_popcount};
-use hset::tlsh::ivf::IvfIndex;
 use hset::tlsh::ivf::bisect::{IvfBuildOptions, build_tlsh_ivf};
+use hset::tlsh::ivf::check_index;
 use hset::tlsh::ivf::search::knn_ivf;
 use hset::tlsh::knn::{knn_brute, knn_cells};
 use hset::tlsh::{TlshDigest, TlshMatch};
@@ -142,10 +142,10 @@ fn every_kernel_builds_the_same_index_and_searches_it_alike() {
     let ivf = build_tlsh_ivf(&rows, &opts).unwrap();
     let qs: Vec<TlshDigest> = (0..10).map(|i| TlshDigest(rows[i * 577])).collect();
     for p in KINDS {
-        let valid = with_popcount(p, || (&ivf).validate(&rows)).unwrap();
+        with_popcount(p, || check_index(&ivf, &rows)).unwrap();
         for q in &qs {
             let want = knn_brute(&rows, q, 20, 200, true);
-            let got = with_popcount(p, || knn_ivf(&valid, q, 20, 200, true, None));
+            let got = with_popcount(p, || knn_ivf(&ivf, &rows, q, 20, 200, true, None).unwrap());
             assert_eq!(got, want, "{p:?}");
         }
     }

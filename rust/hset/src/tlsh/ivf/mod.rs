@@ -335,39 +335,39 @@ pub trait IvfIndex {
     fn list_ids(&self, l: usize) -> impl Iterator<Item = u32> + '_ {
         self.list_range(l).map(move |i| self.id(i))
     }
-
-    /// Check the index against the `HDAT` rows it indexes and wrap it as a
-    /// [`ValidIvf`], or return the first problem as [`Error::Format`]
-    /// (controller ruling 5). Checks, in O(n + lists + CELL_COUNT):
-    ///
-    /// * [`check_layout`](Self::check_layout), `rows.len() == n`, and the
-    ///   offset checks of [`TivfView::parse`] (repeated, for owned indexes);
-    /// * the rows are sorted by cell, so each cell's rows are contiguous;
-    /// * `cell_lists` never decreases;
-    /// * no list is empty;
-    /// * every id is below `n`, ids ascend strictly within a list, and
-    ///   every row is in exactly one list;
-    /// * every member lies in its list's cell, so the lists of cell `c`
-    ///   hold exactly the rows of cell `c`;
-    /// * every member is within its list's `radius2` of the medoid
-    ///   ([`BodyQuery::emb_body`]). The medoid need not be a member.
-    ///
-    /// The coalescing invariant ([`check_invariant`]) is not required.
-    ///
-    /// Takes the index by value; pass `&index` to keep it.
-    fn validate(self, rows: &[[u8; DIGEST_LENGTH]]) -> Result<ValidIvf<'_, Self>>
-    where
-        Self: Sized,
-    {
-        popcount().scan(
-            #[inline(always)]
-            || check_valid(&self, rows),
-        )?;
-        Ok(ValidIvf { index: self, rows })
-    }
 }
 
-/// The checks of [`IvfIndex::validate`].
+/// Check the index against the `HDAT` rows it indexes, or return the
+/// first problem as [`Error::Format`]. Nothing requires this: the search
+/// and the merge bounds-check what they read and never panic on any
+/// index. It is the full structural check that [`Hashset::verify`]
+/// (`hset verify`) makes, in O(n + lists + CELL_COUNT):
+///
+/// * [`check_layout`](IvfIndex::check_layout), `rows.len() == n`, and the
+///   end checks of [`TivfView::parse`] (repeated, for owned indexes);
+/// * the rows are sorted by cell, so each cell's rows are contiguous;
+/// * `list_start` and `cell_lists` never decrease;
+/// * no list is empty;
+/// * every id is below `n`, ids ascend strictly within a list, and
+///   every row is in exactly one list;
+/// * every member lies in its list's cell, so the lists of cell `c`
+///   hold exactly the rows of cell `c`;
+/// * every member is within its list's `radius2` of the medoid
+///   ([`BodyQuery::emb_body`]). The medoid need not be a member.
+///
+/// An index that passes is searched exactly ([`knn_ivf`] equals
+/// [`knn_brute`](crate::tlsh::knn_brute)) and merges into one that passes.
+/// The coalescing invariant ([`check_invariant`]) is not required.
+///
+/// [`Hashset::verify`]: crate::Hashset::verify
+pub fn check_index<I: IvfIndex + ?Sized>(ivf: &I, rows: &[[u8; DIGEST_LENGTH]]) -> Result<()> {
+    popcount().scan(
+        #[inline(always)]
+        || check_valid(ivf, rows),
+    )
+}
+
+/// The checks of [`check_index`].
 #[inline(always)]
 fn check_valid<I: IvfIndex + ?Sized>(ivf: &I, rows: &[[u8; DIGEST_LENGTH]]) -> Result<()> {
     ivf.check_layout()?;
@@ -500,39 +500,6 @@ fn cell_of(row: &[u8; DIGEST_LENGTH]) -> u16 {
     TlshDigest(*row).cell()
 }
 
-/// An index that passed [`IvfIndex::validate`] against `rows()`, made only
-/// by `validate`. It implements [`IvfIndex`] by forwarding, and code taking
-/// one may rely on every check `validate` lists, in particular:
-///
-/// * `rows()` are the indexed rows, sorted by cell, `rows().len() == n`;
-/// * the members of the lists of cell `c` are exactly the rows of cell
-///   `c`, a contiguous range of `rows()`, so a cell with a single list
-///   holds the rows `ids[list_start[l]]..` in order;
-/// * every list is nonempty, ascending, and within `radius2` of its medoid;
-/// * all ranges are in bounds, so no accessor panics on them.
-#[derive(Clone, Copy, Debug)]
-pub struct ValidIvf<'r, I> {
-    index: I,
-    rows: &'r [[u8; DIGEST_LENGTH]],
-}
-
-impl<'r, I: IvfIndex> ValidIvf<'r, I> {
-    /// The validated index.
-    pub fn index(&self) -> &I {
-        &self.index
-    }
-
-    /// The rows it was validated against.
-    pub fn rows(&self) -> &'r [[u8; DIGEST_LENGTH]] {
-        self.rows
-    }
-
-    /// The index, without the guarantee.
-    pub fn into_inner(self) -> I {
-        self.index
-    }
-}
-
 impl<I: IvfIndex + ?Sized> IvfIndex for &I {
     fn n(&self) -> u64 {
         (**self).n()
@@ -557,33 +524,6 @@ impl<I: IvfIndex + ?Sized> IvfIndex for &I {
     }
     fn check_layout(&self) -> Result<()> {
         (**self).check_layout()
-    }
-}
-
-impl<I: IvfIndex> IvfIndex for ValidIvf<'_, I> {
-    fn n(&self) -> u64 {
-        self.index.n()
-    }
-    fn lists(&self) -> usize {
-        self.index.lists()
-    }
-    fn cell_lists(&self, c: usize) -> u32 {
-        self.index.cell_lists(c)
-    }
-    fn medoid(&self, l: usize) -> TlshDigest {
-        self.index.medoid(l)
-    }
-    fn radius2(&self, l: usize) -> u32 {
-        self.index.radius2(l)
-    }
-    fn list_start(&self, l: usize) -> u64 {
-        self.index.list_start(l)
-    }
-    fn id(&self, i: usize) -> u32 {
-        self.index.id(i)
-    }
-    fn check_layout(&self) -> Result<()> {
-        self.index.check_layout()
     }
 }
 

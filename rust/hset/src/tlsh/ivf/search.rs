@@ -19,7 +19,8 @@
 //!   applies to a cell's only list (the lists of a multi-list cell are
 //!   always bounded). Rust does the same and documents it so.
 
-use super::{IvfIndex, ValidIvf};
+use super::{IvfIndex, check_index};
+use crate::error::Result;
 use crate::key::prefetch;
 use crate::tlsh::digest::{DIGEST_LENGTH, TlshDigest};
 use crate::tlsh::distance::{BodyQuery, popcount};
@@ -95,34 +96,36 @@ pub fn list_bound(d2: u32, r2: u32) -> f32 {
 /// each single-list cell of at least [`MIN_BOUNDED_LIST`] rows (scanned
 /// or pruned), and `rows` the rows whose distance was computed. The visit
 /// order is C++'s, so the counts equal C++'s for the same index.
-pub fn knn_ivf<I: IvfIndex>(
-    ivf: &ValidIvf<'_, I>,
+pub fn knn_ivf<I: IvfIndex + ?Sized>(
+    ivf: &I,
+    rows: &[[u8; DIGEST_LENGTH]],
     q: &TlshDigest,
     k: usize,
     max_distance: u32,
     include_length: bool,
     stats: Option<&mut KnnStats>,
-) -> Vec<TlshMatch> {
-    if k == 0 || ivf.rows().is_empty() || q.is_null() {
-        return Vec::new();
+) -> Result<Vec<TlshMatch>> {
+    check_index(ivf, rows)?;
+    if k == 0 || rows.is_empty() || q.is_null() {
+        return Ok(Vec::new());
     }
-    popcount().scan(
+    Ok(popcount().scan(
         #[inline(always)]
-        || ivf_scan(ivf, q, k, max_distance, include_length, stats),
-    )
+        || ivf_scan(ivf, rows, q, k, max_distance, include_length, stats),
+    ))
 }
 
 /// The search of [`knn_ivf`], inlined into its `Popcount::scan` context.
 #[inline(always)]
-fn ivf_scan<I: IvfIndex>(
-    ivf: &ValidIvf<'_, I>,
+fn ivf_scan<I: IvfIndex + ?Sized>(
+    ivf: &I,
+    rows: &[[u8; DIGEST_LENGTH]],
     q: &TlshDigest,
     k: usize,
     max_distance: u32,
     include_length: bool,
     mut stats: Option<&mut KnnStats>,
 ) -> Vec<TlshMatch> {
-    let rows = ivf.rows();
     let order = HeaderOrder::new(q, include_length);
     let body = BodyQuery::new(q);
     let checksum = q.checksum();

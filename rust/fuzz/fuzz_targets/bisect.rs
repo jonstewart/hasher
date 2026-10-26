@@ -17,7 +17,7 @@ use common::{QuerySpec, Row, RowSpec, check_knn, sorted_rows};
 use hset::Error;
 use hset::tlsh::ivf::FLAT_MAX;
 use hset::tlsh::ivf::bisect::{IvfBuildOptions, build_tlsh_ivf};
-use hset::tlsh::{BodyQuery, IvfIndex, TivfView, TlshDigest, TlshIvf};
+use hset::tlsh::{BodyQuery, IvfIndex, TivfView, TlshDigest, TlshIvf, check_index};
 use libfuzzer_sys::fuzz_target;
 
 /// `big` selects a large case: the first row's cell gets this many rows
@@ -133,9 +133,9 @@ fuzz_target!(|case: BisectCase| {
     let bytes = ivf.to_bytes();
     let view = TivfView::parse(&bytes, rows.len() as u64).expect("own payload parses");
     assert_eq!(TlshIvf::from_index(&view), ivf);
-    let valid = view.validate(&rows).expect("a fresh build validates");
+    check_index(&view, &rows).expect("a fresh build validates");
     check_shape(&ivf, &rows, opts.target_list_size);
-    check_knn(&valid, &case.queries);
+    check_knn(&view, &rows, &case.queries);
 
     // Swap the first two rows that differ: no longer sorted.
     if let Some(i) = rows.windows(2).position(|w| w[0] != w[1]) {

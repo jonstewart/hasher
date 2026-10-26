@@ -42,7 +42,7 @@ use crate::hash_type::HashType;
 use crate::lookup::{self, Lookup, SearchConfig};
 use crate::tlsh::cells::{cell_index, cell_table};
 use crate::tlsh::{
-    DIGEST_LENGTH, IvfIndex, KnnStats, TivfView, TlshDigest, TlshMatch, ValidIvf, knn_brute,
+    DIGEST_LENGTH, IvfIndex, KnnStats, TivfView, TlshDigest, TlshMatch, check_index, knn_brute,
     knn_ivf,
 };
 
@@ -94,7 +94,7 @@ struct TlshPart<'a> {
     tivf: Option<TivfView<'a>>,
     /// The outcome of validating `tivf` against `rows`, on first use; the
     /// error as text, since [`Error`] is not `Clone`.
-    valid: OnceLock<std::result::Result<ValidIvf<'a, TivfView<'a>>, String>>,
+    valid: OnceLock<std::result::Result<(), String>>,
 }
 
 impl<'a> TlshPart<'a> {
@@ -355,16 +355,16 @@ impl<'a> Hashset<'a> {
     /// [`Error::Format`] when the index is not valid for the rows (ids out
     /// of range, repeated or missing, not ascending in a list, outside
     /// their list's cell, beyond their list's radius, an empty list, ...).
-    pub fn tlsh_index(&self, idx: usize) -> Result<Option<ValidIvf<'a, TivfView<'a>>>> {
+    pub fn tlsh_index(&self, idx: usize) -> Result<Option<TivfView<'a>>> {
         let part = self.tlsh_part(idx)?;
         let Some(view) = part.tivf else {
             return Ok(None);
         };
         let valid = part
             .valid
-            .get_or_init(|| view.validate(part.rows).map_err(|e| e.to_string()));
+            .get_or_init(|| check_index(&view, part.rows).map_err(|e| e.to_string()));
         match valid {
-            Ok(v) => Ok(Some(*v)),
+            Ok(()) => Ok(Some(view)),
             Err(e) => Err(Error::Format(format!(
                 "TIVF index of hash set {idx} ('{}'): {e}",
                 self.file.sections[idx].header.name
@@ -462,7 +462,7 @@ impl<'a> Hashset<'a> {
                         self.file.sections[idx].header.name
                     )));
                 };
-                Ok(knn_ivf(&ivf, q, k, max_distance, include_length, stats))
+                knn_ivf(&ivf, rows, q, k, max_distance, include_length, stats)
             }
         }
     }

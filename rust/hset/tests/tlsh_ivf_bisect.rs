@@ -7,7 +7,7 @@ use hset::Error;
 use hset::synth::SplitMix64;
 use hset::tlsh::CELL_COUNT;
 use hset::tlsh::ivf::bisect::{IvfBuildOptions, build_tlsh_ivf, nearer};
-use hset::tlsh::ivf::{FLAT_MAX, IvfIndex, TlshIvf};
+use hset::tlsh::ivf::{FLAT_MAX, IvfIndex, TlshIvf, check_index};
 use hset::tlsh::knn::{TlshMatch, knn_brute};
 use hset::tlsh::mt64::Mt19937_64;
 use hset::tlsh::{TlshDigest, body_diff, emb_body_dist2, header_diff};
@@ -51,7 +51,7 @@ fn one_row_is_one_list_of_radius_zero() {
     let cell = 0x4021;
     assert!(ivf.cell_lists[..=cell].iter().all(|&c| c == 0));
     assert!(ivf.cell_lists[cell + 1..].iter().all(|&c| c == 1));
-    (&ivf).validate(&rows).expect("valid");
+    check_index(&ivf, &rows).expect("valid");
 }
 
 #[test]
@@ -134,7 +134,7 @@ fn exactly_t_rows_are_one_list_about_their_one_center() {
     let ivf = build(rows, 32, 7);
     assert_eq!(ivf.lists(), 1);
     check_one_centers(&ivf, rows);
-    (&ivf).validate(rows).expect("valid");
+    check_index(&ivf, rows).expect("valid");
 }
 
 #[test]
@@ -259,7 +259,7 @@ fn fewer_bodies_than_lists_give_one_list_per_body() {
     assert_eq!(ivf.ids.len(), rows.len());
     assert_eq!(sizes(&ivf), vec![70, 70, 70]);
     assert_eq!(ivf.radius2, vec![0, 0, 0]);
-    (&ivf).validate(&rows).expect("valid");
+    check_index(&ivf, &rows).expect("valid");
 }
 
 #[test]
@@ -441,7 +441,7 @@ fn a_build_over_many_cells_is_a_valid_index() {
     assert_eq!(ivf.n, rows.len() as u64);
     assert!(ivf.lists() > 1);
     // lengths, offsets, each row once, ascending ids, cells, radii
-    (&ivf).validate(&rows).expect("valid");
+    check_index(&ivf, &rows).expect("valid");
     check_medoids_are_members(&ivf, &rows);
     check_bisect_shape(&ivf, 64);
 }
@@ -462,7 +462,7 @@ fn list_sizes_and_counts_are_bounded() {
         let ivf = build(&rows, t, 7);
         check_bisect_shape(&ivf, t as u64);
         check_one_centers(&ivf, &rows);
-        (&ivf).validate(&rows).expect("valid");
+        check_index(&ivf, &rows).expect("valid");
     }
 }
 
@@ -477,7 +477,7 @@ fn one_body_above_flat_max_ends_in_median_splits() {
     assert_eq!(sizes(&ivf), vec![2548, 2548]);
     check_bisect_shape(&ivf, 32);
     assert!(ivf.radius2.iter().all(|&r| r == 0));
-    (&ivf).validate(&rows).expect("valid");
+    check_index(&ivf, &rows).expect("valid");
 }
 
 /// Exact kNN over a valid index, written from the model alone (not
@@ -562,7 +562,7 @@ fn check_search_is_exact(ivf: &TlshIvf, rows: &[[u8; 36]], seed: u64, queries: u
 fn searching_a_built_index_equals_brute_force() {
     let rows = sorted_rows(&corpus(81, 6000));
     let ivf = build(&rows, 32, 7);
-    (&ivf).validate(&rows).expect("valid");
+    check_index(&ivf, &rows).expect("valid");
     check_search_is_exact(&ivf, &rows, 82, 20);
 }
 
@@ -576,7 +576,7 @@ fn one_cell_of_twenty_thousand_rows_is_split_and_searchable() {
     let ivf = build(&rows, 32, 7);
     assert_eq!(ivf.ids.len(), rows.len());
     check_bisect_shape(&ivf, 32);
-    (&ivf).validate(&rows).expect("every member within radius2");
+    check_index(&ivf, &rows).expect("every member within radius2");
     let scanned = check_search_is_exact(&ivf, &rows, 72, 5);
     // the radii prune: fewer rows scored than a scan of every query
     assert!(scanned < 2 * 5 * 6 * rows.len(), "scanned {scanned}");

@@ -7,7 +7,9 @@ use hset::SetOp;
 use hset::merge::{RowMerge, RowMode, merge_rows};
 use hset::synth::SplitMix64;
 use hset::tlsh::ivf::merge::merge_tlsh_ivf;
-use hset::tlsh::ivf::{DEFAULT_COALESCE, DROPPED, IvfIndex, TivfView, TlshIvf, check_invariant};
+use hset::tlsh::ivf::{
+    DEFAULT_COALESCE, DROPPED, IvfIndex, TivfView, TlshIvf, check_index, check_invariant,
+};
 use hset::tlsh::{BodyQuery, TlshDigest, emb_body_dist2};
 use hset_testkit::tlsh::{
     Perturbation, cell_corpus, naive_cell_index, perturb_corpus, sorted_rows,
@@ -121,8 +123,7 @@ impl HandCell {
     fn merged(&self, c: u32) -> TlshIvf {
         let map = self.identity();
         let m = merge_tlsh_ivf(Some((&self.ivf, &map[..])), NONE, &self.rows, c).unwrap();
-        (&m).validate(&self.rows)
-            .expect("a merge gives a valid index");
+        check_index(&m, &self.rows).expect("a merge gives a valid index");
         m
     }
 
@@ -250,7 +251,7 @@ fn a_list_that_loses_members_gets_its_radius_recomputed() {
     assert_eq!(m.medoids[1], m2);
     assert_eq!(m.radius2[1], 100);
     assert_eq!(list_ids(&m, 1).len(), 2);
-    (&m).validate(&kept).unwrap();
+    check_index(&m, &kept).unwrap();
 }
 
 #[test]
@@ -264,7 +265,7 @@ fn a_list_whose_members_all_drop_is_omitted() {
     assert_eq!(m.radius2, h.ivf.radius2[..2]);
     assert_eq!(m.cell_lists[CELL], 0);
     assert_eq!(m.cell_lists[CELL + 1], 2);
-    (&m).validate(&kept).unwrap();
+    check_index(&m, &kept).unwrap();
 }
 
 #[test]
@@ -389,7 +390,7 @@ fn a_cell_lists_the_left_sides_lists_then_the_right_sides() {
     assert_eq!(list_ids(&m, 0), h.ids[0]);
     assert_eq!(list_ids(&m, 1), h.ids[2]);
     assert_eq!(list_ids(&m, 2), h.ids[1]);
-    (&m).validate(&h.rows).unwrap();
+    check_index(&m, &h.rows).unwrap();
 
     // coalescing pairs the small lists across the sides
     let m = merge_tlsh_ivf(
@@ -471,9 +472,7 @@ fn random_index(rows: &[[u8; 36]], seed: u64, max_list: usize) -> TlshIvf {
         start = end;
     }
     ivf.cell_lists[CELLS] = ivf.lists() as u32;
-    (&ivf)
-        .validate(rows)
-        .expect("random_index builds valid indexes");
+    check_index(&ivf, rows).expect("random_index builds valid indexes");
     ivf
 }
 
@@ -514,7 +513,8 @@ fn merge_ivf(l: &Side, r: &Side, out: &[[u8; 36]], m: &RowMerge, c: u32) -> Tlsh
 /// coalescing invariant at `c`, and so at most `m / (c / 2) + 1` lists
 /// in a cell of `m` rows.
 fn check_merged(m: &TlshIvf, rows: &[[u8; 36]], c: u32) {
-    let v = m.validate(rows).expect("a merged index is valid");
+    check_index(m, rows).expect("a merged index is valid");
+    let v = m;
     for l in 0..v.lists() {
         let q = BodyQuery::new(&v.medoid(l));
         let exact = v.list_ids(l).map(|i| q.emb_body(&rows[i as usize])).max();

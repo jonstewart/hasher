@@ -23,10 +23,8 @@ use std::collections::BTreeMap;
 use arbitrary::Arbitrary;
 use common::{QuerySpec, Row, RowSpec, check_knn, sorted_rows};
 use hset::tlsh::ivf::merge::merge_tlsh_ivf;
-use hset::tlsh::ivf::{TIVF_HEADER_LENGTH, check_invariant, tivf_len};
-use hset::tlsh::{
-    BodyQuery, CELL_COUNT, DIGEST_LENGTH, IvfIndex, TivfView, TlshDigest, TlshIvf, ValidIvf,
-};
+use hset::tlsh::ivf::{TIVF_HEADER_LENGTH, check_index, check_invariant, tivf_len};
+use hset::tlsh::{BodyQuery, CELL_COUNT, DIGEST_LENGTH, TivfView, TlshDigest, TlshIvf};
 use libfuzzer_sys::fuzz_target;
 
 /// Most mutations applied to a structured payload.
@@ -207,7 +205,7 @@ fn padded(raw: &[u8]) -> Vec<u8> {
 /// The searches and merges of a parsed view, `valid` its validation.
 fn check_view(
     view: &TivfView<'_>,
-    valid: Result<ValidIvf<'_, TivfView<'_>>, hset::Error>,
+    valid: Result<(), hset::Error>,
     rows: &[Row],
     coalesce: u32,
     queries: &[QuerySpec],
@@ -215,16 +213,16 @@ fn check_view(
     let identity: Vec<u32> = (0..rows.len() as u32).collect();
     let none: Option<(&TlshIvf, &[u32])> = None;
     let merged = merge_tlsh_ivf(Some((view, &identity[..])), none, rows, coalesce);
-    let Ok(valid) = valid else {
+    if valid.is_err() {
         // Not a valid index: the merge may refuse it or produce an index
         // that fails validation, but it returned.
         return;
     };
-    check_knn(&valid, queries);
+    check_knn(view, rows, queries);
     let merged = merged.expect("identity merge of a valid index");
     let empty = TlshIvf::empty();
     let two_sided = merge_tlsh_ivf(
-        Some((valid.index(), &identity[..])),
+        Some((view, &identity[..])),
         Some((&empty, &[][..])),
         rows,
         coalesce,
@@ -232,10 +230,8 @@ fn check_view(
     .expect("merge with an empty side");
     assert_eq!(two_sided, merged, "an empty side changed the merge");
     assert!(check_invariant(&merged, coalesce), "coalescing invariant");
-    let merged = merged
-        .validate(rows)
-        .expect("the merge of a valid index validates");
-    check_knn(&merged, queries);
+    check_index(&merged, rows).expect("the merge of a valid index validates");
+    check_knn(&merged, rows, queries);
 }
 
 fuzz_target!(|case: TivfCase| {
@@ -262,7 +258,7 @@ fuzz_target!(|case: TivfCase| {
     };
     assert_eq!(TlshIvf::from_index(&view).to_bytes(), payload);
     let _ = check_invariant(&view, coalesce);
-    let valid = view.validate(&rows);
+    let valid = check_index(&view, &rows);
     if expect_valid {
         assert!(valid.is_ok(), "an unmutated, well-formed index: {valid:?}");
     }
