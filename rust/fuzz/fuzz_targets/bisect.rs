@@ -82,7 +82,7 @@ fn row_cells(rows: &[Row]) -> Vec<usize> {
 /// under the fuzzer's comparison tracing than the build does.
 fn check_shape(ivf: &TlshIvf, rows: &[Row], target: usize) {
     for c in row_cells(rows) {
-        let lists = ivf.cell_range(c);
+        let lists = ivf.cell_range(c).unwrap();
         let cell_rows: u64 = lists.clone().map(|l| ivf.list_len(l)).sum();
         if cell_rows as usize <= FLAT_MAX {
             assert!(
@@ -96,7 +96,7 @@ fn check_shape(ivf: &TlshIvf, rows: &[Row], target: usize) {
             let body = BodyQuery::new(&medoid);
             let mut is_member = false;
             let mut radius2 = 0;
-            for id in ivf.list_ids(l) {
+            for id in ivf.list_ids(l).unwrap() {
                 let row = &rows[id as usize];
                 is_member |= *row == medoid.0;
                 radius2 = radius2.max(body.emb_body(row));

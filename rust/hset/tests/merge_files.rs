@@ -418,6 +418,7 @@ fn check_tlsh_section(hs: &Hashset, t: usize, want_idx: bool, merged_index: bool
         let m = ivf.medoid(l);
         let tight = ivf
             .list_ids(l)
+            .unwrap()
             .map(|id| emb_body_dist2(&m, &TlshDigest(rows[id as usize])))
             .max()
             .unwrap();

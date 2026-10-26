@@ -734,3 +734,180 @@ fn index_equals_brute_force_on_cpp_fixtures() {
         dir.display()
     );
 }
+
+//
+// corrupt indexes: no validation, bounds-checked accesses (C++ trusts the
+// index; Rust never panics on one, and reports an access out of bounds)
+//
+
+/// A search that visits every cell and scans every list: k and the bound
+/// are unlimited, so the bound never prunes.
+fn search_all(ivf: &TlshIvf, rows: &[[u8; 36]]) -> hset::Result<Vec<TlshMatch>> {
+    let q = TlshDigest(rows[0]);
+    let owned = knn_ivf(ivf, rows, &q, usize::MAX, u32::MAX, true, None);
+    // the same through the payload, when it still parses
+    if ivf.ids.len() as u64 == ivf.n
+        && ivf.medoids.len() == ivf.radius2.len()
+        && ivf.list_start.len() == ivf.radius2.len() + 1
+        && ivf.cell_lists.len() == CELLS + 1
+    {
+        let payload = ivf.to_bytes();
+        if let Ok(view) = TivfView::parse(&payload, rows.len() as u64) {
+            let borrowed = knn_ivf(&view, rows, &q, usize::MAX, u32::MAX, true, None);
+            assert_eq!(
+                format!("{borrowed:?}"),
+                format!("{owned:?}"),
+                "view and owned index differ"
+            );
+        }
+    }
+    owned
+}
+
+/// `search_all` fails with a format error mentioning `needle`.
+#[track_caller]
+fn assert_search_error(ivf: &TlshIvf, rows: &[[u8; 36]], needle: &str) {
+    match search_all(ivf, rows) {
+        Err(hset::Error::Format(msg)) => assert!(msg.contains(needle), "{msg:?} lacks {needle:?}"),
+        other => panic!("expected a format error mentioning {needle:?}, got {other:?}"),
+    }
+}
+
+/// Rows and their pairs partition, with the first list of a cell of
+/// several lists and the list of a single-list cell of two rows.
+fn corruptible() -> (Vec<[u8; 36]>, TlshIvf, usize, usize) {
+    let rows = test_rows(51);
+    let ivf = pairs_partition(&rows);
+    let cell_len = |c: usize| ivf.cell_lists[c + 1] - ivf.cell_lists[c];
+    let multi = (0..CELLS).find(|&c| cell_len(c) > 1).unwrap();
+    let single = (0..CELLS)
+        .find(|&c| {
+            let l = ivf.cell_lists[c] as usize;
+            cell_len(c) == 1 && ivf.list_start[l + 1] - ivf.list_start[l] == 2
+        })
+        .unwrap();
+    let (m, s) = (ivf.cell_lists[multi], ivf.cell_lists[single]);
+    (rows, ivf, m as usize, s as usize)
+}
+
+#[test]
+fn the_corruptible_index_searches_exactly() {
+    let (rows, ivf, _, _) = corruptible();
+    check_index(&ivf, &rows).unwrap();
+    assert_eq!(
+        search_all(&ivf, &rows).unwrap(),
+        naive_knn(&rows, &TlshDigest(rows[0]), usize::MAX, u32::MAX, true)
+    );
+}
+
+#[test]
+fn an_id_past_the_rows_in_a_multi_list_cell_is_a_format_error() {
+    let (rows, mut ivf, m, _) = corruptible();
+    let at = ivf.list_start[m] as usize + 1;
+    ivf.ids[at] = 4_000_000;
+    assert_search_error(
+        &ivf,
+        &rows,
+        &format!(
+            "TIVF list {m} has id 4000000 out of range for {} rows",
+            rows.len()
+        ),
+    );
+    // the prefetch reads ids 8 ahead of the scan: an id past the rows there
+    // is still reported (not read) only when the scan reaches it
+    ivf.ids[at] = u32::MAX;
+    assert_search_error(&ivf, &rows, "out of range");
+}
+
+#[test]
+fn a_single_list_cell_whose_rows_run_past_the_end_is_a_format_error() {
+    // the fast path scans rows ids[lb]..ids[lb] + count
+    let (rows, mut ivf, _, s) = corruptible();
+    let at = ivf.list_start[s] as usize;
+    ivf.ids[at] = rows.len() as u32 - 1;
+    assert_search_error(&ivf, &rows, &format!("TIVF list {s} covers rows"));
+    ivf.ids[at] = u32::MAX;
+    assert_search_error(&ivf, &rows, &format!("TIVF list {s} covers rows"));
+}
+
+#[test]
+fn cell_lists_out_of_order_or_past_the_lists_are_a_format_error() {
+    let (rows, ivf, m, _) = corruptible();
+    let c = cell_of(&rows[ivf.ids[ivf.list_start[m] as usize] as usize]);
+    let mut bad = ivf.clone();
+    bad.cell_lists[c] = bad.cell_lists[c + 1] + 1;
+    assert_search_error(&bad, &rows, "cell_lists decreases");
+    let mut bad = ivf.clone();
+    bad.cell_lists[c + 1] = ivf.lists() as u32 + 1;
+    assert_search_error(&bad, &rows, "past the");
+}
+
+#[test]
+fn list_start_out_of_order_or_past_the_ids_is_a_format_error() {
+    let (rows, ivf, m, s) = corruptible();
+    for l in [m, s] {
+        let mut bad = ivf.clone();
+        bad.list_start[l + 1] = bad.list_start[l] - 1;
+        assert_search_error(&bad, &rows, &format!("TIVF list {l} "));
+        let mut bad = ivf.clone();
+        bad.list_start[l + 1] = rows.len() as u64 + 1;
+        assert_search_error(&bad, &rows, &format!("TIVF list {l} "));
+    }
+}
+
+#[test]
+fn an_owned_index_of_inconsistent_lengths_or_rows_is_a_format_error() {
+    let (rows, ivf, _, _) = corruptible();
+    let mut bad = ivf.clone();
+    bad.ids.pop();
+    assert_search_error(&bad, &rows, "ids has");
+    let mut bad = ivf.clone();
+    bad.cell_lists.pop();
+    assert_search_error(&bad, &rows, "cell_lists has");
+    let mut bad = ivf.clone();
+    bad.medoids.pop();
+    assert_search_error(&bad, &rows, "medoids has");
+    assert_search_error(&ivf, &rows[1..], "rows");
+}
+
+/// A change to an index.
+type Patch = Box<dyn Fn(&mut TlshIvf)>;
+
+#[test]
+fn an_index_with_in_bounds_corruption_searches_without_error() {
+    // what check_index reports but the search does not look for: results
+    // may be inexact (as in C++), but the search returns
+    let (rows, ivf, m, s) = corruptible();
+    let mut patches: Vec<Patch> = vec![
+        // too small a radius: lists are pruned that hold matches
+        Box::new(|x| x.radius2.fill(0)),
+        // a row twice, another never
+        Box::new(move |x| x.ids[x.list_start[m] as usize] = x.ids[x.list_start[m] as usize + 1]),
+        // ids descending within a list
+        Box::new(move |x| {
+            x.ids
+                .swap(x.list_start[m] as usize, x.list_start[m] as usize + 1)
+        }),
+        // a member of another cell
+        Box::new(move |x| x.ids[x.list_start[m] as usize] = 0),
+        // a medoid far from its list
+        Box::new(|x| {
+            x.medoids
+                .fill(TlshDigest::from_parts(0, 0, 0, 0, &[3; 128]))
+        }),
+    ];
+    // an empty single-list cell: the list's rows go to its neighbour
+    patches.push(Box::new(move |x| x.list_start[s + 1] = x.list_start[s]));
+    patches.push(Box::new(move |x| x.list_start[s] = x.list_start[s + 1]));
+    for (i, patch) in patches.iter().enumerate() {
+        let mut bad = ivf.clone();
+        patch(&mut bad);
+        assert!(check_index(&bad, &rows).is_err(), "patch {i} is corruption");
+        let got = search_all(&bad, &rows).unwrap_or_else(|e| panic!("patch {i}: {e}"));
+        assert!(got.len() <= rows.len() * 2, "patch {i}");
+        let q = TlshDigest(rows[0]);
+        for (k, t) in [(1, 0), (5, 100), (50, 300)] {
+            knn_ivf(&bad, &rows, &q, k, t, true, None).unwrap_or_else(|e| panic!("patch {i}: {e}"));
+        }
+    }
+}

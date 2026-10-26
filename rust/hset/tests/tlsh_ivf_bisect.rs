@@ -99,6 +99,7 @@ fn defaults_are_the_cpp_defaults() {
 /// `l` (C++ `max_dist2_about`).
 fn max_dist2_about(ivf: &TlshIvf, rows: &[[u8; 36]], l: usize, c: &TlshDigest) -> u32 {
     ivf.list_ids(l)
+        .unwrap()
         .map(|i| emb_body_dist2(c, &TlshDigest(rows[i as usize])))
         .max()
         .unwrap_or(0)
@@ -111,7 +112,7 @@ fn check_one_centers(ivf: &TlshIvf, rows: &[[u8; 36]]) {
     for l in 0..ivf.lists() {
         let mut member = false;
         let mut best = u32::MAX;
-        for i in ivf.list_ids(l) {
+        for i in ivf.list_ids(l).unwrap() {
             let r = TlshDigest(rows[i as usize]);
             member |= r == ivf.medoids[l];
             best = best.min(max_dist2_about(ivf, rows, l, &r));
@@ -334,6 +335,7 @@ fn families_come_out_as_pure_lists() {
             assert_eq!(ivf.list_len(l), 30);
             let fams: Vec<usize> = ivf
                 .list_ids(l)
+                .unwrap()
                 .map(|i| family_of(&rows[i as usize]))
                 .collect();
             assert!(
@@ -386,9 +388,10 @@ fn rows_go_to_the_nearest_mean_not_the_nearest_medoid() {
         let ivf = build(&rows, 16, seed);
         assert_eq!(ivf.lists(), 2, "seed {seed}");
         for l in 0..2 {
-            let has_t = ivf.list_ids(l).any(|i| rows[i as usize] == t);
+            let has_t = ivf.list_ids(l).unwrap().any(|i| rows[i as usize] == t);
             let copies_of_f = ivf
                 .list_ids(l)
+                .unwrap()
                 .filter(|&i| d(&rows[i as usize], &f) == 0)
                 .count();
             assert_eq!(ivf.list_len(l), if has_t { 7 } else { 16 }, "seed {seed}");
@@ -427,6 +430,7 @@ fn check_medoids_are_members(ivf: &TlshIvf, rows: &[[u8; 36]]) {
     for l in 0..ivf.lists() {
         assert!(
             ivf.list_ids(l)
+                .unwrap()
                 .any(|i| TlshDigest(rows[i as usize]) == ivf.medoids[l]),
             "list {l}: medoid is not a member"
         );
@@ -499,7 +503,7 @@ fn ivf_knn(
     let mut found = Vec::new();
     let mut scanned = 0;
     for c in 0..CELL_COUNT {
-        let lists = ivf.cell_range(c);
+        let lists = ivf.cell_range(c).unwrap();
         if lists.is_empty() {
             continue;
         }
@@ -515,7 +519,7 @@ fn ivf_knn(
             if f64::from(header) + bound > f64::from(max_distance) {
                 continue;
             }
-            for i in ivf.list_ids(l) {
+            for i in ivf.list_ids(l).unwrap() {
                 scanned += 1;
                 let r = TlshDigest(rows[i as usize]);
                 let distance = header_diff(q, &r, include_length) + body_diff(q, &r);

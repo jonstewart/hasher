@@ -254,14 +254,14 @@ fn the_range_helpers_slice_cells_and_lists() {
     let ivf = two_lists().ivf;
     let b = ivf.to_bytes();
     let v = TivfView::parse(&b, 6).unwrap();
-    assert_eq!(v.cell_range(CELL), 0..2);
-    assert_eq!(v.cell_range(CELL - 1), 0..0);
-    assert_eq!(v.cell_range(CELL + 1), 2..2);
-    assert_eq!(v.list_range(0), 0..3);
-    assert_eq!(v.list_range(1), 3..6);
+    assert_eq!(v.cell_range(CELL).unwrap(), 0..2);
+    assert_eq!(v.cell_range(CELL - 1).unwrap(), 0..0);
+    assert_eq!(v.cell_range(CELL + 1).unwrap(), 2..2);
+    assert_eq!(v.list_range(0).unwrap(), 0..3);
+    assert_eq!(v.list_range(1).unwrap(), 3..6);
     assert_eq!(v.list_len(1), 3);
-    assert_eq!(v.list_ids(0).collect::<Vec<_>>(), [0, 4, 5]);
-    assert_eq!(ivf.list_ids(1).collect::<Vec<_>>(), [1, 2, 3]);
+    assert_eq!(v.list_ids(0).unwrap().collect::<Vec<_>>(), [0, 4, 5]);
+    assert_eq!(ivf.list_ids(1).unwrap().collect::<Vec<_>>(), [1, 2, 3]);
 }
 
 #[test]

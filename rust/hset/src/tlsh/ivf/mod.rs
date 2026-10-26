@@ -311,17 +311,42 @@ pub trait IvfIndex {
     fn check_layout(&self) -> Result<()>;
 
     /// The lists of cell `c` (`c < CELL_COUNT`):
-    /// `cell_lists[c]..cell_lists[c + 1]`, clamped into `0..lists()`.
-    fn cell_range(&self, c: usize) -> Range<usize> {
-        let end = (self.cell_lists(c + 1) as usize).min(self.lists());
-        (self.cell_lists(c) as usize).min(end)..end
+    /// `cell_lists[c]..cell_lists[c + 1]`, or a format error when that
+    /// range is inverted or runs past `lists()`. Two comparisons, no walk.
+    fn cell_range(&self, c: usize) -> Result<Range<usize>> {
+        let (start, end) = (self.cell_lists(c) as usize, self.cell_lists(c + 1) as usize);
+        if start > end {
+            return Err(Error::format(format!(
+                "TIVF cell_lists decreases from {start} to {end} after cell 0x{c:04x}"
+            )));
+        }
+        if end > self.lists() {
+            return Err(Error::format(format!(
+                "TIVF lists of cell 0x{c:04x} end at {end}, past the {} lists",
+                self.lists()
+            )));
+        }
+        Ok(start..end)
     }
 
-    /// The positions in `ids` of list `l`'s members:
-    /// `list_start[l]..list_start[l + 1]`, clamped into `0..n`.
-    fn list_range(&self, l: usize) -> Range<usize> {
-        let end = self.list_start(l + 1).min(self.n()) as usize;
-        (self.list_start(l) as usize).min(end)..end
+    /// The positions in `ids` of list `l`'s members (`l < lists()`):
+    /// `list_start[l]..list_start[l + 1]`, or a format error when that
+    /// range is inverted or runs past `n`. Two comparisons, no walk.
+    fn list_range(&self, l: usize) -> Result<Range<usize>> {
+        let (start, end) = (self.list_start(l), self.list_start(l + 1));
+        if start > end {
+            return Err(Error::format(format!(
+                "TIVF list {l} starts at {start}, after its end {end}"
+            )));
+        }
+        if end > self.n() {
+            return Err(Error::format(format!(
+                "TIVF list {l} ends at {end}, past the {} ids",
+                self.n()
+            )));
+        }
+        // end <= n, and n ids are in memory (check_layout)
+        Ok(start as usize..end as usize)
     }
 
     /// Number of members of list `l`, `list_start[l + 1] - list_start[l]`
@@ -331,9 +356,9 @@ pub trait IvfIndex {
     }
 
     /// The row indexes of list `l`'s members, in `ids` order (ascending on
-    /// a valid index).
-    fn list_ids(&self, l: usize) -> impl Iterator<Item = u32> + '_ {
-        self.list_range(l).map(move |i| self.id(i))
+    /// a valid index), or the error of [`list_range`](Self::list_range).
+    fn list_ids(&self, l: usize) -> Result<impl Iterator<Item = u32> + '_> {
+        Ok(self.list_range(l)?.map(move |i| self.id(i)))
     }
 }
 
@@ -399,18 +424,17 @@ fn check_valid<I: IvfIndex + ?Sized>(ivf: &I, rows: &[[u8; DIGEST_LENGTH]]) -> R
         }
     }
 
-    // From here every cell_range lies in 0..lists and every list_range in
-    // 0..n. n distinct ids below n: every row exactly once.
+    // n distinct ids below n: every row exactly once.
     let mut seen = vec![0u64; rows.len().div_ceil(64)];
     for c in 0..CELL_COUNT {
-        for l in ivf.cell_range(c) {
+        for l in ivf.cell_range(c)? {
             if ivf.list_len(l) == 0 {
                 return Err(Error::format(format!("TIVF list {l} is empty")));
             }
             let medoid = BodyQuery::new(&ivf.medoid(l));
             let radius2 = ivf.radius2(l);
             let mut prev = None;
-            for i in ivf.list_range(l) {
+            for i in ivf.list_range(l)? {
                 let id = ivf.id(i);
                 let Some(row) = rows.get(id as usize) else {
                     return Err(Error::format(format!(
@@ -480,19 +504,19 @@ fn check_offsets<I: IvfIndex + ?Sized>(ivf: &I) -> Result<()> {
 /// and for an index with no lists. A merge with threshold `C` leaves it
 /// true; a fresh BISECT build need not satisfy it.
 ///
-/// Never panics on a parsed view, validated or not (the walk uses the
-/// clamped [`IvfIndex::cell_range`]).
+/// False when the arrays have the wrong lengths
+/// ([`IvfIndex::check_layout`]) or a cell's range of lists is out of
+/// bounds ([`IvfIndex::cell_range`]); never panics.
 pub fn check_invariant<I: IvfIndex + ?Sized>(ivf: &I, coalesce_threshold: u32) -> bool {
     let half = u64::from(coalesce_threshold / 2);
     if half == 0 {
         return true;
     }
-    (0..CELL_COUNT).all(|c| {
-        ivf.cell_range(c)
-            .filter(|&l| ivf.list_len(l) < half)
-            .nth(1)
-            .is_none()
-    })
+    ivf.check_layout().is_ok()
+        && (0..CELL_COUNT).all(|c| {
+            ivf.cell_range(c)
+                .is_ok_and(|lists| lists.filter(|&l| ivf.list_len(l) < half).nth(1).is_none())
+        })
 }
 
 /// The cell of a raw row.

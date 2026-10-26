@@ -155,7 +155,7 @@ impl HandCell {
 }
 
 fn list_ids(ivf: &TlshIvf, l: usize) -> Vec<u32> {
-    ivf.list_ids(l).collect()
+    ivf.list_ids(l).unwrap().collect()
 }
 
 fn sorted_union(a: &[u32], b: &[u32]) -> Vec<u32> {
@@ -517,7 +517,11 @@ fn check_merged(m: &TlshIvf, rows: &[[u8; 36]], c: u32) {
     let v = m;
     for l in 0..v.lists() {
         let q = BodyQuery::new(&v.medoid(l));
-        let exact = v.list_ids(l).map(|i| q.emb_body(&rows[i as usize])).max();
+        let exact = v
+            .list_ids(l)
+            .unwrap()
+            .map(|i| q.emb_body(&rows[i as usize]))
+            .max();
         assert_eq!(exact, Some(v.radius2(l)), "list {l} radius is not exact");
     }
     assert!(check_invariant(&v, c), "coalescing invariant at C = {c}");
@@ -526,7 +530,7 @@ fn check_merged(m: &TlshIvf, rows: &[[u8; 36]], c: u32) {
         let cells = naive_cell_index(rows);
         for cell in 0..CELLS {
             let rows_in = (cells[cell + 1] - cells[cell]) as usize;
-            let lists = v.cell_range(cell).len();
+            let lists = v.cell_range(cell).unwrap().len();
             if rows_in > 0 {
                 assert!(
                     lists <= rows_in / half + 1,

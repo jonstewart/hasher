@@ -173,14 +173,14 @@ fn gather<I: IvfIndex + ?Sized>(
     rows: &[[u8; DIGEST_LENGTH]],
     cell: &mut Vec<MergeList>,
 ) -> Result<()> {
-    for l in index.cell_range(c) {
+    for l in index.cell_range(c)? {
         let mut m = MergeList {
             medoid: index.medoid(l),
             radius2: index.radius2(l),
             ids: Vec::new(),
         };
         let mut shrunk = false;
-        for id in index.list_ids(l) {
+        for id in index.list_ids(l)? {
             let Some(&out) = map.get(id as usize) else {
                 return Err(Error::format(format!(
                     "TIVF list {l} has id {id} out of range for {} rows",
