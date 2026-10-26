@@ -1,5 +1,5 @@
 //! The TIVF inverted-file index over a TLSH hash set: its in-memory model,
-//! the on-disk chunk payload, and validation. C++: `include/hashset/
+//! the on-disk chunk payload, and its structural check. C++: `include/hashset/
 //! tlsh_ivf.h`, `src/lib/hashset/tlsh_ivf.cpp`; docs/TLSH_EMBEDDING.md
 //! section 3.
 //!
@@ -52,24 +52,30 @@
 //! [`TivfView`] borrows them from a payload, as mapped from a file. Both
 //! implement [`IvfIndex`], the read interface the search and the merge take.
 //!
-//! # Validation
+//! # Checks
 //!
-//! [`TivfView::parse`] checks what C++ checks at load (header values,
-//! length, row count, the ends of `cell_lists` and `list_start`), which is
-//! O(1). [`IvfIndex::validate`]
-//! checks the rest against the rows, O(n), and returns a [`ValidIvf`]; the
-//! hash set runs it lazily on first indexed use (controller ruling 5).
-//! [`check_invariant`] is the merge's coalescing invariant, a property of
-//! good indexes rather than a validity condition.
+//! An index is never validated as a step before use. [`TivfView::parse`]
+//! checks what C++ checks at load (header values, length, row count, the
+//! ends of `cell_lists` and `list_start`), in O(1). The search
+//! ([`knn_ivf`]) and the merge ([`merge_tlsh_ivf`]) read the index as C++
+//! does and bounds-check each read with [`IvfIndex::cell_range`],
+//! [`IvfIndex::list_range`] and checked row access: an index out of
+//! bounds where they read it is an [`Error::Format`], one corrupt within
+//! bounds an inexact answer (as in C++), never a panic. [`check_index`] is
+//! the full structural check against the rows, O(n), run only on request
+//! (`Hashset::verify`, `hset verify`). [`check_invariant`] is the merge's
+//! coalescing invariant, a property of good indexes rather than a validity
+//! condition.
 //!
 //! # Differences from the C++ library
 //!
 //! * `handle_tivf` also checks at load that `list_start` never
-//!   decreases, an O(lists) loop; `parse` does not (the owner's decision:
-//!   no validation pass at load).
-//! * C++ never checks the ids, `cell_lists` monotonicity, cells or radii of
-//!   a loaded index; Rust's `validate` does, so an inconsistent index is a
-//!   format error instead of a wrong (or out-of-bounds) search.
+//!   decreases, an O(lists) loop; `parse` does not (no pass over the
+//!   index at load). The search and the merge find an inverted list range
+//!   where they read it.
+//! * C++ reads a loaded index unchecked; Rust bounds-checks the reads, so
+//!   an index out of bounds is a format error instead of undefined
+//!   behaviour.
 //! * A hash set without an index has no `TivfView` (C++ uses an empty
 //!   `TlshIvfView`); [`TlshIvf::empty`] is the index of no rows.
 
@@ -137,9 +143,10 @@ pub const fn tivf_len(lists: u32, n: u64) -> u64 {
 /// An owned TIVF index (C++ `TlshIvf`); see the [module docs](self).
 ///
 /// The fields are public so builders can fill them; the list count is
-/// `radius2.len()`. Nothing is checked on construction:
-/// [`IvfIndex::validate`] checks an index against its rows, and
-/// [`TlshIvf::to_bytes`] panics on arrays of inconsistent lengths.
+/// `radius2.len()`. Nothing is checked on construction: the search and the
+/// merge check the lengths ([`IvfIndex::check_layout`]) and bounds-check
+/// what they read, [`check_index`] checks an index fully against its rows,
+/// and [`TlshIvf::to_bytes`] panics on arrays of inconsistent lengths.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TlshIvf {
     /// Rows indexed: the `HDAT` row count.
@@ -265,9 +272,9 @@ impl TlshIvf {
 
 /// Read access to a TIVF index, owned ([`TlshIvf`]) or borrowed from a
 /// payload ([`TivfView`]), entry by entry; the arrays are those of the
-/// [module docs](self). The search, the merge and validation are written
-/// against this trait, so they take either kind, a reference to one, or a
-/// [`ValidIvf`].
+/// [module docs](self). The search, the merge and [`check_index`] are
+/// written against this trait, so they take either kind or a reference to
+/// one.
 ///
 /// The accessors take indexes into the arrays: `c` in `0..=CELL_COUNT`,
 /// `l` in `0..lists()` (`0..=lists()` for [`list_start`](Self::list_start)),
@@ -276,16 +283,18 @@ impl TlshIvf {
 /// depends on the index:
 ///
 /// * after [`TivfView::parse`]: the array lengths, `cell_lists[0] == 0`,
-///   `cell_lists[CELL_COUNT] == lists()`, `list_start[0] == 0`,
-///   `list_start[lists()] == n` and `list_start` nondecreasing. Nothing
-///   about the ids, and inner `cell_lists` entries may exceed `lists()`.
-/// * through a [`ValidIvf`]: everything [`IvfIndex::validate`] lists.
-/// * a [`TlshIvf`] promises nothing until validated.
+///   `cell_lists[CELL_COUNT] == lists()`, `list_start[0] == 0` and
+///   `list_start[lists()] == n`. Nothing about the inner entries or the
+///   ids.
+/// * a [`TlshIvf`] promises nothing; [`check_layout`](Self::check_layout)
+///   checks its array lengths in O(1).
+/// * after [`check_index`] over the rows: everything it lists.
 ///
 /// The provided range helpers ([`cell_range`](Self::cell_range),
-/// [`list_range`](Self::list_range)) clamp to the arrays, so walking a
-/// parsed but unvalidated view through them never panics; on a valid
-/// index they are the exact ranges.
+/// [`list_range`](Self::list_range), [`list_ids`](Self::list_ids)) check
+/// the range they read and return a format error when it is inverted or
+/// runs past the arrays, so on an index whose layout is right (always,
+/// for a view) walking cells and lists through them never panics.
 ///
 /// Implementors provide the seven accessors and
 /// [`check_layout`](Self::check_layout); the rest is provided.
@@ -607,8 +616,9 @@ impl<'a> TivfView<'a> {
     ///
     /// The flags and reserved header fields are ignored, as C++ does.
     ///
-    /// The ids and inner `cell_lists` entries are not looked at: call
-    /// [`IvfIndex::validate`] before relying on them.
+    /// The inner `cell_lists` and `list_start` entries and the ids are not
+    /// looked at: the search and the merge bounds-check them as they read
+    /// them, and [`check_index`] checks them fully.
     pub fn parse(payload: &'a [u8], expected_n: u64) -> Result<Self> {
         let Some((header, body)) = payload.split_first_chunk::<TIVF_HEADER_LENGTH>() else {
             return Err(Error::format(format!(

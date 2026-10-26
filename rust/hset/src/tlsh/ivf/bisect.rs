@@ -117,7 +117,7 @@ struct CellLists {
 /// Build the BISECT index over the rows of a TLSH section (see the
 /// [module docs](self)). `rows` must be in bytewise order, as an `HDAT`
 /// is; equal rows (a records file's duplicates) are allowed and each is
-/// indexed. The result passes [`IvfIndex::validate`](super::IvfIndex::validate)
+/// indexed. The result passes [`check_index`](super::check_index)
 /// against `rows`, every medoid is a member of its list, and `radius2` is
 /// exact.
 ///

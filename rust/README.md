@@ -197,6 +197,16 @@ rows=R` (or `strategy=brute rows=R`) after each query. Every strategy
 returns the same matches. Its exit status is 1 when some query has no
 match within `--max-distance`.
 
+A loaded TIVF index is not validated, at load or on first use: loading
+checks only what C++ checks (header, length, row count, the ends of the
+offset arrays), in O(1), and the search and the merge bounds-check each
+read they make, as C++ makes them unchecked. An index out of bounds where a
+search reads it fails that search with a format error (`hset knn` exits 2;
+`--strategy brute` still answers); one corrupt within bounds (a wrong
+radius, a row in the wrong list) gives what C++ gives, possibly inexact.
+`hset verify` (`Hashset::verify`, `tlsh::check_index`) runs the full
+structural check and reports every such problem.
+
 ## Lookup acceleration: convex-hull fitted blocks
 
 An `.hset` section is a sorted array of fixed-width digests. Because digests
@@ -401,7 +411,7 @@ reports.
 Rust targets baseline x86-64, where `u64::count_ones` is a bit-twiddling
 sequence, while the C++ library is built with `-mpopcnt`. Every TLSH scan
 loop (brute, cell and TIVF kNN, the BISECT build's distance loops, the
-merge's coalescing radii, TIVF validation) therefore runs through one
+merge's coalescing radii, the TIVF check) therefore runs through one
 dispatcher, `tlsh::distance::Popcount::scan`, which calls a
 `#[target_feature(enable = "popcnt")]` copy after `is_x86_feature_detected!`
 (the crate's second `unsafe`, next to the prefetch hint), else the portable

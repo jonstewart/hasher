@@ -35,10 +35,14 @@
 //!   `TlshIvfView`), and the output row count is `rows.len()` (C++ takes
 //!   `n_out` separately and checks only that the gathered ids number
 //!   `n_out`).
-//! * Rust checks what C++ trusts or leaves undefined: the array lengths of
-//!   an owned index, that each map has one entry per input row, that every
-//!   input id is inside its map, and that every mapped id is an output row.
-//!   These are errors rather than out-of-bounds reads.
+//! * Rust checks what C++ trusts or leaves undefined, at the accesses the
+//!   merge makes and in O(1) beforehand, with no pass over the index: the
+//!   array lengths of an owned index, that each map has one entry per
+//!   input row, that each cell's range of lists and each list's range of
+//!   ids is in bounds, that every input id is inside its map, and that
+//!   every mapped id is an output row. These are errors rather than
+//!   out-of-bounds reads. The input index is not validated
+//!   ([`check_index`](super::check_index)).
 
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
@@ -77,10 +81,12 @@ use crate::tlsh::distance::{BodyQuery, popcount};
 /// [`DEFAULT_COALESCE`](super::DEFAULT_COALESCE) is the default threshold,
 /// and 0 disables coalescing. See the [module docs](self) for the cost.
 ///
-/// The inputs should be validated ([`IvfIndex::validate`]): an index that
-/// is not gives an error or an index that fails validation, never a panic.
-/// For validated inputs and maps from the row merge, the result passes
-/// `validate` over `rows`, its radii are exact where the inputs' were, and
+/// The inputs are not validated: an index corrupt within bounds gives an
+/// index that [`check_index`](super::check_index) may reject, one out of
+/// bounds where the merge reads it an error, never a panic. For inputs
+/// that `check_index` accepts and maps from the row merge, the result
+/// passes `check_index` over `rows`, its radii are exact where the
+/// inputs' were, and
 /// [`check_invariant`](super::check_invariant)`(coalesce_threshold)` holds.
 ///
 /// # Errors
@@ -89,8 +95,9 @@ use crate::tlsh::distance::{BodyQuery, popcount};
 /// is not increasing within a list, a mapped id is not below `rows.len()`,
 /// the kept ids do not number `rows.len()`, or `rows.len()` exceeds
 /// `u32::MAX`; [`Error::Format`] when an owned index's arrays have the
-/// wrong lengths ([`IvfIndex::check_layout`]) or an input id is past its
-/// map.
+/// wrong lengths ([`IvfIndex::check_layout`]), a cell's lists or a list's
+/// ids are an inverted or out-of-bounds range ([`IvfIndex::cell_range`],
+/// [`IvfIndex::list_range`]), or an input id is past its map.
 pub fn merge_tlsh_ivf<A: IvfIndex + ?Sized, B: IvfIndex + ?Sized>(
     a: Option<(&A, &[u32])>,
     b: Option<(&B, &[u32])>,

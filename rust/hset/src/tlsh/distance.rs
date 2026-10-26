@@ -28,18 +28,19 @@
 //! Rust targets baseline x86-64, where `count_ones` is a bit-twiddling
 //! sequence; the C++ library is built with `-mpopcnt`. Every scan loop in
 //! the crate (the kNN searches, the BISECT build, the merge's coalescing,
-//! TIVF validation) therefore runs through one dispatcher that compiles it
-//! a second time with the POPCNT target feature and picks that copy when
-//! the CPU has the instruction ([`Popcount::detected`]). [`with_popcount`]
-//! forces a choice on a thread, for tests and benchmarks. On other
-//! architectures there is one copy (aarch64's `count_ones` is NEON `cnt`).
+//! the TIVF check `check_index`) therefore runs through one dispatcher
+//! that compiles it a second time with the POPCNT target feature and picks
+//! that copy when the CPU has the instruction ([`Popcount::detected`]).
+//! [`with_popcount`] forces a choice on a thread, for tests and
+//! benchmarks. On other architectures there is one copy (aarch64's
+//! `count_ones` is NEON `cnt`).
 
 use std::cell::Cell;
 
 use super::digest::{DIGEST_LENGTH, HI, LO, TlshDigest};
 
 /// The popcount instructions the TLSH scans (kNN searches, index builds,
-/// merges and validation) are compiled for.
+/// merges and the TIVF check) are compiled for.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Popcount {
     /// `u64::count_ones` for the build target: a bit-twiddling sequence on

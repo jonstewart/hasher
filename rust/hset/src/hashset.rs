@@ -621,9 +621,8 @@ pub struct TlshReport {
 pub struct IndexReport {
     /// Number of lists (the header's count).
     pub lists: usize,
-    /// It passed the full structural check
-    /// ([`check_index`](crate::tlsh::check_index)), which only `verify`
-    /// makes.
+    /// It passed the full structural check ([`check_index`]), which only
+    /// `verify` makes.
     pub valid: bool,
 }
 
