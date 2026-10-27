@@ -314,10 +314,6 @@ class Report:
                     worst = max(worst, abs(irs[(q, 'r_naive')]['mean'] - rn), abs(irs[(q, 'r_tie')]['mean'] - rt))
             self.validation.append(('recall@k (naive, tie-aware) agrees with summary.txt',
                                     f'largest difference {worst:.5f} (summary prints 4 decimals)', worst <= 6e-5))
-        self.validation.append(('hset fully resident in the page cache during timing',
-                                f'{fpct(run["machine"].get("hset_resident_before_timing"))} before, '
-                                f'{fpct(run["machine"].get("hset_resident_after_timing"))} after',
-                                (run['machine'].get('hset_resident_after_timing') or 0) >= 0.999))
 
         self.knn_ir(qsets, irs, k)
         self.knn_latency(qsets, L, sp)
@@ -1222,13 +1218,11 @@ on this hardware.</p>
                      f'{fint(run.get("hset", {}).get("null_rows"))} null'],
             ['kNN parameters', escape(json.dumps(run.get('params', {})))],
             ['Seeds', escape(json.dumps(run.get('seeds', {})))],
-            ['kNN warm-up', f'file streamed {len(wr.get("file_reads", []))}× (MiB/s per pass: {reads}), mmap '
-                            f'MAP_POPULATE {wr.get("mmap_populate")}, {wr.get("queries_per_set_method")} untimed '
-                            f'queries per set × method; residency {fpct(mach.get("hset_resident_before_timing"))} / '
-                            f'{fpct(mach.get("hset_resident_after_timing"))}; MemAvailable '
+            ['kNN warm-up', f'file streamed {len(wr.get("file_reads", []))}× (MiB/s per pass: {reads}), '
+                            f'{wr.get("queries_per_set_method")} untimed queries per set × method; MemAvailable '
                             f'{fint((mach.get("mem_available_kb_before_timing") or 0) / 1024)} MiB'],
             ['kNN timing', f'steady_clock, timer overhead {run.get("timer_overhead_ns", {}).get("median", "–")} ns '
-                           f'median (not subtracted); timing thread pinned to CPU {mach.get("pin_cpu", "–")}; analysis '
+                           f'median (not subtracted); analysis '
                            f'pass on {mach.get("analysis_threads", "–")} threads, untimed'],
             ['Lookup warm-up', f'{mf.get("warm_reads", "–")} file reads, every page touched, '
                                f'{fint(mf.get("warmup_queries"))} untimed lookups; pinned CPU {escape(str(mf.get("cpu_affinity", "–")))}; '
@@ -1243,9 +1237,7 @@ on this hardware.</p>
              f'methods {escape(", ".join(x["params"].get("methods", [])))}; same seeds as the main run: '
              f'{x.get("seeds", {}).get("member") == run.get("seeds", {}).get("member") and x.get("seeds", {}).get("random") == run.get("seeds", {}).get("random")}; '
              f'{len(x.get("warmup", {}).get("file_reads", []))} file read(s), '
-             f'{x.get("warmup", {}).get("queries_per_set_method", "–")} warm-up queries per set × method; timing '
-             f'thread on CPU {x.get("machine", {}).get("pin_cpu", "–")}; residency '
-             f'{fpct(x.get("machine", {}).get("hset_resident_after_timing"))} after timing; analysis pass '
+             f'{x.get("warmup", {}).get("queries_per_set_method", "–")} warm-up queries per set × method; analysis pass '
              f'{"skipped" if not x.get("analysis_seconds") else "run"}']
             for d, x in self.args.extra_runs
         ]

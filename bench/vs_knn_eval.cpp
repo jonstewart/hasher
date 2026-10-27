@@ -56,8 +56,6 @@
 #include <vector>
 
 #include <fcntl.h>
-#include <pthread.h>
-#include <sched.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -98,8 +96,6 @@ struct Options {
   std::vector<std::string> methods{"brute", "index", "embed"};
   std::string embed_kernel = "vec";
   unsigned threads = std::max(1u, std::thread::hardware_concurrency());
-  int pin_cpu = -1;
-  bool populate = true;
   bool analysis = true;
   bool hist = true;
 };
@@ -127,8 +123,6 @@ R"(usage: vs_knn_eval --hset FILE --out DIR [options]
                         lib (sfhash_tlsh_embed_dist2, scalar) (vec)
   --threads N           threads of the untimed row embedding and analysis
                         pass (all CPUs)
-  --pin-cpu C           pin the timing thread to CPU C (analysis threads are not pinned)
-  --no-populate         mmap without MAP_POPULATE
   --no-analysis         skip the untimed analysis pass (no deep/hist, no d_k)
   --no-hist             do not write hist.csv
 )";
@@ -200,8 +194,6 @@ Options parse_args(int argc, char** argv) {
     else if (a == "--deep-k") o.deep_k = num();
     else if (a == "--embed-kernel") o.embed_kernel = val();
     else if (a == "--threads") o.threads = std::max<unsigned>(1, num());
-    else if (a == "--pin-cpu") o.pin_cpu = static_cast<int>(num());
-    else if (a == "--no-populate") o.populate = false;
     else if (a == "--no-analysis") o.analysis = false;
     else if (a == "--no-hist") o.hist = false;
     else if (a == "--help" || a == "-h") usage();
@@ -296,7 +288,7 @@ double secs_since(Clock::time_point t0) {
 }
 
 //
-// file: warm reads, mapping, residency
+// file: warm reads, mapping
 //
 
 struct WarmRead {
@@ -312,7 +304,6 @@ std::vector<WarmRead> warm_reads(const std::string& path, size_t passes, uint64_
     if (fd < 0) {
       throw std::runtime_error("cannot open " + path);
     }
-    ::posix_fadvise(fd, 0, 0, POSIX_FADV_SEQUENTIAL);
     const auto t0 = Clock::now();
     uint64_t total = 0;
     ssize_t r;
@@ -335,12 +326,12 @@ struct Mapping {
   void* base = MAP_FAILED;
   size_t size = 0;
 
-  Mapping(const std::string& path, size_t sz, bool populate): size(sz) {
+  Mapping(const std::string& path, size_t sz): size(sz) {
     const int fd = ::open(path.c_str(), O_RDONLY);
     if (fd < 0) {
       throw std::runtime_error("cannot open " + path);
     }
-    base = ::mmap(nullptr, size, PROT_READ, MAP_SHARED | (populate ? MAP_POPULATE : 0), fd, 0);
+    base = ::mmap(nullptr, size, PROT_READ, MAP_SHARED, fd, 0);
     ::close(fd);
     if (base == MAP_FAILED) {
       throw std::runtime_error("cannot mmap " + path);
@@ -351,20 +342,6 @@ struct Mapping {
     if (base != MAP_FAILED) {
       ::munmap(base, size);
     }
-  }
-
-  // fraction of pages resident in memory (mincore)
-  double resident() const {
-    const size_t page = static_cast<size_t>(::sysconf(_SC_PAGESIZE));
-    std::vector<unsigned char> v((size + page - 1) / page);
-    if (::mincore(base, size, v.data()) != 0) {
-      return -1;
-    }
-    size_t r = 0;
-    for (unsigned char c: v) {
-      r += c & 1;
-    }
-    return v.empty() ? 1.0 : static_cast<double>(r) / v.size();
   }
 };
 
@@ -662,15 +639,6 @@ struct Pass {
   double timed_s = 0;
 };
 
-void pin_thread(int cpu) {
-  cpu_set_t set;
-  CPU_ZERO(&set);
-  CPU_SET(cpu, &set);
-  if (pthread_setaffinity_np(pthread_self(), sizeof set, &set) != 0) {
-    throw std::runtime_error("cannot pin to CPU " + std::to_string(cpu));
-  }
-}
-
 } // namespace
 
 int main(int argc, char** argv) {
@@ -680,12 +648,6 @@ int main(int argc, char** argv) {
   try {
     std::filesystem::create_directories(opt.out);
     const std::filesystem::path out(opt.out);
-
-    // original affinity, restored in analysis threads when --pin-cpu is used
-    cpu_set_t orig_mask;
-    CPU_ZERO(&orig_mask);
-    sched_getaffinity(0, sizeof orig_mask, &orig_mask);
-    const int affinity_cpus = CPU_COUNT(&orig_mask);
 
     struct stat st;
     if (::stat(opt.hset.c_str(), &st) != 0) {
@@ -700,17 +662,13 @@ int main(int argc, char** argv) {
     if (file_size > mem_avail0_kb * 1024) {
       std::cerr << "WARNING: hset is larger than MemAvailable; timings will include I/O\n";
     }
-    if (affinity_cpus == 1 && opt.threads > 1) {
-      std::cerr << "note: process is pinned to one CPU; the analysis pass's " << opt.threads
-                << " threads will share it (prefer --pin-cpu)\n";
-    }
 
     // 1. warm the page cache
     const auto wr = warm_reads(opt.hset, opt.warm_reads, file_size);
 
     // 2. map and load
     auto t0 = Clock::now();
-    Mapping map(opt.hset, file_size, opt.populate);
+    Mapping map(opt.hset, file_size);
     SFHASH_Error* err = nullptr;
     std::unique_ptr<SFHASH_Hashset, decltype(&sfhash_destroy_hashset)> hset(
       sfhash_load_hashset(map.base, static_cast<const char*>(map.base) + file_size, &err),
@@ -824,13 +782,7 @@ int main(int argc, char** argv) {
     std::cerr << "steady_clock overhead: min " << tov.min_ns << " ns, median " << tov.median_ns
               << " ns, mean " << tov.mean_ns << " ns\n";
 
-    if (opt.pin_cpu >= 0) {
-      pin_thread(opt.pin_cpu);
-    }
-
-    const double resident_before = map.resident();
     const uint64_t mem_avail1_kb = meminfo_kb("MemAvailable");
-    std::cerr << "hset resident before timing: " << 100 * resident_before << "%\n";
 
     // 5. timed passes: for each set, for each method, warm up then time
     const Kernel kernel = opt.embed_kernel == "lib" ? emb_dist2_lib : emb_dist2_vec;
@@ -909,7 +861,6 @@ int main(int argc, char** argv) {
         passes.push_back(std::move(p));
       }
     }
-    const double resident_after = map.resident();
 
     // 6. untimed analysis: full TLSH distance histogram and deep embedding
     // ranking per query, several queries per scan, across threads
@@ -931,9 +882,6 @@ int main(int argc, char** argv) {
       std::atomic<size_t> done{0};
       const size_t nbatches = (queries.size() + BATCH - 1) / BATCH;
       auto worker = [&]() {
-        if (opt.pin_cpu >= 0) {
-          pthread_setaffinity_np(pthread_self(), sizeof orig_mask, &orig_mask);
-        }
         for (size_t b; (b = next.fetch_add(1)) < nbatches;) {
           const size_t lo = b * BATCH;
           const size_t hi = std::min(queries.size(), lo + BATCH);
@@ -1237,10 +1185,8 @@ int main(int argc, char** argv) {
       }
     }
     std::snprintf(line, sizeof line,
-                  "\nhset %.1f MiB, MemAvailable %.1f MiB at start / %.1f MiB before timing; "
-                  "resident %.1f%% before / %.1f%% after timing\n",
-                  file_size / 1048576.0, mem_avail0_kb / 1024.0, mem_avail1_kb / 1024.0,
-                  100 * resident_before, 100 * resident_after);
+                  "\nhset %.1f MiB, MemAvailable %.1f MiB at start / %.1f MiB before timing\n",
+                  file_size / 1048576.0, mem_avail0_kb / 1024.0, mem_avail1_kb / 1024.0);
     sum << line;
     sum << "analysis pass " << analysis_s << " s; total " << secs_since(run_t0) << " s\n";
     std::cout << sum.str() << std::flush;
@@ -1287,17 +1233,13 @@ int main(int argc, char** argv) {
       for (size_t i = 0; i < wr.size(); ++i) {
         j << (i ? ", " : "") << "{\"seconds\": " << wr[i].seconds << ", \"mib_per_s\": " << wr[i].mib_per_s << "}";
       }
-      j << "], \"queries_per_set_method\": " << opt.warmup << ", \"mmap_populate\": "
-        << (opt.populate ? "true" : "false") << "},\n";
+      j << "], \"queries_per_set_method\": " << opt.warmup << "},\n";
       j << "  \"timer_overhead_ns\": {\"min\": " << tov.min_ns << ", \"median\": " << tov.median_ns
         << ", \"mean\": " << tov.mean_ns << ", \"subtracted\": false},\n";
       j << "  \"machine\": {\"cpu\": " << json_str(cpu_model()) << ", \"online_cpus\": "
-        << std::thread::hardware_concurrency() << ", \"affinity_cpus\": " << affinity_cpus
-        << ", \"pin_cpu\": " << opt.pin_cpu << ", \"analysis_threads\": " << opt.threads
+        << std::thread::hardware_concurrency() << ", \"analysis_threads\": " << opt.threads
         << ", \"mem_total_kb\": " << mem_total_kb << ", \"mem_available_kb_start\": " << mem_avail0_kb
         << ", \"mem_available_kb_before_timing\": " << mem_avail1_kb
-        << ", \"hset_resident_before_timing\": " << resident_before
-        << ", \"hset_resident_after_timing\": " << resident_after
         << ", \"kernel\": " << json_str(run_cmd("uname -sr")) << "},\n";
       j << "  \"passes\": [\n";
       for (size_t i = 0; i < pstats.size(); ++i) {

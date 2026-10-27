@@ -10,6 +10,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cerrno>
 #include <chrono>
 #include <condition_variable>
 #include <cstdio>
@@ -25,8 +26,6 @@
 #include <thread>
 #include <vector>
 
-#include <fcntl.h>
-#include <pthread.h>
 #include <unistd.h>
 
 #include <archive.h>
@@ -100,9 +99,6 @@ struct HasherDeleter {
 };
 
 SFHASH_Hasher* thread_hasher() {
-  // named for top -H / pidstat -t
-  thread_local const bool named = (pthread_setname_np(pthread_self(), "vsscan-hash"), true);
-  (void) named;
   thread_local std::unique_ptr<SFHASH_Hasher, HasherDeleter> h(
     sfhash_create_hasher(vsscan_hash_algs())
   );
@@ -517,26 +513,25 @@ void prefetch_zip(
   uint64_t ahead,
   size_t chunk)
 {
-  const int fd = ::open(zip.c_str(), O_RDONLY);
-  if (fd < 0) {
+  std::ifstream in(zip, std::ios::binary);
+  if (!in) {
     return;
   }
-  posix_fadvise(fd, 0, 0, POSIX_FADV_SEQUENTIAL);
-  std::vector<uint8_t> buf(chunk);
+  std::vector<char> buf(chunk);
   uint64_t pos = 0;
   while (!stop) {
     if (pos < reader_pos + ahead) {
-      const ssize_t n = ::pread(fd, buf.data(), buf.size(), pos);
+      in.read(buf.data(), static_cast<std::streamsize>(buf.size()));
+      const std::streamsize n = in.gcount();
       if (n <= 0) {
         break; // end of file or error; the readers will report errors
       }
-      pos += n;
+      pos += static_cast<uint64_t>(n);
     }
     else {
       std::this_thread::sleep_for(std::chrono::milliseconds(10));
     }
   }
-  ::close(fd);
 }
 
 ZipResult scan_zip(
@@ -579,7 +574,6 @@ ZipResult scan_zip(
     std::thread prefetcher;
     if (opts.prefetch_ahead > 0) {
       prefetcher = std::thread([&]{
-        pthread_setname_np(pthread_self(), "vsscan-pref");
         prefetch_zip(zip, job.max_pos, stop_prefetch, opts.prefetch_ahead, 8 << 20);
       });
     }
@@ -587,7 +581,6 @@ ZipResult scan_zip(
     std::vector<std::thread> readers;
     for (unsigned r = 0; r < k; ++r) {
       readers.emplace_back([&, r]{
-        pthread_setname_np(pthread_self(), "vsscan-read");
         try {
           strides[r] = read_stride(job, opts, r, k, pool, budget, stats, deadline, has_deadline);
         }

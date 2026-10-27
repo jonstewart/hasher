@@ -256,26 +256,20 @@ fixed, recorded seeds (`--member-seed`, `--random-seed`).
 
 ```sh
 make bench/vs_knn_eval
-bench/vs_knn_eval --hset vs.hset --out knn-out --pin-cpu 2
+bench/vs_knn_eval --hset vs.hset --out knn-out
 # defaults: --k 100 --max-distance unbounded --include-length true
 #           --queries 1000 --warm-reads 3 --warmup 50 --deep-k 1000
 ```
 
 Timing. Before anything is timed, the file is read sequentially `--warm-reads`
 times (MiB/s per pass printed: the first pass shows whether it was cached),
-then mapped with `MAP_POPULATE`, and the size is printed against
-MemAvailable, with a warning when it does not fit; the fraction of the mapping
-resident (`mincore`) is recorded before and after the timed passes. The
-passes run per set, per method (all 1,000 queries of one method in a row,
-each method warmed by `--warmup` untimed queries of that set, drawn with
-`--warmup-seed` apart from the measured ones). Each query is timed alone with
+then mapped, and the size is printed against MemAvailable, with a warning
+when it does not fit. The passes run per set, per method (all 1,000 queries
+of one method in a row, each method warmed by `--warmup` untimed queries of
+that set, drawn with `--warmup-seed` apart from the measured ones). Each query is timed alone with
 `steady_clock` around the kNN call only (for `embed`: query embedding, scan
 and heap). The timer overhead (an empty region, 1M repetitions) is recorded
-and not subtracted. The timing thread is single-threaded; `--pin-cpu C` pins
-it to CPU C. `taskset -c C bench/vs_knn_eval ...` pins it too, but then the
-untimed analysis pass below also runs on that one CPU; give taskset a set of
-CPUs and `--pin-cpu` one of them, or use `--pin-cpu` alone. On this VM the
-online CPUs are 0-3 and 12-23 (`cat /sys/devices/system/cpu/online`).
+and not subtracted. The timing thread is single-threaded.
 
 Analysis pass (untimed, after the timed passes, `--threads`, default all CPUs,
 eight queries per scan): for every query, the TLSH distance of every row (a
@@ -294,7 +288,7 @@ Outputs in `--out` (CSV with a header; `read_csv_auto` in DuckDB; ranks are
 | `results.csv` | `qset, qid, method, rank, row_idx, tlsh_dist, emb_dist2` (`tlsh_dist` from `sfhash_tlsh_diff` with the length setting, computed after timing; `emb_dist2` with the embed kernel, for all three methods) |
 | `deep.csv` | `qset, qid, rank, row_idx, emb_dist2, tlsh_dist`: embedding top `--deep-k` |
 | `hist.csv` | `qset, qid, tlsh_dist, n_rows`: the full distance histogram, nonzero bins (`--no-hist` to skip) |
-| `run.json` | hset path, size, name, rows, null rows, lists, row-embedding seconds; parameters; seeds (hex strings); warm-up passes and settings; timer overhead; CPU, affinity, MemTotal/MemAvailable, residency; date, git commit, argv; per pass n/mean/median/stddev/p99/max/min in us; checks |
+| `run.json` | hset path, size, name, rows, null rows, lists, row-embedding seconds; parameters; seeds (hex strings); warm-up passes and settings; timer overhead; CPU, MemTotal/MemAvailable; date, git commit, argv; per pass n/mean/median/stddev/p99/max/min in us; checks |
 | `summary.txt` | the printed summary |
 
 With ties at the k-th distance (identical digests are common in real
@@ -321,9 +315,10 @@ from (select e.*, exists (select 1 from r b where b.method = 'brute' and b.qset 
 join q using (qset, qid) group by e.qset;
 ```
 
-Synthetic check (2026-10-24, Xeon E5645, `--pin-cpu 2`, other work on the
-VM; `make_tlsh_corpus` digests plus 15% exact duplicates, built by
-`mkhashset ... md5 tlsh true true`; mean us per query, member / random):
+Synthetic check (2026-10-24, Xeon E5645, timing thread pinned to CPU 2 with a
+since-removed option, other work on the VM; `make_tlsh_corpus` digests plus
+15% exact duplicates, built by `mkhashset ... md5 tlsh true true`; mean us per
+query, member / random):
 
 | rows | queries/set | brute | index | embed | embed recall@100 naive / tie-aware | brute/index mismatches | wall |
 |------|-------------|-------|-------|-------|------------------------------------|------------------------|------|
@@ -402,8 +397,7 @@ Any of `--knn`, `--found`, `--notfound` may be left out. The exit status is
 1 when a validation check fails: brute/index mismatches (rows, and distance
 at every rank), internal consistency of the kNN outputs (k-th distance,
 count_le against `hist.csv`, embed a prefix of the deep ranking), agreement
-with the program's `summary.txt` and `meta.json` statistics, page residency,
-and the lookup assertions (every stored SHA-256 found, no random one found).
+with the program's `summary.txt` and `meta.json` statistics, and the lookup assertions (every stored SHA-256 found, no random one found).
 
 Metrics: latency per set x method (n, mean, median, stddev, p90, p99, p99.9,
 min, max), speedups (ratios of means and medians, per-query paired ratios),
