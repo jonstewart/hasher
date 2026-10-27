@@ -2,12 +2,11 @@
 //
 // Hash set lookup eval driver: times individual SHA-256 lookups through the
 // public client API (sfhash_hashset_lookup, include/hasher/hashset.h) against
-// an hset, e.g. the VirusShare hset with records. Single-threaded; run it
-// pinned to one CPU:
+// an hset, e.g. the VirusShare hset with records. Single-threaded:
 //
-//   taskset -c 3 bench/vs_lookup_eval export   HSET --out sha256.txt [--seed S]
-//   taskset -c 3 bench/vs_lookup_eval found    HSET --list sha256.txt --csv found.csv
-//   taskset -c 3 bench/vs_lookup_eval notfound HSET --list sha256.txt --csv notfound.csv
+//   bench/vs_lookup_eval export   HSET --out sha256.txt [--seed S]
+//   bench/vs_lookup_eval found    HSET --list sha256.txt --csv found.csv
+//   bench/vs_lookup_eval notfound HSET --list sha256.txt --csv notfound.csv
 //
 // export    writes every SHA-256 of the hset's sha256 hash set as lowercase
 //           hex, one per line, shuffled with mt19937_64(seed) (std::shuffle,
@@ -50,17 +49,14 @@
 #include <iterator>
 #include <memory>
 #include <random>
-#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <vector>
 
 #include <fcntl.h>
-#include <sched.h>
 #include <sys/resource.h>
 #include <sys/stat.h>
 #include <unistd.h>
-#include <x86intrin.h>
 
 #include <boost/interprocess/file_mapping.hpp>
 #include <boost/interprocess/mapped_region.hpp>
@@ -123,7 +119,6 @@ struct Options {
   double noise_secs = 2.0;
   bool unique = false;        // export
   uint64_t inject_hits = 0;   // notfound self-test
-  std::string timer = "steady";
 };
 
 void usage() {
@@ -137,9 +132,8 @@ void usage() {
     "                          [--inject-hits K (self-test: replace K queries\n"
     "                           with hashes taken from the hset)]\n"
     "common: [--warm-reads N (3)] [--warmup-queries M|all (100000)]\n"
-    "        [--timer steady|rdtscp (steady)] [--no-aggregate]\n"
-    "        [--catch-bench K] [--noise-secs S (2)] [--meta FILE (CSV.meta.json)]\n"
-    "Run pinned: taskset -c N vs_lookup_eval ...\n");
+    "        [--no-aggregate] [--catch-bench K] [--noise-secs S (2)]\n"
+    "        [--meta FILE (CSV.meta.json)]\n");
 }
 
 uint64_t parse_u64(const std::string& s, const char* what) {
@@ -180,7 +174,6 @@ Options parse_args(int argc, char** argv) {
       if (v == "all") o.warmup_all = true;
       else o.warmup_queries = parse_u64(v, "--warmup-queries");
     }
-    else if (a == "--timer") o.timer = val();
     else if (a == "--no-aggregate") o.aggregate = false;
     else if (a == "--catch-bench") o.catch_bench = parse_u64(val(), "--catch-bench");
     else if (a == "--unique") o.unique = true;
@@ -189,7 +182,6 @@ Options parse_args(int argc, char** argv) {
     else if (a == "-h" || a == "--help") { usage(); std::exit(0); }
     else { usage(); die("unknown argument '" + a + "'"); }
   }
-  if (o.timer != "steady" && o.timer != "rdtscp") die("--timer must be steady or rdtscp");
   if (o.cmd == "export" && o.list.empty()) die("export needs --out LIST");
   if (o.cmd == "found" && o.list.empty()) die("found needs --list LIST");
   if (o.cmd != "export" && o.csv.empty()) die(o.cmd + " needs --csv CSV");
@@ -244,27 +236,6 @@ std::string loadavg() {
   std::string a, b, c;
   in >> a >> b >> c;
   return a + " " + b + " " + c;
-}
-
-std::string affinity() {
-  cpu_set_t set;
-  CPU_ZERO(&set);
-  if (sched_getaffinity(0, sizeof(set), &set) != 0) return "unknown";
-  std::string out;
-  for (int c = 0; c < CPU_SETSIZE; ++c) {
-    if (CPU_ISSET(c, &set)) {
-      if (!out.empty()) out += ",";
-      out += std::to_string(c);
-    }
-  }
-  return out;
-}
-
-int affinity_count() {
-  cpu_set_t set;
-  CPU_ZERO(&set);
-  if (sched_getaffinity(0, sizeof(set), &set) != 0) return -1;
-  return CPU_COUNT(&set);
 }
 
 std::string iso_now() {
@@ -340,28 +311,13 @@ struct Json {
   }
 };
 
-// The pinned CPU's /proc/stat counters (USER_HZ ticks) and this process's
-// faults and context switches, sampled around a timed pass: interference
-// (steal, interrupts, preemption, page faults) shows up here.
+// This process's faults and context switches, sampled around a timed pass:
+// interference (preemption, page faults) shows up here.
 struct Interference {
-  int cpu = -1;
-  // user nice system idle iowait irq softirq steal
-  std::array<uint64_t, 8> stat{};
   long minflt = 0, majflt = 0, nvcsw = 0, nivcsw = 0;
 
   static Interference sample() {
     Interference x;
-    x.cpu = sched_getcpu();
-    std::ifstream in("/proc/stat");
-    std::string line;
-    const std::string want = "cpu" + std::to_string(x.cpu) + " ";
-    while (std::getline(in, line)) {
-      if (line.rfind(want, 0) == 0) {
-        std::istringstream ls(line.substr(want.size()));
-        for (auto& v: x.stat) ls >> v;
-        break;
-      }
-    }
     rusage ru{};
     getrusage(RUSAGE_SELF, &ru);
     x.minflt = ru.ru_minflt;
@@ -374,26 +330,13 @@ struct Interference {
   // b minus a, as JSON, and printed
   static std::string delta(const Interference& a, const Interference& b) {
     Json j;
-    j.raw("cpu", std::to_string(b.cpu));
-    j.boolean("same_cpu", a.cpu == b.cpu);
-    static const char* names[] = {"user", "nice", "system", "idle", "iowait",
-                                  "irq", "softirq", "steal"};
-    for (size_t i = 0; i < 8; ++i) {
-      j.raw(std::string("cpu_ticks_") + names[i],
-            std::to_string(int64_t(b.stat[i]) - int64_t(a.stat[i])));
-    }
     j.raw("minor_faults", std::to_string(b.minflt - a.minflt));
     j.raw("major_faults", std::to_string(b.majflt - a.majflt));
     j.raw("voluntary_ctxsw", std::to_string(b.nvcsw - a.nvcsw));
     j.raw("involuntary_ctxsw", std::to_string(b.nivcsw - a.nivcsw));
-    std::printf("interference on cpu %d (USER_HZ ticks): user %" PRId64 " system %" PRId64
-                " irq %" PRId64 " softirq %" PRId64 " steal %" PRId64
-                "; faults minor %ld major %ld; ctxsw vol %ld invol %ld\n",
-                b.cpu, int64_t(b.stat[0] - a.stat[0]), int64_t(b.stat[2] - a.stat[2]),
-                int64_t(b.stat[5] - a.stat[5]), int64_t(b.stat[6] - a.stat[6]),
-                int64_t(b.stat[7] - a.stat[7]), b.minflt - a.minflt,
-                b.majflt - a.majflt, b.nvcsw - a.nvcsw, b.nivcsw - a.nivcsw);
-    if (a.cpu != b.cpu) std::printf("WARNING: migrated from cpu %d to %d\n", a.cpu, b.cpu);
+    std::printf("interference: faults minor %ld major %ld; ctxsw vol %ld invol %ld\n",
+                b.minflt - a.minflt, b.majflt - a.majflt, b.nvcsw - a.nvcsw,
+                b.nivcsw - a.nivcsw);
     return j.dump(4);
   }
 };
@@ -516,7 +459,6 @@ void warm_file(const Hset& hs, unsigned passes, WarmInfo& wi) {
 
   const int fd = ::open(hs.path.c_str(), O_RDONLY);
   if (fd < 0) die("cannot open " + hs.path);
-  posix_fadvise(fd, 0, 0, POSIX_FADV_SEQUENTIAL);
   std::vector<char> buf(16u << 20);
   for (unsigned p = 0; p < passes; ++p) {
     const auto t0 = clk::now();
@@ -549,51 +491,16 @@ void warm_file(const Hset& hs, unsigned passes, WarmInfo& wi) {
 // Timers
 // --------------------------------------------------------------------------
 
-inline uint64_t tsc_begin() {
-  _mm_lfence();
-  const uint64_t t = __rdtsc();
-  _mm_lfence();
-  return t;
-}
-
-inline uint64_t tsc_end() {
-  unsigned aux;
-  const uint64_t t = __rdtscp(&aux);
-  _mm_lfence();
-  return t;
-}
-
-// ticks per ns of the TSC, measured against steady_clock over ~300 ms
-double calibrate_tsc() {
-  const auto c0 = clk::now();
-  const uint64_t t0 = tsc_begin();
-  while (secs_since(c0) < 0.3) {}
-  const uint64_t t1 = tsc_end();
-  const double ns = std::chrono::duration<double, std::nano>(clk::now() - c0).count();
-  return (t1 - t0) / ns;
-}
-
 struct Timer {
-  bool rdtscp = false;
-  double ticks_per_ns = 1.0;
-
-  // Time fn() once; returns the interval in timer ticks (ns for steady).
+  // Time fn() once with steady_clock; returns the interval in ns.
   template <class Fn>
   inline uint64_t time(Fn&& fn) const {
-    if (rdtscp) {
-      const uint64_t t0 = tsc_begin();
-      fn();
-      const uint64_t t1 = tsc_end();
-      return t1 - t0;
-    }
     const auto t0 = clk::now();
     fn();
     const auto t1 = clk::now();
     return static_cast<uint64_t>(
       std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count());
   }
-
-  double to_ns(uint64_t ticks) const { return rdtscp ? ticks / ticks_per_ns : double(ticks); }
 };
 
 // --------------------------------------------------------------------------
@@ -710,7 +617,7 @@ Stats timer_overhead(const Timer& t) {
   constexpr size_t N = 1000000;
   std::vector<double> v(N);
   for (size_t i = 0; i < N; ++i) {
-    v[i] = t.to_ns(t.time([] { asm volatile("" ::: "memory"); }));
+    v[i] = double(t.time([] { asm volatile("" ::: "memory"); }));
   }
   return stats_of(std::move(v));
 }
@@ -759,8 +666,7 @@ void run_catch(const Hset& hs, const std::vector<Hash>& sample) {
 // --------------------------------------------------------------------------
 
 void write_csv(const std::string& path, const std::vector<Hash>& q,
-               const std::vector<uint8_t>& found, const std::vector<double>& ns,
-               bool integral_ns) {
+               const std::vector<uint8_t>& found, const std::vector<double>& ns) {
   FILE* f = std::fopen(path.c_str(), "wb");
   if (!f) die("cannot write " + path);
   std::vector<char> buf(4 << 20);
@@ -770,12 +676,7 @@ void write_csv(const std::string& path, const std::vector<Hash>& q,
   hx[64] = '\0';
   for (size_t i = 0; i < ns.size(); ++i) {
     sfhash_hex(hx, q[i].data(), 32);
-    if (integral_ns) {
-      std::fprintf(f, "%zu,%s,%u,%.0f\n", i, hx, unsigned(found[i]), ns[i]);
-    }
-    else {
-      std::fprintf(f, "%zu,%s,%u,%.2f\n", i, hx, unsigned(found[i]), ns[i]);
-    }
+    std::fprintf(f, "%zu,%s,%u,%.0f\n", i, hx, unsigned(found[i]), ns[i]);
   }
   if (std::fclose(f) != 0) die("error writing " + path);
 }
@@ -813,7 +714,7 @@ TimedPass timed_pass(const Hset& hs, const Timer& t, const std::vector<Hash>& q,
   tp.interference = Interference::delta(i0, Interference::sample());
   tp.ns.resize(q.size());
   for (size_t i = 0; i < q.size(); ++i) {
-    tp.ns[i] = t.to_ns(ticks[i]);
+    tp.ns[i] = double(ticks[i]);
     tp.over_10us += tp.ns[i] > 1e4;
     tp.over_100us += tp.ns[i] > 1e5;
   }
@@ -852,14 +753,13 @@ void aggregate_pass(const Hset& hs, const std::vector<Hash>& q, TimedPass& tp) {
 
 // metadata common to found and notfound
 Json common_meta(const Options& o, const Hset& hs, const WarmInfo& wi,
-                 const Timer& t, const Stats& ovh) {
+                 const Stats& ovh) {
   Json j;
   j.str("tool", "vs_lookup_eval");
   j.str("subcommand", o.cmd);
   j.str("date", iso_now());
   j.str("host", hostname());
   j.str("cpu_model", cpu_model());
-  j.str("cpu_affinity", affinity());
   j.str("clocksource", clocksource());
   j.str("loadavg_at_end", loadavg());
   j.str("lookup_api", "sfhash_hashset_lookup");
@@ -882,8 +782,7 @@ Json common_meta(const Options& o, const Hset& hs, const WarmInfo& wi,
   j.num("page_touch_secs", wi.touch_secs);
   j.u64("warmup_queries", wi.warmup_n);
   j.num("warmup_secs", wi.warmup_secs);
-  j.str("timer", t.rdtscp ? "rdtscp" : "steady_clock");
-  if (t.rdtscp) j.num("tsc_ticks_per_ns", t.ticks_per_ns);
+  j.str("timer", "steady_clock");
   j.num("timer_overhead_median_ns", ovh.median);
   j.num("timer_overhead_mean_ns", ovh.mean);
   j.raw("timer_overhead_ns", stats_json(ovh));
@@ -892,16 +791,8 @@ Json common_meta(const Options& o, const Hset& hs, const WarmInfo& wi,
   return j;
 }
 
-void setup_timer(const Options& o, Timer& t, Stats& ovh, Noise& nz) {
-  t.rdtscp = (o.timer == "rdtscp");
-  if (t.rdtscp) {
-    t.ticks_per_ns = calibrate_tsc();
-    std::printf("timer: rdtscp, %.4f ticks/ns (calibrated against steady_clock)\n",
-                t.ticks_per_ns);
-  }
-  else {
-    std::printf("timer: std::chrono::steady_clock (clocksource %s)\n", clocksource().c_str());
-  }
+void setup_timer(const Options& o, const Timer& t, Stats& ovh, Noise& nz) {
+  std::printf("timer: std::chrono::steady_clock (clocksource %s)\n", clocksource().c_str());
   ovh = timer_overhead(t);
   std::printf("timer overhead (empty timed region, 1M reps): median %.1f ns, "
               "mean %.1f ns, p99 %.1f ns, p99.9 %.1f ns, max %.1f ns\n",
@@ -911,11 +802,7 @@ void setup_timer(const Options& o, Timer& t, Stats& ovh, Noise& nz) {
 
 void print_env(const Options& o) {
   std::printf("vs_lookup_eval %s  %s\n", o.cmd.c_str(), iso_now().c_str());
-  std::printf("cpu: %s; affinity: %s; loadavg %s\n", cpu_model().c_str(),
-              affinity().c_str(), loadavg().c_str());
-  if (affinity_count() != 1 && o.cmd != "export") {
-    std::printf("WARNING: not pinned to one CPU; run under taskset -c N\n");
-  }
+  std::printf("cpu: %s; loadavg %s\n", cpu_model().c_str(), loadavg().c_str());
 }
 
 void print_hset(const Hset& hs) {
@@ -1046,7 +933,7 @@ int cmd_found(const Options& o) {
   if (o.aggregate) aggregate_pass(hs, q, tp);
 
   t0 = clk::now();
-  write_csv(o.csv, q, tp.found, tp.ns, !t.rdtscp);
+  write_csv(o.csv, q, tp.found, tp.ns);
   std::printf("wrote %s in %.2f s\n", o.csv.c_str(), secs_since(t0));
 
   if (o.catch_bench) {
@@ -1057,7 +944,7 @@ int cmd_found(const Options& o) {
     run_catch(hs, sample);
   }
 
-  Json j = common_meta(o, hs, wi, t, ovh);
+  Json j = common_meta(o, hs, wi, ovh);
   j.raw("noise_floor", noise_json(nz));
   j.str("list", o.list);
   j.u64("list_count", q.size());
@@ -1177,7 +1064,7 @@ int cmd_notfound(const Options& o) {
   std::printf("%zu of %zu random values found (%zu collisions)\n",
               hits.size(), q.size(), collisions.size());
 
-  write_csv(o.csv, q, tp.found, tp.ns, !t.rdtscp);
+  write_csv(o.csv, q, tp.found, tp.ns);
   std::printf("wrote %s\n", o.csv.c_str());
 
   if (o.catch_bench) {
@@ -1185,7 +1072,7 @@ int cmd_notfound(const Options& o) {
     run_catch(hs, sample);
   }
 
-  Json j = common_meta(o, hs, wi, t, ovh);
+  Json j = common_meta(o, hs, wi, ovh);
   j.raw("noise_floor", noise_json(nz));
   j.str("list", o.list);
   j.u64("seed", seed);

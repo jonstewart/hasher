@@ -132,9 +132,9 @@ a real `.hset` and measures what clients get.
 ```sh
 make bench/vs_lookup_eval
 H=vs.hset
-taskset -c 3 bench/vs_lookup_eval export   $H --out sha256.txt            # --seed S, --unique
-taskset -c 3 bench/vs_lookup_eval found    $H --list sha256.txt --csv found.csv
-taskset -c 3 bench/vs_lookup_eval notfound $H --list sha256.txt --csv notfound.csv  # --seed S, --count N
+bench/vs_lookup_eval export   $H --out sha256.txt            # --seed S, --unique
+bench/vs_lookup_eval found    $H --list sha256.txt --csv found.csv
+bench/vs_lookup_eval notfound $H --list sha256.txt --csv notfound.csv  # --seed S, --count N
 ```
 
 * `export` writes every row of the sha256 hash set as lowercase hex, one per
@@ -167,32 +167,26 @@ per-query timer cost; `--catch-bench K` adds a Catch2 `BENCHMARK` over K
 sampled queries as a further cross-check.
 
 The timer is `std::chrono::steady_clock` (vDSO `clock_gettime`, the `tsc`
-clocksource on this VM) or, with `--timer rdtscp`, `lfence; rdtsc; lfence`
-... `rdtscp; lfence` with the TSC rate calibrated against steady_clock (the
-CPU has `constant_tsc` and `nonstop_tsc`). The overhead of an empty timed
-region (1M repetitions) is printed and recorded; the CSV's `ns` is the raw
-interval and includes it.
+clocksource on this VM). The overhead of an empty timed region (1M
+repetitions) is printed and recorded; the CSV's `ns` is the raw interval and
+includes it.
 
 Outputs:
 
 * the CSV, `i,sha256,found,ns`: query position, lowercase hex, 0/1, and ns
-  (an integer for steady_clock, two decimals for rdtscp). For example
+  (an integer). For example
   `duckdb -c "select count(*), avg(ns), quantile_disc(ns, [0.5, 0.9, 0.99, 0.999]), max(ns) from 'found.csv'"`;
   the program's percentiles are the sorted sample's element floor(q (n - 1)),
   which is `quantile_disc`, and its stddev is the sample stddev (`stddev_samp`).
 * `<csv>.meta.json` (`--meta` to change; `<list>.meta.json` for `export`):
   hset path, size and name, sha256 and record counts, seeds, warm-up settings
-  and times, MemAvailable, the timer and its overhead, CPU model, affinity,
+  and times, MemAvailable, the timer and its overhead, CPU model,
   clocksource, load average, the date, and the summary statistics
   (n, mean, median, stddev, p90, p99, p99.9, min, max) and wall times.
 
-Run it single-threaded and pinned: `taskset -c N`, with N a CPU nothing else
-is pinned to; the program warns when its affinity mask has more than one CPU.
-
 Also before a timed pass, `--noise-secs S` (default 2) reads the clock back to
 back for S seconds and counts the gaps, the times the CPU was taken away; the
-pass itself records the pinned CPU's `/proc/stat` deltas (irq, softirq, steal)
-and the process's page faults and context switches. On this VM every CPU loses
+pass itself records the process's page faults and context switches. On this VM every CPU loses
 5-20 us about 1,250-1,700 times a second (the 1000 Hz tick, CONFIG_HZ=1000,
 plus other interrupts and VM exits), so about 0.1% of queries carry one
 (7,692 of 9M over 10 us in the steady_clock run below): p99 and below measure
@@ -206,7 +200,7 @@ mkhashset in 2 min 20 s and 1.4 GB of RSS, a 1.37 GiB file, cached):
 | pass | n | mean | median | stddev | p90 | p99 | p99.9 | max | aggregate mean |
 |------|--:|-----:|-------:|-------:|----:|----:|------:|----:|---------------:|
 | found, steady_clock | 9,000,000 | 682 | 642 | 1,620 | 907 | 1,182 | 1,753 | 4.3 ms | 606 |
-| found, rdtscp | 9,000,000 | 792 | 754 | 2,610 | 1,046 | 1,338 | 15,575 | 4.8 ms | 677 |
+| found, rdtscp (a since-removed option) | 9,000,000 | 792 | 754 | 2,610 | 1,046 | 1,338 | 15,575 | 4.8 ms | 677 |
 | notfound, steady_clock | 10,000 | 814 | 774 | 793 | 1,078 | 1,349 | 18,735 | 30 us | 642 |
 
 ns per query, raw (the timer's overhead included: 28-30 ns median for

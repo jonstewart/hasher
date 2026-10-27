@@ -923,10 +923,9 @@ inflation</b> = max TLSH distance in E − d<sub>k</sub>; the ratio divides inst
             nrows.append([p, escape(str(m.get('timer'))), f'{to.get("median", "–")} / {to.get("p99", "–")}',
                           f'{nf.get("gaps_over_5us", 0) / secs:,.0f} /s', f'{nf.get("gaps_over_10us", 0) / secs:,.0f} /s',
                           ns(nf.get('median_gap_over_5us_ns')), ns(nf.get('max_gap_ns')),
-                          escape(str(m.get('cpu_affinity'))),
                           f'{it.get("involuntary_ctxsw", "–")} / {it.get("major_faults", "–")}'])
         t2 = table(['pass', 'timer', 'timer overhead ns (median / p99)', 'gaps > 5 µs', 'gaps > 10 µs',
-                    'median gap > 5 µs', 'max gap', 'pinned CPU', 'invol. ctx switches / major faults'], nrows)
+                    'median gap > 5 µs', 'max gap', 'invol. ctx switches / major faults'], nrows)
 
         # assertions
         if mf:
@@ -1225,7 +1224,7 @@ on this hardware.</p>
                            f'median (not subtracted); analysis '
                            f'pass on {mach.get("analysis_threads", "–")} threads, untimed'],
             ['Lookup warm-up', f'{mf.get("warm_reads", "–")} file reads, every page touched, '
-                               f'{fint(mf.get("warmup_queries"))} untimed lookups; pinned CPU {escape(str(mf.get("cpu_affinity", "–")))}; '
+                               f'{fint(mf.get("warmup_queries"))} untimed lookups; '
                                f'clocksource {escape(str(mf.get("clocksource", "–")))}' if mf else '–'],
             ['VM noise floor', 'every CPU loses 5–20 µs about 1,250–1,700 times a second (1000 Hz tick, other '
                                'interrupts and VM exits; measured per pass in the lookup section). Percentiles up to '
@@ -1319,10 +1318,10 @@ max_distance (e.g. 144) would prune far more, so these index timings are not com
                         f'python3 -I bench/vs_report/header_split.py --hset {self.args.hset} \\\n'
                         f'    --knn {self.args.knn} --out {os.path.join(self.args.out, "header_split.csv")}')
         cmds.append('# lookup eval (step 2)\nE=/work/bench/vs_lookup_eval; H=<vs.hset>; D=/work/vs-eval\n'
-                    'taskset -c 3 $E export $H --out $D/vs_sha256.txt\n'
-                    'taskset -c 3 $E found $H --list $D/vs_sha256.txt --csv $D/lookup/lookup_found.csv '
+                    '$E export $H --out $D/vs_sha256.txt\n'
+                    '$E found $H --list $D/vs_sha256.txt --csv $D/lookup/lookup_found.csv '
                     '--warm-reads 3 --warmup-queries all --catch-bench 100000\n'
-                    'taskset -c 3 $E notfound $H --list $D/vs_sha256.txt --csv $D/lookup/lookup_notfound.csv '
+                    '$E notfound $H --list $D/vs_sha256.txt --csv $D/lookup/lookup_notfound.csv '
                     '--warm-reads 3 --warmup-queries 100000')
         for m in (mf, mn):
             if m:

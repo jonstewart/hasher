@@ -142,7 +142,7 @@ bin_PROGRAMS = src/fuzzy/fuzzy src/hasher/hasher src/mkhashset/mkhashset src/hse
 check_PROGRAMS = test/test test/bench_hex test/bench_hsd test/bench_tlsh test/bench_hset_merge bench/bench_eval
 
 bench_bench_eval_SOURCES = bench/eval.cpp src/lib/hashset/util.cpp
-bench_bench_eval_CPPFLAGS = -Iinclude -Ibench -Ivendors/parallel-hashmap
+bench_bench_eval_CPPFLAGS = $(AM_CPPFLAGS) -I$(srcdir)/bench
 bench_bench_eval_CXXFLAGS = $(AM_CXXFLAGS) -O3 -march=native
 
 # hash set lookup eval driver (bench/README.md, "vs_lookup_eval")
